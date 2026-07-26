@@ -71,6 +71,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk2.0-0 libgdk-pixbuf2.0-0 libx11-6 libxtst6
           url=$(curl --fail --silent --show-error https://raw.githubusercontent.com/Villavu/Simba-Build-Archive/main/latest.linux64)
           curl --fail --location --output simba.zip "$url"
           unzip -q simba.zip
@@ -100,28 +102,45 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          ./Simba-Linux64 --extractopenssl --run tests/latest_openrs2.simba
+          run_simba() {
+            ./Simba-Linux64 --extractopenssl "$@"
+            sleep 2
+            while pgrep -f 'Simba-Linux64.*\.simba' >/dev/null; do sleep 2; done
+          }
+          run_simba --run tests/latest_openrs2.simba
           cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
           test -n "$cache_file"
-          ./Simba-Linux64 --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+          run_simba --cache="$(dirname "$cache_file")" --run generator.simba
 
       - name: Generate full asset tree (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          ./Simba.app/Contents/MacOS/Simba --extractopenssl --run tests/latest_openrs2.simba
+          run_simba() {
+            ./Simba.app/Contents/MacOS/Simba --extractopenssl "$@"
+            sleep 2
+            while pgrep -f 'Simba.app/Contents/MacOS/Simba.*\.simba' >/dev/null; do sleep 2; done
+          }
+          run_simba --run tests/latest_openrs2.simba
           cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
           test -n "$cache_file"
-          ./Simba.app/Contents/MacOS/Simba --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+          run_simba --cache="$(dirname "$cache_file")" --run generator.simba
 
       - name: Generate full asset tree (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./Simba-Win64.exe --extractopenssl --run tests/latest_openrs2.simba
+          function Invoke-Simba([string[]]$SimbaArgs, [string]$ScriptName) {
+            & .\Simba-Win64.exe --extractopenssl @SimbaArgs
+            Start-Sleep -Seconds 2
+            while (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "Simba-Win64\.exe.*$ScriptName" }) {
+              Start-Sleep -Seconds 2
+            }
+          }
+          Invoke-Simba @('--run', 'tests/latest_openrs2.simba') 'latest_openrs2\.simba'
           $cacheFile = Get-ChildItem cache/2625 -Filter main_file_cache.dat2 -File -Recurse | Select-Object -First 1
           if (!$cacheFile) { throw 'main_file_cache.dat2 was not unpacked' }
-          ./Simba-Win64.exe --extractopenssl --cache="$($cacheFile.Directory.FullName)" --run generator.simba
+          Invoke-Simba @("--cache=$($cacheFile.Directory.FullName)", '--run', 'generator.simba') 'generator\.simba'
 
       - name: Verify the generated manifest (Unix)
         if: runner.os != 'Windows'
