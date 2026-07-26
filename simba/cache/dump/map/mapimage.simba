@@ -1,0 +1,1684 @@
+(*
+# MapImage
+The `map/zips/map.zip` renderer: one 256x256 truecolour chunk per region per
+plane, named `<plane>-<regionX>-<regionY>.png`. Ported from
+`net.runelite.cache.SimbaMapImageDumper`.
+
+```pascal
+var
+  mi: TMapImage;
+  img: TImage;
+mi := TMapImage.Create(store);
+img := mi.Render(50, 50, 0);
+img.Save('0-50-50.png');
+```
+
+Three passes, in this order, per region: the blended terrain
+({ref}`TMapImage.BuildPlane` + the plane composite), the object/wall/mapscene
+overlay ({ref}`TMapImage.DrawObjects`) and the area icons
+({ref}`TMapImage.DrawIcons`). `map-noicons.zip` is the first two; it is
+committed but consumed by nothing - `map.bin` is built from `map.zip` - so this
+unit only ever renders the full variant.
+
+## The palette is the broken one, on purpose
+See `mappalette.simba`. `SimbaMapImageDumper` builds its table with
+`JagexColor.createPalette(BRIGHTNESS_MAX)`, which is rerouted to
+`createPaletteHSV` - pow before quantise, no `rgb = 0 -> 1` guard. Swapping in
+`utils/cache/jagexcolor.simba`'s validated palette discolours every terrain
+pixel in the file.
+
+## Neighbouring regions are load-bearing, in two separate ways
+The Java allocates one 13056 x 45568 canvas (2.38 GB) and cuts chunks out of it,
+so cross-region effects are free for it and are the whole difficulty here.
+
+1. **The blend reads five tiles into every neighbour**, diagonals included
+   (`:386-427`), so a chunk's *terrain* depends on a 3x3 region window. Rendering
+   region 50,50 without neighbours costs thousands of pixels - measured at
+   84.5% - 95.1% raw match against the committed chunks.
+2. **Objects, mapscene sprites and icons write outside their own region.**
+   `drawY = (drawBaseY + (64 - sizeY - localY)) * 4` goes above the region's own
+   rectangle for a tall object near its north edge - up to `(33-1)*4 = 128` px on
+   cache 2625's largest `sizeY` - and a blitted sprite is centred, so it spills a
+   few pixels in any direction. Both stay well inside one region, so the same 3x3
+   window covers them.
+
+## Draw order matters, even though export order does not
+`SimbaMapImageDumper` draws **all** regions first and extracts chunks in a
+second loop (`:275-307`), so unlike collision there is no "the chunk was
+exported before its neighbour was drawn" quirk.
+
+What survives is the order *within* the drawing loop. Regions are drawn in
+`HashMap` iteration order, and each one paints terrain, then objects, then icons
+(`:289-291`). A region's terrain covers its own rectangle and nothing else - so
+a neighbour that was drawn **earlier** has its bleed erased by this region's
+terrain wherever that terrain paints, while a neighbour drawn **later** paints
+on top. The 3x3 window therefore has to be composited in `HashMap` order with
+the centre's terrain slotted into its own position, not "neighbours first" or
+"neighbours last".
+
+That is measured, not reasoned. Over 74 sampled regions x 4 planes = 296 chunks:
+
+| composite order | chunks equal | differing pixels |
+|---|---|---|
+| `HashMap` order, centre's terrain in its own slot | **296 / 296** | **0** |
+| all neighbours first, then the centre | 275 / 296 | 655 |
+| the centre first, then all neighbours | 272 / 296 | 1287 |
+| the centre alone, no neighbour bleed at all | 274 / 296 | 706 |
+
+Note the third row is *worse* than the fourth: painting every neighbour's bleed
+unconditionally on top adds more wrong pixels than dropping all of it.
+
+With region ids below 65536 the `HashMap` hash is the identity, the table
+capacity is 4096, and the bucket collapses to
+**`((regionX mod 16) shl 8) or regionY`** ({ref}`_MapBucket`). No two regions of
+a 3x3 window can share a bucket, so that is a strict order over the nine.
+
+## What the terrain pass leaves black
+`drawTile` skips source pixels equal to 0 (`:359`) and the canvas starts at
+`0x000000` (`TYPE_INT_RGB`). A tile with neither underlay nor overlay is never
+written, an overlay-only tile writes only its overlay sub-pixels, and an overlay
+whose `rgbColor` is `0xFF00FF` resolves to 0 and writes nothing. Those pixels
+stay black unless an object or icon lands on them.
+
+## convert() is off by one for negative offsets, and that is the shipped behaviour
+```java
+private static int convert(int d) {
+    if (d >= 0) return d % 64;
+    return 64 - -(d % 64) - 1;
+}
+```
+(`:596-600`). For `d = -1` that is `64 - 1 - 1 = 62`, not 63 - so the blend reads
+the *second to last* column of the left neighbour where it means to read the
+last. It is a real defect and it is what produced `map.zip`, so
+{ref}`_MapConvert` reproduces it exactly. Do not "correct" it.
+
+## Three claims in the plan that the source does not support
+* `shape` is **not** unbounded. `overlayPath = (attribute - 2) div 4` only runs
+  for `attribute <= 49`, so the path is 0..11 and `shape = path + 1` is 1..12 -
+  exactly the 13 rows `TILE_SHAPE_2D` has. No clamp is needed.
+* `runningMultiplier = 0` cannot divide by zero. The running window is
+  `[xi-4, xi+5] x [yi-4, yi+5]`, which always contains the tile being emitted, and
+  `UnderlayDefinition.calculateHsl` floors `hueMultiplier` at 1 - so a tile with
+  `underlayId > 0` guarantees a multiplier of at least 1. The guard below is
+  defensive only.
+* `map-noicons.zip` is not a separate render. `renderIcons = false` gates
+  `drawMapIcons` alone (`:876`); mapscene decorations run in both.
+*)
+{$DEFINE WL_CACHE_DUMP_MAPIMAGE_INCLUDED}
+{$IFNDEF WL_CACHE_REGION_INCLUDED}{$INCLUDE_ONCE ../../region.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_OBJECT_INCLUDED}{$INCLUDE_ONCE ../../defs/object.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_TERRAIN_INCLUDED}{$INCLUDE_ONCE ../../defs/terrain.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_SPRITE_INCLUDED}{$INCLUDE_ONCE ../../defs/sprite.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_MAPPALETTE_INCLUDED}{$INCLUDE_ONCE mappalette.simba}{$ENDIF}
+
+const
+  // net.runelite.cache.SimbaMapImageDumper.MAP_SCALE / .BLEND
+  MAPIMAGE_SCALE: Integer = 4;
+  MAPIMAGE_BLEND: Integer = 5;
+  // Region.X * MAP_SCALE - the side of one exported chunk, in pixels.
+  MAPIMAGE_CHUNK_SIZE: Integer = 256;
+
+  // The blend's tile window, REGION_X + BLEND * 2 wide: world offsets -5..68
+  // relative to the region base, in both axes. See TMapImage.BuildPlane.
+  MAPIMAGE_GRID: Integer = 74;
+
+  // :69-70. Java's `+` binds tighter than `<<`, so `238 + (int)10.0D - 10 << 16`
+  // is `238 << 16`. Both colours are plain and the arithmetic is decorative.
+  MAPIMAGE_WALL_RGB: Integer = $EEEEEE;
+  MAPIMAGE_DOOR_RGB: Integer = $EE0000;
+
+  // The hardcoded carve-out at :560: full-tile overlays are not painted on
+  // planes >= 1 inside this region box.
+  MAPIMAGE_SKIP_X1: Integer = 46;
+  MAPIMAGE_SKIP_X2: Integer = 47;
+  MAPIMAGE_SKIP_Y1: Integer = 77;
+  MAPIMAGE_SKIP_Y2: Integer = 79;
+
+  // idx8's archive of map decorations, found by name (`:973`).
+  MAPIMAGE_SCENE_ARCHIVE: String = 'mapscene';
+
+  // How many decoded regions to keep. Nine are live at once (the 3x3 window);
+  // the slack is what stops a raster-order sweep from re-decoding a whole column
+  // every time the inner loop wraps.
+  MAPIMAGE_REGION_CACHE: Integer = 24;
+
+  // TILE_SHAPE_2D and TILE_ROTATION_2D (`:66-67`), flattened row-major at 16
+  // entries per row. Row `shape` of the first is a 4x4 mask - 0 picks the
+  // underlay, non-zero the overlay - read through row `rotation` of the second.
+  MAPIMAGE_TILE_SHAPE: TIntegerArray = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1,
+    1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+    0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+    0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0,
+    1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1,
+    1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1
+  ];
+  MAPIMAGE_TILE_ROTATION: TIntegerArray = [
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    12,  8,  4,  0, 13,  9,  5,  1, 14, 10,  6,  2, 15, 11,  7,  3,
+    15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1,  0,
+     3,  7, 11, 15,  2,  6, 10, 14,  1,  5,  9, 13,  0,  4,  8, 12
+  ];
+
+(*
+## _MapConvert
+```pascal
+function _MapConvert(d: Integer): Integer;
+```
+`SimbaMapImageDumper.convert` (`:596-600`): a world-tile offset relative to a
+region base, mapped back into 0..63 so it can index the neighbour it landed in.
+
+**It is off by one for negative offsets** - `convert(-1)` is 62, not 63 - and
+that is deliberate; see the unit docstring. Lape's `mod` truncates toward zero
+exactly as Java's `%` does, so the two agree on every input.
+*)
+function _MapConvert(d: Integer): Integer;
+begin
+  if d >= 0 then Exit(d mod 64);
+  Result := 64 - (-(d mod 64)) - 1;
+end;
+
+(*
+## _MapBucket
+```pascal
+function _MapBucket(regionX, regionY: Integer): Integer;
+```
+Where region `(x, y)` lands in `RegionLoader.regions`, a
+`HashMap<Integer, Region>` (`region/RegionLoader.java:52`) whose `values()`
+iteration order is the order every region is drawn in.
+
+2933 entries give a table capacity of 4096. Region ids are below 65536, so
+`h ^ (h >>> 16)` is `h`, and `h and 4095` collapses to
+`((regionX mod 16) shl 8) or regionY`.
+*)
+function _MapBucket(regionX, regionY: Integer): Integer;
+begin
+  Result := ((regionX mod 16) shl 8) or regionY;
+end;
+
+type
+(*
+## TMapAreaDefinition
+```pascal
+TMapAreaDefinition = record
+  Id, SpriteId, Field3294, TextColor, Category, TextScale: Integer;
+  Name: String;
+end;
+```
+One file of config archive 35 (`EConfigType.AREA`), ported from
+`definitions/loaders/AreaLoader.java`. `SpriteId` is the only field the map
+renderer reads - it is an idx8 **archive** id, and the icon is that archive's
+frame 0 (`SpriteManager.load` keys its multimap by archive id).
+
+The rest of the opcode fan-out is implemented even though nothing consumes it,
+because `AreaLoader` has no terminator other than opcode 0: skipping an opcode's
+payload desynchronises the stream and yields a plausible, wrong `SpriteId` from
+there on. `dev/tests/442_mapimage.simba` decodes all 1261 files and asserts each
+lands exactly on the end of its data, which no desynced parse can do.
+*)
+  TMapAreaDefinition = record
+    Id, SpriteId, Field3294, TextColor, Category, TextScale: Integer;
+    Name: String;
+  end;
+
+(*
+## TMapAreaDefinition.Load
+```pascal
+function TMapAreaDefinition.Load(id: Integer; data: TByteArray): TMapAreaDefinition; static;
+```
+Decodes one AREA file. Raises on an opcode `AreaLoader` does not know - the Java
+silently falls out of `processOpcode` and reads the next byte as the following
+opcode, which is exactly the desync the exhaustion assertion is there to catch.
+*)
+function TMapAreaDefinition.Load(id: Integer; data: TByteArray): TMapAreaDefinition; static;
+var
+  s: TByteStream;
+  opcode, n, m, i: Integer;
+begin
+  Result.Id := id;
+  Result.SpriteId := -1;
+  Result.Field3294 := -1;
+  Result.Category := -1;
+
+  s := TByteStream.Create(data);
+  while True do
+  begin
+    opcode := s.ReadUByte();
+    if opcode = 0 then Break;
+
+    if (opcode >= 10) and (opcode <= 14) then
+    begin
+      s.ReadJagexString();
+      Continue;
+    end;
+
+    case opcode of
+      1: Result.SpriteId := s.ReadBigSmart2();
+      2: Result.Field3294 := s.ReadBigSmart2();
+      3: Result.Name := s.ReadJagexString();
+      4: Result.TextColor := s.ReadUMedium();
+      5: s.ReadUMedium();
+      6: Result.TextScale := s.ReadUByte();
+      7: s.ReadUByte();
+      8: s.ReadUByte();
+      15:
+      begin
+        n := s.ReadUByte();
+        for i := 0 to n * 2 - 1 do s.ReadShort();
+        s.ReadInt();
+        m := s.ReadUByte();
+        for i := 0 to m - 1 do s.ReadInt();
+        for i := 0 to n - 1 do s.ReadByte();
+      end;
+      16: ;  // no payload
+      17: s.ReadJagexString();
+      18: s.ReadBigSmart2();
+      19: Result.Category := s.ReadUShort();
+      21: s.ReadInt();
+      22: s.ReadInt();
+      23: begin s.ReadUByte(); s.ReadUByte(); s.ReadUByte(); end;
+      24: begin s.ReadShort(); s.ReadShort(); end;
+      25: s.ReadBigSmart2();
+      28: s.ReadUByte();
+      29: s.ReadUByte();
+      30: s.ReadUByte();
+      else
+        raise 'MapImage: area ' + ToStr(id) + ' has unknown opcode ' + ToStr(opcode);
+    end;
+  end;
+
+  if s.Remaining() <> 0 then
+    raise 'MapImage: area ' + ToStr(id) + ' left ' + ToStr(s.Remaining()) + ' bytes undecoded';
+end;
+
+type
+(*
+## TMapRegion
+```pascal
+TMapRegion = record
+  Id, RegionX, RegionY, BaseX, BaseY: Integer;
+  DrawBaseX, DrawBaseY: Integer;
+  Valid: Boolean;
+  UnderlayId, OverlayId, OverlayPath, OverlayRot, Settings: TIntegerArray;
+  Locs: array of TLocation;
+  TileStart, Order: TIntegerArray;
+  Occupied: TIntegerArray;
+end;
+```
+One decoded region reduced to what the map renderer reads, plus a per-tile index
+over its locations.
+
+The five tile arrays are flat and strided by `TRegion.TileIndex(z, x, y)`, the
+same layout `TRegion.Tiles` uses. They are copied out of the `TRegion` rather
+than held by reference so the 24-slot cache does not pin whole `TRegion`s -
+`TMapRegion` is about a third the size.
+
+`UnderlayId` and `OverlayId` are stored **already masked** with `$7FFF`, which is
+what `Region.getUnderlayId`/`getOverlayId` do on their way out
+(`region/Region.java:157-171`); `region.simba` deliberately keeps the raw value.
+
+`TileStart`/`Order` are a CSR-style bucket index over `Locs`, keyed by
+`x * 64 + y` and built stably, so a tile's locations come back in the order the
+region file listed them - which is the order `drawObjects` visits them in
+(`:604-610`, a `LinkedList`-backed `computeIfAbsent`). `Occupied` lists the tiles
+holding any location at all, ascending, so the 4096-tile sweep skips the empty
+ones without losing that order.
+*)
+  TMapRegion = record
+    Id, RegionX, RegionY, BaseX, BaseY: Integer;
+    DrawBaseX, DrawBaseY: Integer;
+    Valid: Boolean;
+    UnderlayId, OverlayId, OverlayPath, OverlayRot, Settings: TIntegerArray;
+    Locs: array of TLocation;
+    TileStart, Order, Occupied: TIntegerArray;
+  end;
+
+type
+(*
+## TMapImage
+```pascal
+TMapImage = record
+  Store: TCacheStore;
+  MinRegionX, MinRegionY, MaxRegionX, MaxRegionY: Integer;
+  CanvasWidth, CanvasHeight: Integer;
+  ...
+end;
+```
+The whole dumper: the definition tables `SimbaMapImageDumper.load()` builds
+(`:222-238`), the whole-map canvas bounds its object pass tests against, a
+24-slot region cache and the four blended plane buffers of whichever region was
+rendered last.
+
+Create it once and call {ref}`TMapImage.Render` per chunk. Pass it as `var`:
+every cache it keeps lives on the record, so a by-value copy starts cold and
+re-decodes everything.
+*)
+  TMapImage = record
+    Store: TCacheStore;
+
+    Palette: TIntegerArray;
+
+    // UNDERLAY definitions by id. Hue is pre-multiplied by HueMultiplier and can
+    // be negative; see TUnderlayDefinition.CalculateHsl.
+    UnHue, UnSat, UnLight, UnMul: TIntegerArray;
+    UnKnown: TBooleanArray;
+    UnMaxId: Integer;
+
+    // OVERLAY definitions by id.
+    OvTexture, OvRgb, OvSecondRgb: TIntegerArray;
+    OvHue, OvSat, OvLight: TIntegerArray;
+    OvOtherHue, OvOtherSat, OvOtherLight: TIntegerArray;
+    OvKnown: TBooleanArray;
+    OvMaxId: Integer;
+
+    // TextureDefinition.averageRGB by id - a packed HSL despite the name.
+    TexAvg: TIntegerArray;
+    TexMaxId: Integer;
+
+    // OBJECT definitions by id, five fields of them.
+    ObjSizeX, ObjSizeY, ObjWallOrDoor, ObjMapScene, ObjMapArea: TIntegerArray;
+    ObjKnown: TBooleanArray;
+    ObjMaxId: Integer;
+
+    // AreaDefinition.spriteId by area id, -1 for "no icon".
+    AreaSprite: TIntegerArray;
+    AreaMaxId: Integer;
+
+    // Every frame of the "mapscene" archive, indexed by ObjectDefinition.mapSceneID.
+    Scenes: array of TSpriteDefinition;
+
+    // Frame 0 of each icon archive an area references, decoded on demand.
+    IconIds: TIntegerArray;
+    Icons: array of TSpriteDefinition;
+
+    MinRegionX, MinRegionY, MaxRegionX, MaxRegionY: Integer;
+    CanvasWidth, CanvasHeight: Integer;
+    Exists: TBooleanArray;
+
+    CacheIds, CacheStamp: TIntegerArray;
+    CacheRegions: array of TMapRegion;
+    Clock: Integer;
+
+    PlaneRegion: Integer;
+    PlaneBuf: array of TIntegerArray;
+    PlaneBuilt: TBooleanArray;
+  end;
+
+// ARGB opacity. Written as a shift because the literal $FF000000 does not fit a
+// signed 32-bit Integer; the resulting Integer is negative, which is exactly the
+// bit pattern Java's `| 0xFF000000` produces and is only ever tested against 0.
+function _MapOpaque(): Integer;
+begin
+  Result := 255 shl 24;
+end;
+
+// Djb2.hash (util/Djb2.java): `hash = c + ((hash << 5) - hash)`, 32-bit wrapping.
+// Simba strings are byte strings, so Ord() is the raw byte, which matches
+// String.charAt for the ASCII archive names this is used on.
+function _MapDjb2(name: String): Integer;
+var
+  i, h: Integer;
+begin
+  h := 0;
+  for i := 1 to Length(name) do
+    h := Ord(name[i]) + ((h shl 5) - h);
+  Result := h;
+end;
+
+// Loads every UNDERLAY and OVERLAY definition into flat by-id tables.
+// `loadUnderlays`/`loadOverlays` (`:923-967`) do the same into HashMaps.
+procedure TMapImage.LoadTerrainDefs();
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids: TIntegerArray;
+  un: TUnderlayDefinition;
+  ov: TOverlayDefinition;
+  a, i, id: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.CONFIGS));
+
+  a := table.IndexOfArchive(Ord(EConfigType.UNDERLAY));
+  if a = -1 then raise 'MapImage: the cache has no UNDERLAY config archive';
+  ids := table.Archives[a].FileIds;
+  files := Self.Store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.UNDERLAY), []);
+
+  Self.UnMaxId := 0;
+  for i := 0 to High(ids) do
+    if ids[i] > Self.UnMaxId then Self.UnMaxId := ids[i];
+  SetLength(Self.UnHue, Self.UnMaxId + 1);
+  SetLength(Self.UnSat, Self.UnMaxId + 1);
+  SetLength(Self.UnLight, Self.UnMaxId + 1);
+  SetLength(Self.UnMul, Self.UnMaxId + 1);
+  SetLength(Self.UnKnown, Self.UnMaxId + 1);
+
+  for i := 0 to High(files) do
+  begin
+    id := ids[i];
+    un := TUnderlayDefinition.Load(id, files[i]);
+    Self.UnHue[id] := un.Hue;
+    Self.UnSat[id] := un.Saturation;
+    Self.UnLight[id] := un.Lightness;
+    Self.UnMul[id] := un.HueMultiplier;
+    Self.UnKnown[id] := True;
+  end;
+
+  a := table.IndexOfArchive(Ord(EConfigType.OVERLAY));
+  if a = -1 then raise 'MapImage: the cache has no OVERLAY config archive';
+  ids := table.Archives[a].FileIds;
+  files := Self.Store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.OVERLAY), []);
+
+  Self.OvMaxId := 0;
+  for i := 0 to High(ids) do
+    if ids[i] > Self.OvMaxId then Self.OvMaxId := ids[i];
+  SetLength(Self.OvTexture, Self.OvMaxId + 1);
+  SetLength(Self.OvRgb, Self.OvMaxId + 1);
+  SetLength(Self.OvSecondRgb, Self.OvMaxId + 1);
+  SetLength(Self.OvHue, Self.OvMaxId + 1);
+  SetLength(Self.OvSat, Self.OvMaxId + 1);
+  SetLength(Self.OvLight, Self.OvMaxId + 1);
+  SetLength(Self.OvOtherHue, Self.OvMaxId + 1);
+  SetLength(Self.OvOtherSat, Self.OvMaxId + 1);
+  SetLength(Self.OvOtherLight, Self.OvMaxId + 1);
+  SetLength(Self.OvKnown, Self.OvMaxId + 1);
+
+  for i := 0 to High(files) do
+  begin
+    id := ids[i];
+    ov := TOverlayDefinition.Load(id, files[i]);
+    Self.OvTexture[id] := ov.Texture;
+    Self.OvRgb[id] := ov.RgbColor;
+    Self.OvSecondRgb[id] := ov.SecondaryRgbColor;
+    Self.OvHue[id] := ov.Hue;
+    Self.OvSat[id] := ov.Saturation;
+    Self.OvLight[id] := ov.Lightness;
+    Self.OvOtherHue[id] := ov.OtherHue;
+    Self.OvOtherSat[id] := ov.OtherSaturation;
+    Self.OvOtherLight[id] := ov.OtherLightness;
+    Self.OvKnown[id] := True;
+  end;
+end;
+
+// RSTextureProvider's `textures` array (`item/RSTextureProvider.java:49-60`):
+// sized to max id + 1 and sparse, with getAverageTextureRGB answering 0 for an
+// empty slot (`:86-89`). A zero average is a real value, so the slot's emptiness
+// is not distinguishable afterwards - and does not need to be.
+procedure TMapImage.LoadTextures();
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids: TIntegerArray;
+  tex: TTextureDefinition;
+  a, i: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.TEXTURES));
+  a := table.IndexOfArchive(0);
+  if a = -1 then raise 'MapImage: the cache has no texture archive';
+  ids := table.Archives[a].FileIds;
+  files := Self.Store.ReadFiles(Ord(EIndexType.TEXTURES), 0, []);
+
+  Self.TexMaxId := 0;
+  for i := 0 to High(ids) do
+    if ids[i] > Self.TexMaxId then Self.TexMaxId := ids[i];
+  SetLength(Self.TexAvg, Self.TexMaxId + 1);
+
+  for i := 0 to High(files) do
+  begin
+    tex := TTextureDefinition.Load(ids[i], files[i]);
+    Self.TexAvg[ids[i]] := tex.AverageRGB;
+  end;
+end;
+
+// ObjectManager reduced to the five fields the map pass reads (`:653`, `:665`,
+// `:744`, `:896`). Decoded up front for the same reason ObjectManager.load is:
+// a full dump asks about a location's object millions of times.
+procedure TMapImage.LoadObjects();
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids: TIntegerArray;
+  obj: TObjectDefinition;
+  a, i, id: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.OBJECTS));
+  if a = -1 then raise 'MapImage: the cache has no OBJECT config archive';
+  ids := table.Archives[a].FileIds;
+  files := Self.Store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.OBJECTS), []);
+
+  Self.ObjMaxId := 0;
+  for i := 0 to High(ids) do
+    if ids[i] > Self.ObjMaxId then Self.ObjMaxId := ids[i];
+  SetLength(Self.ObjSizeX, Self.ObjMaxId + 1);
+  SetLength(Self.ObjSizeY, Self.ObjMaxId + 1);
+  SetLength(Self.ObjWallOrDoor, Self.ObjMaxId + 1);
+  SetLength(Self.ObjMapScene, Self.ObjMaxId + 1);
+  SetLength(Self.ObjMapArea, Self.ObjMaxId + 1);
+  SetLength(Self.ObjKnown, Self.ObjMaxId + 1);
+
+  for i := 0 to High(files) do
+  begin
+    id := ids[i];
+    obj := TObjectDefinition.Load(id, files[i]);
+    Self.ObjSizeX[id] := obj.SizeX;
+    Self.ObjSizeY[id] := obj.SizeY;
+    Self.ObjWallOrDoor[id] := obj.WallOrDoor;
+    Self.ObjMapScene[id] := obj.MapSceneId;
+    Self.ObjMapArea[id] := obj.MapAreaId;
+    Self.ObjKnown[id] := True;
+  end;
+end;
+
+// AreaManager.load (`AreaManager.java:54-68`), keeping only spriteId.
+procedure TMapImage.LoadAreas();
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids: TIntegerArray;
+  area: TMapAreaDefinition;
+  a, i: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.AREA));
+  if a = -1 then raise 'MapImage: the cache has no AREA config archive';
+  ids := table.Archives[a].FileIds;
+  files := Self.Store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.AREA), []);
+
+  Self.AreaMaxId := 0;
+  for i := 0 to High(ids) do
+    if ids[i] > Self.AreaMaxId then Self.AreaMaxId := ids[i];
+  SetLength(Self.AreaSprite, Self.AreaMaxId + 1);
+  for i := 0 to Self.AreaMaxId do Self.AreaSprite[i] := -1;
+
+  for i := 0 to High(files) do
+  begin
+    area := TMapAreaDefinition.Load(ids[i], files[i]);
+    Self.AreaSprite[ids[i]] := area.SpriteId;
+  end;
+end;
+
+// loadSprites (`:969-978`): idx8's archive named "mapscene", every frame of it.
+procedure TMapImage.LoadScenes();
+var
+  table: TCacheRefTable;
+  hash, i, archive: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.SPRITES));
+  if not table.Named then
+    raise 'MapImage: index 8 is unnamed, so the "mapscene" archive cannot be found';
+
+  hash := _MapDjb2(MAPIMAGE_SCENE_ARCHIVE);
+  archive := -1;
+  for i := 0 to High(table.Archives) do
+    if table.Archives[i].NameHash = hash then
+    begin
+      archive := table.Archives[i].Id;
+      Break;
+    end;
+
+  if archive = -1 then
+    raise 'MapImage: index 8 has no archive named "' + MAPIMAGE_SCENE_ARCHIVE + '"';
+
+  Self.Scenes := TSpriteDefinition.LoadAll(archive,
+                   Self.Store.Read(Ord(EIndexType.SPRITES), archive, []));
+  if Length(Self.Scenes) = 0 then
+    raise 'MapImage: the "' + MAPIMAGE_SCENE_ARCHIVE + '" archive decoded to no frames';
+end;
+
+// Every region idx5 declares below REGION_MAX_ID, and the canvas they span.
+// The Java measures its bounds over the regions that actually loaded, which on
+// cache 2625 is the same set: 2934 archives, one of them 25287, leaving 2933.
+procedure TMapImage.LoadWorld();
+var
+  table: TCacheRefTable;
+  i, id, x, y: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.MAPS));
+  if table.Named then
+    raise 'MapImage: index 5 is named (an OpenRS2-style dump); only the ' +
+          'unnamed live-cache layout is implemented';
+
+  SetLength(Self.Exists, REGION_MAX_ID);
+  Self.MinRegionX := -1;
+
+  for i := 0 to High(table.Archives) do
+  begin
+    id := table.Archives[i].Id;
+    if (id < 0) or (id >= REGION_MAX_ID) then Continue;
+    Self.Exists[id] := True;
+
+    x := RegionXOf(id);
+    y := RegionYOf(id);
+    if Self.MinRegionX = -1 then
+    begin
+      Self.MinRegionX := x; Self.MaxRegionX := x;
+      Self.MinRegionY := y; Self.MaxRegionY := y;
+      Continue;
+    end;
+    if x < Self.MinRegionX then Self.MinRegionX := x;
+    if x > Self.MaxRegionX then Self.MaxRegionX := x;
+    if y < Self.MinRegionY then Self.MinRegionY := y;
+    if y > Self.MaxRegionY then Self.MaxRegionY := y;
+  end;
+
+  if Self.MinRegionX = -1 then
+    raise 'MapImage: index 5 declares no regions';
+
+  Self.CanvasWidth := (Self.MaxRegionX - Self.MinRegionX + 1) * REGION_X * MAPIMAGE_SCALE;
+  Self.CanvasHeight := (Self.MaxRegionY - Self.MinRegionY + 1) * REGION_Y * MAPIMAGE_SCALE;
+end;
+
+(*
+## TMapImage.Create
+```pascal
+function TMapImage.Create(var store: TCacheStore): TMapImage; static;
+```
+Everything `SimbaMapImageDumper.load()` does (`:222-238`): the underlay,
+overlay, texture, object and area tables, the mapscene sprite archive, and the
+region set with the canvas it spans. Takes a few seconds - the OBJECT archive
+alone is 62194 definitions - and is meant to be paid once for a whole dump.
+
+`store` is `var` so the reference tables it parses land on the caller's record
+rather than on a temporary copy.
+*)
+function TMapImage.Create(var store: TCacheStore): TMapImage; static;
+var
+  i: Integer;
+begin
+  Result.Store := store;
+  Result.Palette := MapPalette();
+
+  Result.LoadTerrainDefs();
+  Result.LoadTextures();
+  Result.LoadObjects();
+  Result.LoadAreas();
+  Result.LoadScenes();
+  Result.LoadWorld();
+
+  SetLength(Result.CacheIds, MAPIMAGE_REGION_CACHE);
+  SetLength(Result.CacheStamp, MAPIMAGE_REGION_CACHE);
+  SetLength(Result.CacheRegions, MAPIMAGE_REGION_CACHE);
+  for i := 0 to MAPIMAGE_REGION_CACHE - 1 do Result.CacheIds[i] := -1;
+
+  // The buffers themselves are allocated by BuildPlane, which reallocates
+  // rather than clearing - SetLength preserves the overlapping prefix, so a
+  // reused buffer would leak the previous region's terrain.
+  SetLength(Result.PlaneBuf, REGION_Z);
+  SetLength(Result.PlaneBuilt, REGION_Z);
+  Result.PlaneRegion := -1;
+
+  // Give the caller its own store back, with the reference tables already
+  // parsed - the same courtesy TCacheDefs extends.
+  store := Result.Store;
+end;
+
+(*
+## TMapImage.IconSprite
+```pascal
+function TMapImage.IconSprite(archive: Integer): TSpriteDefinition;
+```
+Frame 0 of idx8 archive `archive`, which is what `sprites.findSprite(spriteId, 0)`
+answers (`:901`) - `SpriteManager` keys its multimap by archive id, so an area's
+`spriteId` is an archive id and not a frame id.
+
+Decoded on demand and kept; the 1261 area definitions between them reference 136
+distinct archives.
+*)
+function TMapImage.IconSprite(archive: Integer): TSpriteDefinition;
+var
+  frames: array of TSpriteDefinition;
+  i: Integer;
+begin
+  for i := 0 to High(Self.IconIds) do
+    if Self.IconIds[i] = archive then Exit(Self.Icons[i]);
+
+  frames := TSpriteDefinition.LoadAll(archive,
+              Self.Store.Read(Ord(EIndexType.SPRITES), archive, []));
+  if Length(frames) = 0 then
+    raise 'MapImage: sprite archive ' + ToStr(archive) + ' decoded to no frames';
+
+  SetLength(Self.IconIds, Length(Self.IconIds) + 1);
+  SetLength(Self.Icons, Length(Self.Icons) + 1);
+  Self.IconIds[High(Self.IconIds)] := archive;
+  Self.Icons[High(Self.Icons)] := frames[0];
+  Result := frames[0];
+end;
+
+(*
+## TMapImage.RegionExists
+```pascal
+function TMapImage.RegionExists(regionX, regionY: Integer): Boolean;
+```
+`regionLoader.findRegionForWorldCoordinates(...) != null`, answered from the
+reference table. Out-of-range coordinates are False rather than a raise, because
+the blend asks about the four sides of every region including the ones on the
+edge of the world.
+*)
+function TMapImage.RegionExists(regionX, regionY: Integer): Boolean;
+var
+  id: Integer;
+begin
+  if (regionX < 0) or (regionX > 255) or (regionY < 0) or (regionY > 255) then Exit(False);
+  id := RegionIdOf(regionX, regionY);
+  if (id < 0) or (id >= REGION_MAX_ID) then Exit(False);
+  Result := Self.Exists[id];
+end;
+
+// TRegion projected onto what this renderer reads, with the CSR location index
+// built. See TMapRegion.
+function TMapImage.LoadRegion(id: Integer): TMapRegion;
+var
+  region: TRegion;
+  cursor: TIntegerArray;
+  tiles, i, n, t, used: Integer;
+begin
+  Result.Id := id;
+  Result.RegionX := RegionXOf(id);
+  Result.RegionY := RegionYOf(id);
+  Result.BaseX := Result.RegionX shl 6;
+  Result.BaseY := Result.RegionY shl 6;
+  Result.DrawBaseX := Result.BaseX - Self.MinRegionX * REGION_X;
+  Result.DrawBaseY := Self.MaxRegionY * REGION_Y - Result.BaseY;
+  Result.Valid := False;
+
+  if not Self.RegionExists(Result.RegionX, Result.RegionY) then Exit;
+
+  region := TRegion.Load(Self.Store, id, []);
+  if not region.HasTerrain then Exit;
+  Result.Valid := True;
+
+  n := REGION_Z * REGION_X * REGION_Y;
+  SetLength(Result.UnderlayId, n);
+  SetLength(Result.OverlayId, n);
+  SetLength(Result.OverlayPath, n);
+  SetLength(Result.OverlayRot, n);
+  SetLength(Result.Settings, n);
+  for i := 0 to n - 1 do
+  begin
+    // Region.getUnderlayId / getOverlayId mask on the way out; region.simba
+    // keeps the raw value, so the mask happens here.
+    Result.UnderlayId[i] := region.Tiles[i].UnderlayId and $7FFF;
+    Result.OverlayId[i] := region.Tiles[i].OverlayId and $7FFF;
+    Result.OverlayPath[i] := region.Tiles[i].OverlayPath;
+    Result.OverlayRot[i] := region.Tiles[i].OverlayRotation;
+    Result.Settings[i] := region.Tiles[i].Settings;
+  end;
+
+  Result.Locs := Copy(region.Locations);
+  n := Length(Result.Locs);
+  tiles := REGION_X * REGION_Y;
+
+  // Dropped before it is sized, so the counts below start at 0: SetLength keeps
+  // the overlapping prefix of whatever the array already held.
+  cursor := [];
+  SetLength(cursor, tiles);
+  for i := 0 to n - 1 do
+    Inc(cursor[Result.Locs[i].X * REGION_Y + Result.Locs[i].Y]);
+
+  SetLength(Result.TileStart, tiles + 1);
+  t := 0;
+  used := 0;
+  for i := 0 to tiles - 1 do
+  begin
+    Result.TileStart[i] := t;
+    t += cursor[i];
+    if cursor[i] > 0 then Inc(used);
+  end;
+  Result.TileStart[tiles] := t;
+
+  SetLength(Result.Occupied, used);
+  used := 0;
+  for i := 0 to tiles - 1 do
+    if Result.TileStart[i] <> Result.TileStart[i + 1] then
+    begin
+      Result.Occupied[used] := i;
+      Inc(used);
+    end;
+
+  // cursor is reused as a per-bucket write head, which is what keeps the
+  // within-tile order equal to the region file's order.
+  for i := 0 to tiles - 1 do cursor[i] := Result.TileStart[i];
+  SetLength(Result.Order, n);
+  for i := 0 to n - 1 do
+  begin
+    t := Result.Locs[i].X * REGION_Y + Result.Locs[i].Y;
+    Result.Order[cursor[t]] := i;
+    Inc(cursor[t]);
+  end;
+end;
+
+// Least-recently-used slot for region `id`, decoding it if it is not resident.
+function TMapImage.RegionSlot(id: Integer): Integer;
+var
+  i, victim, oldest: Integer;
+begin
+  Inc(Self.Clock);
+
+  for i := 0 to High(Self.CacheIds) do
+    if Self.CacheIds[i] = id then
+    begin
+      Self.CacheStamp[i] := Self.Clock;
+      Exit(i);
+    end;
+
+  victim := 0;
+  oldest := Self.CacheStamp[0];
+  for i := 1 to High(Self.CacheIds) do
+    if Self.CacheStamp[i] < oldest then
+    begin
+      oldest := Self.CacheStamp[i];
+      victim := i;
+    end;
+
+  Self.CacheRegions[victim] := Self.LoadRegion(id);
+  Self.CacheIds[victim] := id;
+  Self.CacheStamp[victim] := Self.Clock;
+  Result := victim;
+end;
+
+(*
+## TMapImage.Neighbourhood
+```pascal
+function TMapImage.Neighbourhood(regionX, regionY: Integer): array of TMapRegion;
+```
+The region at `(regionX, regionY)` and every existing region touching it,
+**sorted by {ref}`_MapBucket`** - i.e. in the order `SimbaMapImageDumper` draws
+them. The centre is always element `[i]` for exactly one `i`; find it by `Id`.
+
+The records are copies, so a later eviction cannot invalidate them: Lape's
+dynamic arrays are refcounted and a record assignment shares them rather than
+copying, which is what makes nine copies free here.
+*)
+function TMapImage.Neighbourhood(regionX, regionY: Integer): array of TMapRegion;
+var
+  dx, dy, i, j, n: Integer;
+  buckets: TIntegerArray;
+  tmpR: TMapRegion;
+  tmpB: Integer;
+begin
+  Result := [];
+  buckets := [];
+
+  for dx := -1 to 1 do
+    for dy := -1 to 1 do
+      if Self.RegionExists(regionX + dx, regionY + dy) then
+      begin
+        n := Length(Result);
+        SetLength(Result, n + 1);
+        SetLength(buckets, n + 1);
+        Result[n] := Self.CacheRegions[Self.RegionSlot(RegionIdOf(regionX + dx, regionY + dy))];
+        buckets[n] := _MapBucket(regionX + dx, regionY + dy);
+      end;
+
+  // Nine elements at most; an insertion sort is smaller than the alternative and
+  // is what keeps the "equal buckets are impossible here" argument checkable.
+  for i := 1 to High(Result) do
+  begin
+    tmpR := Result[i];
+    tmpB := buckets[i];
+    j := i - 1;
+    while (j >= 0) and (buckets[j] > tmpB) do
+    begin
+      Result[j + 1] := Result[j];
+      buckets[j + 1] := buckets[j];
+      Dec(j);
+    end;
+    Result[j + 1] := tmpR;
+    buckets[j + 1] := tmpB;
+  end;
+end;
+
+(*
+## TMapImage.BuildPlane
+```pascal
+procedure TMapImage.BuildPlane(regs: array of TMapRegion; centre, z: Integer);
+```
+`drawRegions(int[][] pixels, Region region, int z)` (`:369-594`): the blended
+terrain of one region on one plane, into `Self.PlaneBuf[z]`.
+
+The blend is a **two-pass separable running sum**, not a box blur over a fixed
+kernel. The x pass walks columns `-10 .. 73` adding the underlay at `xi + 5` and
+subtracting the one at `xi - 5` into 74 per-row accumulators; the y pass then
+does the same over rows. The window that survives at tile `(xi, yi)` is
+`[xi-4, xi+5] x [yi-4, yi+5]` - asymmetric, because the subtraction at step `k`
+removes column `k-5` before the emit at `k`.
+
+Both passes widen when the neighbour on that side exists (`:381-384`, `:386-388`),
+so an edge-of-world region blends over a *smaller* window than an interior one.
+Getting that wrong is invisible on interior regions and wrong on the coast.
+
+`regs` is the 3x3 window {ref}`TMapImage.Neighbourhood` returns and `centre` is
+the index of the region being rendered. Underlays are read at world offsets
+-5..68 in both axes, which is what the 74x74 grid built first covers - so the
+per-tile region lookup happens once per grid cell instead of twice per
+accumulation step.
+*)
+procedure TMapImage.BuildPlane(regs: array of TMapRegion; centre, z: Integer);
+var
+  gHue, gSat, gLight, gMul, gNum: TIntegerArray;
+  hues, sats, lights, muls, nums: TIntegerArray;
+  pixels, palette: TIntegerArray;
+  hasLeft, hasRight, hasUp, hasDown: Boolean;
+  nb: TIntegerArray;
+  baseX, baseY, rx, ry, opaque, cx, cy, plane0: Integer;
+  xt, yt, gi, wx, wy, uid, ui, k: Integer;
+  xStart, xEnd, xLo, xHi, yStart, yEnd, yLo, yHi, yStart2, yEnd2: Integer;
+  xi, yi, xr, xl, yu, yd, idx: Integer;
+  runHue, runSat, runLight, runMul, runNum: Integer;
+  avgHue, avgSat, avgLight, underlayHsl, underlayRgb: Integer;
+  overlayId, overlayRgb, shape, rotation, oid, hsl: Integer;
+  drawX, drawY, i, j, rotIdx, p, v: Integer;
+begin
+  baseX := regs[centre].BaseX;
+  baseY := regs[centre].BaseY;
+  rx := regs[centre].RegionX;
+  ry := regs[centre].RegionY;
+  palette := Self.Palette;
+  opaque := _MapOpaque();
+
+  // A reused buffer would leak its previous contents: SetLength keeps the
+  // overlapping prefix, so the array is dropped first to get a zeroed one.
+  Self.PlaneBuf[z] := [];
+  SetLength(Self.PlaneBuf[z], MAPIMAGE_CHUNK_SIZE * MAPIMAGE_CHUNK_SIZE);
+  pixels := Self.PlaneBuf[z];
+
+  // Which element of regs sits at each of the nine (dx, dy) offsets, so the
+  // grid below does one array read per cell instead of scanning nine records.
+  SetLength(nb, 9);
+  for i := 0 to 8 do nb[i] := -1;
+  for i := 0 to High(regs) do
+    if regs[i].Valid then
+      nb[(regs[i].RegionX - rx + 1) * 3 + (regs[i].RegionY - ry + 1)] := i;
+
+  // --- the underlay grid, world offsets -5..68 in both axes ----------------
+  gHue := []; gSat := []; gLight := []; gMul := []; gNum := [];
+  SetLength(gHue, MAPIMAGE_GRID * MAPIMAGE_GRID);
+  SetLength(gSat, MAPIMAGE_GRID * MAPIMAGE_GRID);
+  SetLength(gLight, MAPIMAGE_GRID * MAPIMAGE_GRID);
+  SetLength(gMul, MAPIMAGE_GRID * MAPIMAGE_GRID);
+  SetLength(gNum, MAPIMAGE_GRID * MAPIMAGE_GRID);
+
+  plane0 := z * REGION_X * REGION_Y;
+
+  for xt := -MAPIMAGE_BLEND to REGION_X + MAPIMAGE_BLEND - 1 do
+  begin
+    wx := (baseX + xt) shr 6;
+    cx := _MapConvert(xt);
+    for yt := -MAPIMAGE_BLEND to REGION_Y + MAPIMAGE_BLEND - 1 do
+    begin
+      wy := (baseY + yt) shr 6;
+      k := nb[(wx - rx + 1) * 3 + (wy - ry + 1)];
+      if k = -1 then Continue;
+
+      cy := _MapConvert(yt);
+      uid := regs[k].UnderlayId[plane0 + cx * REGION_Y + cy];
+      if uid <= 0 then Continue;
+
+      ui := uid - 1;
+      if (ui > Self.UnMaxId) or (not Self.UnKnown[ui]) then
+        raise 'MapImage: region ' + ToStr(regs[k].Id) + ' uses underlay ' +
+              ToStr(ui) + ', which the cache does not hold';
+
+      gi := (xt + MAPIMAGE_BLEND) * MAPIMAGE_GRID + (yt + MAPIMAGE_BLEND);
+      gHue[gi] := Self.UnHue[ui];
+      gSat[gi] := Self.UnSat[ui];
+      gLight[gi] := Self.UnLight[ui];
+      gMul[gi] := Self.UnMul[ui];
+      gNum[gi] := 1;
+    end;
+  end;
+
+  // --- the separable running sum -------------------------------------------
+  hasLeft := Self.RegionExists(rx - 1, ry);
+  hasRight := Self.RegionExists(rx + 1, ry);
+  hasUp := Self.RegionExists(rx, ry + 1);
+  hasDown := Self.RegionExists(rx, ry - 1);
+
+  hues := []; sats := []; lights := []; muls := []; nums := [];
+  SetLength(hues, MAPIMAGE_GRID);
+  SetLength(sats, MAPIMAGE_GRID);
+  SetLength(lights, MAPIMAGE_GRID);
+  SetLength(muls, MAPIMAGE_GRID);
+  SetLength(nums, MAPIMAGE_GRID);
+
+  if hasLeft then xStart := -MAPIMAGE_BLEND * 2 else xStart := -MAPIMAGE_BLEND;
+  if hasRight then xEnd := REGION_X + MAPIMAGE_BLEND * 2 - 1 else xEnd := REGION_X + MAPIMAGE_BLEND - 1;
+  if hasLeft then xLo := -MAPIMAGE_BLEND else xLo := 0;
+  if hasRight then xHi := REGION_X + MAPIMAGE_BLEND else xHi := REGION_X;
+
+  if hasDown then yStart := -MAPIMAGE_BLEND else yStart := 0;
+  if hasUp then yEnd := REGION_Y + MAPIMAGE_BLEND - 1 else yEnd := REGION_Y - 1;
+  if hasDown then yLo := -MAPIMAGE_BLEND else yLo := 0;
+  if hasUp then yHi := REGION_Y + MAPIMAGE_BLEND else yHi := REGION_Y;
+
+  if hasDown then yStart2 := -MAPIMAGE_BLEND * 2 else yStart2 := -MAPIMAGE_BLEND;
+  if hasUp then yEnd2 := REGION_Y + MAPIMAGE_BLEND * 2 - 1 else yEnd2 := REGION_Y + MAPIMAGE_BLEND - 1;
+
+  for xi := xStart to xEnd do
+  begin
+    for yi := yStart to yEnd do
+    begin
+      k := yi + MAPIMAGE_BLEND;
+
+      xr := xi + MAPIMAGE_BLEND;
+      if (xr >= xLo) and (xr < xHi) then
+      begin
+        gi := (xr + MAPIMAGE_BLEND) * MAPIMAGE_GRID + k;
+        hues[k] += gHue[gi];
+        sats[k] += gSat[gi];
+        lights[k] += gLight[gi];
+        muls[k] += gMul[gi];
+        nums[k] += gNum[gi];
+      end;
+
+      xl := xi - MAPIMAGE_BLEND;
+      if (xl >= xLo) and (xl < xHi) then
+      begin
+        gi := (xl + MAPIMAGE_BLEND) * MAPIMAGE_GRID + k;
+        hues[k] -= gHue[gi];
+        sats[k] -= gSat[gi];
+        lights[k] -= gLight[gi];
+        muls[k] -= gMul[gi];
+        nums[k] -= gNum[gi];
+      end;
+    end;
+
+    if (xi < 0) or (xi >= REGION_X) then Continue;
+
+    runHue := 0; runSat := 0; runLight := 0; runMul := 0; runNum := 0;
+
+    for yi := yStart2 to yEnd2 do
+    begin
+      yu := yi + MAPIMAGE_BLEND;
+      if (yu >= yLo) and (yu < yHi) then
+      begin
+        k := yu + MAPIMAGE_BLEND;
+        runHue += hues[k];
+        runSat += sats[k];
+        runLight += lights[k];
+        runMul += muls[k];
+        runNum += nums[k];
+      end;
+
+      yd := yi - MAPIMAGE_BLEND;
+      if (yd >= yLo) and (yd < yHi) then
+      begin
+        k := yd + MAPIMAGE_BLEND;
+        runHue -= hues[k];
+        runSat -= sats[k];
+        runLight -= lights[k];
+        runMul -= muls[k];
+        runNum -= nums[k];
+      end;
+
+      if (yi < 0) or (yi >= REGION_Y) then Continue;
+
+      idx := TRegion.TileIndex(z, xi, yi);
+      uid := regs[centre].UnderlayId[idx];
+      overlayId := regs[centre].OverlayId[idx];
+      if (uid <= 0) and (overlayId <= 0) then Continue;
+
+      underlayHsl := -1;
+      if uid > 0 then
+      begin
+        if (runMul = 0) or (runNum = 0) then
+          raise 'MapImage: empty blend window at region ' + ToStr(regs[centre].Id) +
+                ' plane ' + ToStr(z) + ' tile ' + ToStr(xi) + ',' + ToStr(yi);
+
+        avgHue := (runHue * 256) div runMul;
+        avgSat := runSat div runNum;
+        avgLight := runLight div runNum;
+        if avgLight < 0 then avgLight := 0
+        else if avgLight > 255 then avgLight := 255;
+
+        underlayHsl := MapPackHsl(avgHue, avgSat, avgLight);
+      end;
+
+      underlayRgb := 0;
+      if underlayHsl <> -1 then
+        underlayRgb := palette[MapMethod1792(underlayHsl, MAP_LIGHTNESS)] or opaque;
+
+      shape := 0;
+      rotation := 0;
+      overlayRgb := 0;
+
+      if overlayId <> 0 then
+      begin
+        shape := regs[centre].OverlayPath[idx] + 1;
+        rotation := regs[centre].OverlayRot[idx];
+
+        oid := overlayId - 1;
+        if (oid > Self.OvMaxId) or (not Self.OvKnown[oid]) then
+          raise 'MapImage: region ' + ToStr(regs[centre].Id) + ' uses overlay ' +
+                ToStr(oid) + ', which the cache does not hold';
+
+        if Self.OvTexture[oid] >= 0 then
+          hsl := Self.TexAvg[Self.OvTexture[oid]]
+        else if Self.OvRgb[oid] = $FF00FF then
+          hsl := -2
+        else
+          hsl := MapPackHsl(Self.OvHue[oid], Self.OvSat[oid], Self.OvLight[oid]);
+
+        if hsl <> -2 then
+          overlayRgb := palette[MapAdjustHSLListness0(hsl, MAP_LIGHTNESS)] or opaque;
+
+        if Self.OvSecondRgb[oid] <> -1 then
+        begin
+          hsl := MapPackHsl(Self.OvOtherHue[oid], Self.OvOtherSat[oid], Self.OvOtherLight[oid]);
+          overlayRgb := palette[MapAdjustHSLListness0(hsl, MAP_LIGHTNESS)] or opaque;
+        end;
+      end;
+
+      drawX := xi * MAPIMAGE_SCALE;
+      drawY := (REGION_Y - 1 - yi) * MAPIMAGE_SCALE;
+
+      if shape = 0 then
+      begin
+        if underlayRgb <> 0 then
+          for j := 0 to MAPIMAGE_SCALE - 1 do
+          begin
+            p := (drawY + j) * MAPIMAGE_CHUNK_SIZE + drawX;
+            for i := 0 to MAPIMAGE_SCALE - 1 do pixels[p + i] := underlayRgb;
+          end;
+      end
+      else if shape = 1 then
+      begin
+        // :556-564. Full-tile overlays are skipped above ground inside one
+        // hardcoded region box.
+        if (z < 1) or
+           (rx < MAPIMAGE_SKIP_X1) or (rx > MAPIMAGE_SKIP_X2) or
+           (ry < MAPIMAGE_SKIP_Y1) or (ry > MAPIMAGE_SKIP_Y2) then
+          for j := 0 to MAPIMAGE_SCALE - 1 do
+          begin
+            p := (drawY + j) * MAPIMAGE_CHUNK_SIZE + drawX;
+            for i := 0 to MAPIMAGE_SCALE - 1 do pixels[p + i] := overlayRgb;
+          end;
+      end
+      else
+      begin
+        // :566-587. i is the row, j the column - the Java indexes
+        // pixels[drawX + j][drawY + i], i.e. [column][row].
+        rotIdx := shape * 16;
+        k := rotation * 16;
+        if underlayRgb <> 0 then
+        begin
+          for i := 0 to MAPIMAGE_SCALE - 1 do
+          begin
+            p := (drawY + i) * MAPIMAGE_CHUNK_SIZE + drawX;
+            for j := 0 to MAPIMAGE_SCALE - 1 do
+            begin
+              if MAPIMAGE_TILE_SHAPE[rotIdx + MAPIMAGE_TILE_ROTATION[k]] = 0 then
+                v := underlayRgb
+              else
+                v := overlayRgb;
+              pixels[p + j] := v;
+              Inc(k);
+            end;
+          end;
+        end
+        else
+          for i := 0 to MAPIMAGE_SCALE - 1 do
+          begin
+            p := (drawY + i) * MAPIMAGE_CHUNK_SIZE + drawX;
+            for j := 0 to MAPIMAGE_SCALE - 1 do
+            begin
+              if MAPIMAGE_TILE_SHAPE[rotIdx + MAPIMAGE_TILE_ROTATION[k]] <> 0 then
+                pixels[p + j] := overlayRgb;
+              Inc(k);
+            end;
+          end;
+      end;
+    end;
+  end;
+end;
+
+// One `image.setRGB(gx, gy, rgb)` on the whole-map canvas, clipped to the chunk
+// whose top-left canvas pixel is (originX, originY). A write that falls outside
+// belongs to a neighbouring chunk and is dropped.
+procedure _MapPut(data: PColorBGRA; originX, originY, gx, gy, rgb: Integer);
+var
+  lx, ly: Integer;
+begin
+  lx := gx - originX;
+  if (lx < 0) or (lx >= MAPIMAGE_CHUNK_SIZE) then Exit;
+  ly := gy - originY;
+  if (ly < 0) or (ly >= MAPIMAGE_CHUNK_SIZE) then Exit;
+
+  lx := ly * MAPIMAGE_CHUNK_SIZE + lx;
+  data[lx]^.R := (rgb shr 16) and $FF;
+  data[lx]^.G := (rgb shr 8) and $FF;
+  data[lx]^.B := rgb and $FF;
+  data[lx]^.A := 255;
+end;
+
+(*
+## _MapBlitIcon
+```pascal
+procedure _MapBlitIcon(data: PColorBGRA; originX, originY, x, y: Integer; sprite: TSpriteDefinition);
+```
+`SimbaMapImageDumper.blitIcon` (`:988-1007`): the sprite's own `OffsetX`/
+`OffsetY` are added to the destination, and a source pixel equal to 0 is
+transparent. Cache sprites encode black as `$000001` precisely so it survives
+that test, which is why icon outlines come out as `(0,0,1)` and not as holes.
+
+The Java clips against the whole-map canvas; this clips against the chunk, which
+is a subset of it, so the two agree on every pixel that could be visible.
+*)
+procedure _MapBlitIcon(data: PColorBGRA; originX, originY, x, y: Integer; sprite: TSpriteDefinition);
+var
+  xo, yo, rgb, w, h: Integer;
+begin
+  x += sprite.OffsetX;
+  y += sprite.OffsetY;
+
+  w := sprite.Width;
+  h := sprite.Height;
+
+  for yo := 0 to h - 1 do
+    for xo := 0 to w - 1 do
+    begin
+      rgb := sprite.Pixels[xo + yo * w];
+      if rgb <> 0 then
+        _MapPut(data, originX, originY, x + xo, y + yo, rgb);
+    end;
+end;
+
+// blitMapDecoration (`:980-986`): the mapscene sprite centred on the object's
+// footprint. Both divisions truncate toward zero and can go negative when the
+// sprite is wider than the object, exactly as Java's `/` does.
+procedure TMapImage.BlitDecoration(data: PColorBGRA; originX, originY, x, y, objId: Integer);
+var
+  scene, ox, oy: Integer;
+begin
+  scene := Self.ObjMapScene[objId];
+  if (scene < 0) or (scene > High(Self.Scenes)) then
+    raise 'MapImage: object ' + ToStr(objId) + ' names mapscene ' + ToStr(scene) +
+          ', which the archive does not hold';
+
+  ox := (Self.ObjSizeX[objId] * MAPIMAGE_SCALE - Self.Scenes[scene].Width) div 2;
+  oy := (Self.ObjSizeY[objId] * MAPIMAGE_SCALE - Self.Scenes[scene].Height) div 2;
+  _MapBlitIcon(data, originX, originY, x + ox, y + oy, Self.Scenes[scene]);
+end;
+
+(*
+## TMapImage.DrawObjects
+```pascal
+procedure TMapImage.DrawObjects(data: PColorBGRA; reg: TMapRegion; originX, originY, z: Integer);
+```
+`drawObjects` (`:602-791`): walls, doors, diagonals and mapscene decorations for
+one region, clipped to the chunk at `(originX, originY)`.
+
+Differences from the collision dumper's object pass, all of them real:
+no `interactType` filter, no `type in 4..8` skip, no `type = 22` rule, no
+Wintertodt id special case, and **no footprint rectangle** for types 10..22 -
+there is no `collisionColor` analogue here.
+
+Selection per tile is the same bridge/push-down shape as the terrain composite,
+except that here `pushDownLocs` **is** populated (`:642`), unlike the identically
+named dead list in the collision dumper.
+
+The three `if`s in the Java body are not mutually exclusive and are kept that
+way: a type-9 location with no mapscene draws its diagonal in the second and
+then falls into the third, where it does nothing; one *with* a mapscene blits and
+`continue`s so the third never sees it.
+*)
+procedure TMapImage.DrawObjects(data: PColorBGRA; reg: TMapRegion; originX, originY, z: Integer);
+var
+  oi, tileIdx, localX, localY, tileZ, planeSize, base: Integer;
+  pass, k, li, id, locType, rotation, drawX, drawY, rgb, i, gy: Integer;
+  wantPlane: Integer;
+  doMain, doAbove: Boolean;
+begin
+  if not reg.Valid then Exit;
+
+  planeSize := REGION_X * REGION_Y;
+  base := z * planeSize;
+
+  for oi := 0 to High(reg.Occupied) do
+  begin
+    tileIdx := reg.Occupied[oi];
+    localX := tileIdx div REGION_Y;
+    localY := tileIdx - localX * REGION_Y;
+
+    // :621-622. A bridge deck pulls the locations of the plane above down.
+    tileZ := z;
+    if (reg.Settings[planeSize + tileIdx] and 2) <> 0 then tileZ += 1;
+
+    doMain := (reg.Settings[base + tileIdx] and 24) = 0;         // :635
+    doAbove := False;
+    if z < 3 then                                                 // :639-644
+      doAbove := (reg.Settings[base + planeSize + tileIdx] and 8) <> 0;
+
+    for pass := 0 to 1 do
+    begin
+      if (pass = 0) and (not doMain) then Continue;
+      if (pass = 1) and (not doAbove) then Continue;
+      wantPlane := tileZ + pass;
+
+      for k := reg.TileStart[tileIdx] to reg.TileStart[tileIdx + 1] - 1 do
+      begin
+        li := reg.Order[k];
+        if reg.Locs[li].Plane <> wantPlane then Continue;
+
+        locType := reg.Locs[li].LocType;
+        // Types 4..8, 12..21 and 23..63 match none of the three blocks below,
+        // and the Java never even looks their object up. Filtering here keeps
+        // the id check off locations that are allowed to be anything.
+        if (locType > 3) and (locType <> 9) and (locType <> 10) and
+           (locType <> 11) and (locType <> 22) then Continue;
+
+        id := reg.Locs[li].Id;
+        if (id < 0) or (id > Self.ObjMaxId) or (not Self.ObjKnown[id]) then
+          raise 'MapImage: region ' + ToStr(reg.Id) + ' places object ' + ToStr(id) +
+                ', which the cache does not hold';
+
+        rotation := reg.Locs[li].Orientation;
+        drawX := (reg.DrawBaseX + localX) * MAPIMAGE_SCALE;
+        drawY := (reg.DrawBaseY + (REGION_Y - Self.ObjSizeY[id] - localY)) * MAPIMAGE_SCALE;
+
+        // --- :649-735, walls, doors and corners --------------------------
+        if (locType >= 0) and (locType <= 3) then
+        begin
+          rgb := MAPIMAGE_WALL_RGB;
+          if Self.ObjWallOrDoor[id] <> 0 then rgb := MAPIMAGE_DOOR_RGB;
+
+          if Self.ObjMapScene[id] <> -1 then
+            Self.BlitDecoration(data, originX, originY, drawX, drawY, id)
+          // :669. Canvas bounds, not chunk bounds.
+          else if (drawX >= 0) and (drawY >= 0) and
+                  (drawX < Self.CanvasWidth) and (drawY < Self.CanvasHeight) then
+          begin
+            if (locType = 0) or (locType = 2) then
+              for i := 0 to MAPIMAGE_SCALE - 1 do
+                case rotation of
+                  0: _MapPut(data, originX, originY, drawX, drawY + i, rgb);
+                  1: _MapPut(data, originX, originY, drawX + i, drawY, rgb);
+                  2: _MapPut(data, originX, originY, drawX + MAPIMAGE_SCALE - 1, drawY + i, rgb);
+                  3: _MapPut(data, originX, originY, drawX + i, drawY + MAPIMAGE_SCALE - 1, rgb);
+                end;
+
+            if locType = 3 then                                   // :699-705
+              case rotation of
+                0: _MapPut(data, originX, originY, drawX, drawY, rgb);
+                1: _MapPut(data, originX, originY, drawX + MAPIMAGE_SCALE - 1, drawY, rgb);
+                2: _MapPut(data, originX, originY, drawX + MAPIMAGE_SCALE - 1, drawY + MAPIMAGE_SCALE - 1, rgb);
+                3: _MapPut(data, originX, originY, drawX, drawY + MAPIMAGE_SCALE - 1, rgb);
+              end;
+
+            // :707-733. A type 2 draws a SECOND edge, and its rotations index
+            // the four edges differently from the block above.
+            if locType = 2 then
+              for i := 0 to MAPIMAGE_SCALE - 1 do
+                case rotation of
+                  0: _MapPut(data, originX, originY, drawX + i, drawY, rgb);
+                  1: _MapPut(data, originX, originY, drawX + MAPIMAGE_SCALE - 1, drawY + i, rgb);
+                  2: _MapPut(data, originX, originY, drawX + i, drawY + MAPIMAGE_SCALE - 1, rgb);
+                  3: _MapPut(data, originX, originY, drawX, drawY + i, rgb);
+                end;
+          end;
+        end;
+
+        // --- :737-773, the diagonal --------------------------------------
+        if locType = 9 then
+        begin
+          if Self.ObjMapScene[id] <> -1 then
+          begin
+            Self.BlitDecoration(data, originX, originY, drawX, drawY, id);
+            Continue;                                             // :749
+          end;
+
+          if (drawX >= 0) and (drawY >= 0) and
+             (drawX < Self.CanvasWidth) and (drawY < Self.CanvasHeight) then
+          begin
+            rgb := MAPIMAGE_WALL_RGB;
+            if Self.ObjWallOrDoor[id] <> 0 then rgb := MAPIMAGE_DOOR_RGB;
+
+            for i := 0 to MAPIMAGE_SCALE - 1 do
+            begin
+              if (rotation <> 0) and (rotation <> 2) then gy := drawY + i
+              else gy := drawY + (MAPIMAGE_SCALE - 1 - i);
+              _MapPut(data, originX, originY, drawX + i, gy, rgb);
+            end;
+          end;
+        end;
+
+        // --- :775-786, mapscene only -------------------------------------
+        if (locType = 22) or ((locType >= 9) and (locType <= 11)) then
+          if Self.ObjMapScene[id] <> -1 then
+            Self.BlitDecoration(data, originX, originY, drawX, drawY, id);
+      end;
+    end;
+  end;
+end;
+
+(*
+## TMapImage.DrawIcons
+```pascal
+procedure TMapImage.DrawIcons(data: PColorBGRA; reg: TMapRegion; originX, originY, z: Integer);
+```
+`drawMapIcons` (`:874-910`): the area icon of every location whose object carries
+a `mapAreaId`, clipped to the chunk at `(originX, originY)`. This is the entire
+difference between `map.zip` and `map-noicons.zip` - 956 of 11732 chunks - and
+nothing else in the dumper is gated on `renderIcons`.
+
+Two things here that no other pass does:
+
+* it walks **every** location in the region, in file order, with no roof or
+  push-down filter - only `localZ = tileZ`;
+* it centres on the sprite's `MaxWidth`/`MaxHeight` (`:905-906`) and then offsets
+  by its `OffsetX`/`OffsetY` inside `blitIcon`, while
+  {ref}`TMapImage.BlitDecoration` centres on `Width`/`Height`. Three different
+  size fields across the two call sites, and mixing them up is a silent
+  one-pixel shift.
+*)
+procedure TMapImage.DrawIcons(data: PColorBGRA; reg: TMapRegion; originX, originY, z: Integer);
+var
+  i, localX, localY, tileZ, planeSize, id, areaId, archive: Integer;
+  drawX, drawY: Integer;
+  sprite: TSpriteDefinition;
+begin
+  if not reg.Valid then Exit;
+  planeSize := REGION_X * REGION_Y;
+
+  for i := 0 to High(reg.Locs) do
+  begin
+    localX := reg.Locs[i].X;
+    localY := reg.Locs[i].Y;
+
+    tileZ := z;
+    if (reg.Settings[planeSize + localX * REGION_Y + localY] and 2) <> 0 then tileZ += 1;
+    if reg.Locs[i].Plane <> tileZ then Continue;
+
+    id := reg.Locs[i].Id;
+    if (id < 0) or (id > Self.ObjMaxId) or (not Self.ObjKnown[id]) then
+      raise 'MapImage: region ' + ToStr(reg.Id) + ' places object ' + ToStr(id) +
+            ', which the cache does not hold';
+
+    areaId := Self.ObjMapArea[id];
+    if areaId = -1 then Continue;
+
+    if (areaId < 0) or (areaId > Self.AreaMaxId) then
+      raise 'MapImage: object ' + ToStr(id) + ' names area ' + ToStr(areaId) +
+            ', which the cache does not hold';
+    archive := Self.AreaSprite[areaId];
+    if archive < 0 then
+      raise 'MapImage: area ' + ToStr(areaId) + ' has no sprite';
+
+    sprite := Self.IconSprite(archive);
+
+    drawX := reg.DrawBaseX + localX;
+    drawY := reg.DrawBaseY + (REGION_Y - 1 - localY);
+
+    _MapBlitIcon(data, originX, originY,
+                 2 + drawX * MAPIMAGE_SCALE - sprite.MaxWidth div 2,
+                 2 + drawY * MAPIMAGE_SCALE - sprite.MaxHeight div 2,
+                 sprite);
+  end;
+end;
+
+// The blend buffer for plane `z` of the region being rendered, built on first
+// use. drawTile does the same lazily through its `int[4][][] map` local (`:346-352`).
+procedure TMapImage.EnsurePlane(regs: array of TMapRegion; centre, z: Integer);
+begin
+  if Self.PlaneBuilt[z] then Exit;
+  Self.BuildPlane(regs, centre, z);
+  Self.PlaneBuilt[z] := True;
+end;
+
+// drawTile's blit (`:354-366`): one tile's 4x4 out of a plane buffer, skipping
+// source pixels equal to 0 so an unpainted sub-pixel leaves what is underneath.
+// The buffer and the chunk share a coordinate space, so source and destination
+// index are the same number.
+procedure TMapImage.BlitTile(data: PColorBGRA; plane, tx, ty: Integer);
+var
+  i, j, argb, p: Integer;
+  buf: TIntegerArray;
+begin
+  buf := Self.PlaneBuf[plane];
+
+  for j := 0 to MAPIMAGE_SCALE - 1 do
+  begin
+    p := (ty * MAPIMAGE_SCALE + j) * MAPIMAGE_CHUNK_SIZE + tx * MAPIMAGE_SCALE;
+    for i := 0 to MAPIMAGE_SCALE - 1 do
+    begin
+      argb := buf[p + i];
+      if argb <> 0 then
+      begin
+        data[p + i]^.R := (argb shr 16) and $FF;
+        data[p + i]^.G := (argb shr 8) and $FF;
+        data[p + i]^.B := argb and $FF;
+        data[p + i]^.A := 255;
+      end;
+    end;
+  end;
+end;
+
+// drawRegions(image, drawBaseX, drawBaseY, z, region) (`:310-342`): the blended
+// plane buffers composited onto the chunk, with the bridge and push-down rules
+// deciding which buffer each tile takes.
+procedure TMapImage.DrawTerrain(data: PColorBGRA; regs: array of TMapRegion; centre, z: Integer);
+var
+  settings: TIntegerArray;
+  x, y, invertedY, tileZ, planeSize, tileSetting, upSetting, idx: Integer;
+  isBridge: Boolean;
+begin
+  planeSize := REGION_X * REGION_Y;
+  settings := regs[centre].Settings;
+
+  for x := 0 to REGION_X - 1 do
+    for y := 0 to REGION_Y - 1 do
+    begin
+      invertedY := REGION_Y - y - 1;
+      idx := x * REGION_Y + invertedY;
+      isBridge := (settings[planeSize + idx] and 2) <> 0;
+
+      tileZ := z;
+      if isBridge then tileZ += 1;
+      if tileZ >= REGION_Z then Continue;
+
+      tileSetting := settings[z * planeSize + idx];
+      if (tileSetting and 24) = 0 then
+      begin
+        if (z = 0) and isBridge then
+        begin
+          Self.EnsurePlane(regs, centre, 0);
+          Self.BlitTile(data, 0, x, y);
+        end;
+        Self.EnsurePlane(regs, centre, tileZ);
+        Self.BlitTile(data, tileZ, x, y);
+      end;
+
+      if tileZ < 3 then
+      begin
+        upSetting := settings[(z + 1) * planeSize + idx];
+        if (upSetting and 8) <> 0 then
+        begin
+          Self.EnsurePlane(regs, centre, tileZ + 1);
+          Self.BlitTile(data, tileZ + 1, x, y);
+        end;
+      end;
+    end;
+end;
+
+(*
+## TMapImage.ChunkName
+```pascal
+function TMapImage.ChunkName(regionX, regionY, z: Integer): String;
+```
+The zip entry name for one chunk: `<plane>-<regionX>-<regionY>.png` (`:303`).
+This exact spelling is what WaspLib's map loader looks chunks up by - see
+`main/position/map/maploader.simba`.
+*)
+function TMapImage.ChunkName(regionX, regionY, z: Integer): String;
+begin
+  Result := ToStr(z) + '-' + ToStr(regionX) + '-' + ToStr(regionY) + '.png';
+end;
+
+(*
+## TMapImage.Render
+```pascal
+function TMapImage.Render(regionX, regionY, z: Integer): TImage;
+```
+One 256x256 chunk of `map.zip`.
+
+The 3x3 window is composited in `HashMap` draw order (see the unit docstring):
+every region in it contributes its objects and its icons, and the centre also
+contributes its terrain, in the slot its own bucket puts it in. Neighbours whose
+bleed lands here *before* the centre's terrain is painted are therefore erased by
+it, and those drawn after survive - which is what the Java's single shared canvas
+does for free.
+
+A fresh `TImage` is black with an opaque alpha, which is exactly the
+`TYPE_INT_RGB` canvas the Java allocates, so nothing has to be cleared first.
+*)
+function TMapImage.Render(regionX, regionY, z: Integer): TImage;
+var
+  regs: array of TMapRegion;
+  data: PColorBGRA;
+  i, centre, id, originX, originY: Integer;
+begin
+  if (z < 0) or (z >= REGION_Z) then
+    raise 'MapImage: plane ' + ToStr(z) + ' is out of range';
+  if not Self.RegionExists(regionX, regionY) then
+    raise 'MapImage: no region at ' + ToStr(regionX) + ',' + ToStr(regionY);
+
+  id := RegionIdOf(regionX, regionY);
+  regs := Self.Neighbourhood(regionX, regionY);
+
+  centre := -1;
+  for i := 0 to High(regs) do
+    if regs[i].Id = id then centre := i;
+  if centre = -1 then
+    raise 'MapImage: region ' + ToStr(id) + ' is missing from its own neighbourhood';
+  if not regs[centre].Valid then
+    raise 'MapImage: region ' + ToStr(id) + ' has no terrain';
+
+  // The four blend buffers belong to one region; a caller sweeping planes 0..3
+  // of the same region therefore pays for them once.
+  if Self.PlaneRegion <> id then
+  begin
+    Self.PlaneRegion := id;
+    for i := 0 to REGION_Z - 1 do Self.PlaneBuilt[i] := False;
+  end;
+
+  Result := new TImage(MAPIMAGE_CHUNK_SIZE, MAPIMAGE_CHUNK_SIZE);
+  data := Result.Data;
+
+  originX := regs[centre].DrawBaseX * MAPIMAGE_SCALE;
+  originY := regs[centre].DrawBaseY * MAPIMAGE_SCALE;
+
+  for i := 0 to High(regs) do
+  begin
+    if i = centre then
+      Self.DrawTerrain(data, regs, centre, z);
+    Self.DrawObjects(data, regs[i], originX, originY, z);
+    Self.DrawIcons(data, regs[i], originX, originY, z);
+  end;
+end;

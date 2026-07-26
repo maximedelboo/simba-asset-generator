@@ -1,0 +1,1059 @@
+(*
+# Dump Objects
+Produces `map/objects.zip`: one compact JSON array per populated map chunk,
+named `<plane>-<regionX>-<regionY>.json`, listing every object placement the
+map renderer would draw there.
+
+The Java this replaces is `SimbaObjectInfoDumper`, which writes the zip itself
+rather than leaving a directory for the CI to compress.
+
+## This artifact deliberately does NOT match the committed zip
+Every one of the 48857 entries in `wasp-assets/map/objects.zip` carries the same
+`size[2]` (523) and the same `colors`. That is a defect in the Java, not a
+property of the data: `SimbaObjectInfoDumper.java:331,350` memoises the computed
+geometry under `object.getObjectID()`, and `ObjectDefinition.objectID`
+(`ObjectDefinition.java:66`) is declared and **never assigned anywhere in the
+repository**. Every lookup and every store therefore uses key 0, so the first
+object processed stamps its height and colour list onto all 48857 entries.
+`getId()` is the field that actually holds the id; `getObjectID()` is a
+different, dead one that Lombok gave a getter to. Full analysis in
+`docs/phase2-objects-degeneracy.md`.
+
+This unit emits the correct per-object values, so:
+
+| field | against the committed zip |
+|---|---|
+| `id`, `name`, `type`, `category`, `actions`, `coordinates`, `size[0]`, `size[1]`, `rotations` | **identical** |
+| entry names, entry order, JSON framing | **identical** |
+| `size[2]`, `colors` | **different, on purpose** |
+
+`hashes.json` for `objects.zip` will therefore never match the Java pipeline's,
+and that is the intended outcome. `dev/tests/413_objects.simba` asserts the
+first group exactly and asserts of the second only that it is *not* degenerate -
+more than one distinct height, more than one distinct colour set - so a
+regression back to a single constant fails loudly instead of quietly restoring
+"parity".
+
+## What decides the entry order
+Two nested rules, and both have to be computed rather than assumed.
+
+1. **Plane-major.** `for (int i = 0; i < Region.Z; ++i) dumper.mapRegions(i, zip)`
+   (`SimbaObjectInfoDumper.java:146`), so the zip is four blocks: every plane-0
+   chunk, then every plane-1 chunk, and so on. Measured on the committed file:
+   1606 / 650 / 388 / 141.
+2. **Java `HashMap` bucket order over region ids**, because the inner loop is
+   `for (Region region : regionLoader.getRegions())` and `getRegions()` returns
+   `HashMap<Integer, Region>.values()` (`RegionLoader.java:52`) keyed by
+   `regionId = (x shl 8) or y`, inserted ascending. See
+   {ref}`ObjectDumpTableSize` and {ref}`ObjectDumpBucketOrder`.
+
+   The table size on cache 2625 works out to 4096, which is why the research
+   could describe the order as `sort by (regionId mod 4096, regionId)` - but
+   4096 only bounds the region count to 1537..3072. **Nothing here hardcodes
+   it.** Cross 3072 regions in a future revision and the table becomes 8192 and
+   every entry in the file moves.
+
+## Three data-dependent values this unit computes
+Hardcoding any of them turns a revision change into a silent whole-file diff.
+
+- **`highestY.baseY`** - `drawBaseY = regionLoader.getHighestY().getBaseY() -
+  region.getBaseY()` (`:426`), the max `baseY` over the regions actually loaded.
+  It is 12544 on cache 2625, and it is a term in **every Y coordinate in the
+  file**. {ref}`TObjectDump.Create` derives it from the idx5 reference table.
+
+  Java loads a region for every idx5 archive whose id is below `MAX_REGION`
+  (`RegionLoader.java:70-80`); `loadMapDef` can only return null when the
+  archive is absent from the index, and our id list comes *from* the index, so
+  the two sets are the same by construction. {ref}`TObjectDump.LoadRegions`
+  raises rather than skipping if one of them turns out to have no terrain,
+  because that would move `highestY` without anything saying so.
+
+  **No test can tell a hardcoded 12544 from this computation on the caches we
+  have.** Both OpenRS2 2625 and 2639 declare the same 2933 regions and the same
+  `highestY.baseY` of 12544, so substituting the constant produces byte-identical
+  output and `dev/tests/413_objects.simba` passes. That is precisely what makes
+  the trap silent: the day a revision adds a region south of row 196, a hardcode
+  shifts every Y coordinate in the file and nothing says why. The only defence is
+  that the value is derived here rather than written down.
+- **The `HashMap` table size**, above.
+- **The set of regions**, which is read from idx5 and not assumed to be dense.
+
+## Order-dependent shared state, reproduced rather than avoided
+`resolveMorphedObject` (`:243-263`) does more than pick a definition: when it
+falls through to a morph target whose category is 0, it writes the *base*
+object's category into that target and the write **persists for the rest of the
+run** (`:255`). It is a mutation of `ObjectManager`'s shared definition, so a
+morphed object's category is decided by whichever base resolved to it first, and
+chunks dumped before that point ship a different value from chunks dumped after.
+33 object ids in the committed zip appear with two different categories because
+of it.
+
+That is why {ref}`TObjectDump.Run` walks planes and regions in exactly the Java's
+order instead of the cheaper region-major order: the *selection* a morph makes is
+order-independent (`isValidObject` never reads a category), but the value it
+emits is not.
+
+## Memoisation: per model, never per entity
+The Java bug lives in an entity-level memo, so this unit does not have one.
+{ref}`TObjectDump.ModelStat` caches {ref}`TModelStats.OfModel` by **model id**,
+which is provably transparent - a model's height and colours are a pure function
+of its own bytes, and 15882 objects share far fewer models between them. The
+entity-level loop that combines them is re-run per emitted entry, exactly as
+`SimbaNPCDumper` does it and exactly as {ref}`TModelStats.OfModels` spells it
+out: height from the first model only, colours concatenated across every model
+with no cross-model dedup, and no recolour or retexture applied.
+
+## Layout notes
+- Entry name is `z + "-" + region.getRegionX() + "-" + region.getRegionY() +
+  ".json"` (`:435`), and an empty chunk is **skipped** - `exportEmptyJSONs` is
+  `false` (`:70`), so the committed file has 2785 entries for 2933 x 4 = 11732
+  possible ones.
+- The JSON is `JsonArray.toString()`: compact, no trailing newline, and **not**
+  HTML-escaped, because `JsonElement.toString()` builds a bare `JsonWriter`
+  whose `htmlSafe` default is false. `<col=00ffff>` and apostrophes go out raw -
+  use {ref}`JSONEscape`, not {ref}`JSONEscapeHTML`. Key order is the literal
+  insertion order of `:373-411`: `id, name, type, category, actions,
+  coordinates, size, rotations, colors`.
+- Every number is an integer. Nothing here may ever emit `1.0`.
+*)
+{$DEFINE WL_CACHE_DUMP_OBJECTS_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ZIPWRITER_INCLUDED}{$INCLUDE_ONCE zipwriter.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_MODELSTATS_INCLUDED}{$INCLUDE_ONCE modelstats.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_REGION_INCLUDED}{$INCLUDE_ONCE ../region.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_OBJECT_INCLUDED}{$INCLUDE_ONCE ../defs/object.simba}{$ENDIF}
+
+const
+  // SimbaObjectInfoDumper.MAP_SCALE - pixels per map square along one axis.
+  OBJDUMP_MAP_SCALE: Integer = 4;
+
+  // Tiles per region, and the number of (tile, plane) slots a location can
+  // occupy: 64 x 64 x 4 = 16384.
+  OBJDUMP_TILES: Integer = 4096;
+  OBJDUMP_SLOTS: Integer = 16384;
+
+(*
+## ObjectDumpSpread
+```pascal
+function ObjectDumpSpread(key: Integer): Integer;
+```
+`java.util.HashMap.hash` for a boxed `Integer` key: `h xor (h >>> 16)`, where an
+`Integer`'s own `hashCode` is its value.
+
+Java's `>>>` is the **logical** shift and Lape's `shr` is logical too, so a plain
+`shr` is right here - unlike `>>`, which would need an arithmetic helper. Region
+ids are non-negative and below 65536 anyway, so every one of them spreads to
+itself; the mix only starts to matter above that, and it is written out in full
+so a larger id space does not silently break the order.
+*)
+function ObjectDumpSpread(key: Integer): Integer;
+begin
+  Result := key xor (key shr 16);
+end;
+
+(*
+## ObjectDumpTableSize
+```pascal
+function ObjectDumpTableSize(count: Integer): Integer;
+```
+The table capacity a default-constructed `java.util.HashMap` ends up with after
+`count` insertions: start at 16 with a threshold of `0.75 * capacity`, and double
+both the moment the size passes the threshold.
+
+Capacity is what `bucket = spread(key) and (capacity - 1)` is taken modulo, so it
+decides the entire entry order of `map/objects.zip`. On cache 2625 the answer is
+4096 for 2933 regions - but 4096 only tells you the count was between 1537 and
+3072, which is exactly why this is computed. A revision with 3073 regions gets
+8192 and a completely different file.
+
+```pascal
+WriteLn ObjectDumpTableSize(2933);  // 4096
+WriteLn ObjectDumpTableSize(3073);  // 8192
+```
+*)
+function ObjectDumpTableSize(count: Integer): Integer;
+var
+  size, threshold: Integer;
+begin
+  Result := 16;
+  threshold := 12;   // 0.75 * 16, the DEFAULT_LOAD_FACTOR
+  for size := 1 to count do
+    if size > threshold then
+    begin
+      Result *= 2;
+      threshold := (Result * 3) div 4;
+    end;
+end;
+
+(*
+## ObjectDumpBucketOrder
+```pascal
+function ObjectDumpBucketOrder(keys: TIntegerArray): TIntegerArray;
+```
+Positions into `keys` in the order a `java.util.HashMap` iterates them: buckets
+`0 .. capacity-1` ascending and, within a bucket, insertion order - which is the
+order `keys` is given in.
+
+Java 8 preserves a bin's relative order across a resize, so the chain never gets
+reshuffled and one pass over the final capacity reproduces the whole sequence.
+The one thing that would break that is treeification, which reorders a bin into
+red-black order once it holds 8 entries at a capacity of 64 or more. It cannot
+happen for this key set: with 2933 region ids the fullest bin ever reaches is 6,
+and the final table has at most 3 per bin.
+
+Implemented as a stable counting sort over the buckets, so it is one pass over
+`keys` plus one over the table rather than a comparison sort.
+
+```pascal
+WriteLn ObjectDumpBucketOrder([5, 21, 3, 37, 1]);  // [4, 2, 0, 1, 3]
+```
+*)
+function ObjectDumpBucketOrder(keys: TIntegerArray): TIntegerArray;
+var
+  start: TIntegerArray;
+  capacity, mask, i, b: Integer;
+begin
+  Result := [];
+  if Length(keys) = 0 then Exit;
+
+  capacity := ObjectDumpTableSize(Length(keys));
+  mask := capacity - 1;
+
+  // start[b + 1] counts bucket b, then a prefix sum turns it into that
+  // bucket's first output slot. SetLength keeps the overlapping prefix of
+  // whatever the slot held, hence the `:= []` first.
+  start := [];
+  SetLength(start, capacity + 1);
+  for i := 0 to High(keys) do
+  begin
+    b := ObjectDumpSpread(keys[i]) and mask;
+    Inc(start[b + 1]);
+  end;
+  for b := 1 to capacity do
+    start[b] += start[b - 1];
+
+  SetLength(Result, Length(keys));
+  for i := 0 to High(keys) do
+  begin
+    b := ObjectDumpSpread(keys[i]) and mask;
+    Result[start[b]] := i;
+    Inc(start[b]);
+  end;
+end;
+
+// `[a,b,c]`, always integers - never a float, and never an empty pair of
+// braces where the Java writes `[]`.
+function _ObjDumpInts(values: TIntegerArray): String;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 0 to High(values) do
+  begin
+    if i > 0 then Result += ',';
+    Result += ToStr(values[i]);
+  end;
+  Result += ']';
+end;
+
+// The `actions` array: every op slot the cache set, in slot order, with the
+// holes dropped - `SimbaObjectInfoDumper.java:381-385` skips a null op rather
+// than writing one, so the slot indices are lost. Phase 2 measured this against
+// all 15882 committed object ids.
+function _ObjDumpActions(ops: TEntityOps): String;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 0 to High(ops.Ops) do
+    if ops.Ops[i] <> '' then
+    begin
+      if Result <> '[' then Result += ',';
+      Result += '"' + JSONEscape(ops.Ops[i]) + '"';
+    end;
+  Result += ']';
+end;
+
+// A String as its raw bytes, for TZipWriter.
+function _ObjDumpBytes(s: String): TByteArray;
+begin
+  Result := [];
+  if s = '' then Exit;
+  SetLength(Result, Length(s));
+  Move(s[1], Result[0], Length(s));
+end;
+
+type
+(*
+## TObjectDumpDef
+```pascal
+TObjectDumpDef = record
+  Id: Integer;
+  NameJSON, ActionsJSON: String;
+  SizeX, SizeY, InteractType, WallOrDoor, Category: Integer;
+  Models, ConfigChangeDest: TIntegerArray;
+  IsNullName: Boolean;
+end;
+```
+The slice of a {ref}`TObjectDefinition` this dumper reads, with the two string
+fields already rendered as JSON so they are escaped once rather than once per
+placement.
+
+Holding the full definitions instead would mean 62194 live `TEntityOps` records,
+each of which eagerly allocates a 5 x 20 string grid - about six million string
+slots for four fields that are actually used.
+
+**`Category` is mutable and shared**, which is the whole point: it stands in for
+the `ObjectDefinition` instance `ObjectManager` hands out, and
+{ref}`TObjectDump.ResolveMorph` writes to it mid-dump.
+*)
+  TObjectDumpDef = record
+    Id: Integer;
+    NameJSON: String;
+    ActionsJSON: String;
+    SizeX, SizeY: Integer;
+    InteractType, WallOrDoor: Integer;
+    Category: Integer;
+    Models: TIntegerArray;
+    ConfigChangeDest: TIntegerArray;
+    IsNullName: Boolean;
+  end;
+
+(*
+## TObjectDumpRegion
+```pascal
+TObjectDumpRegion = record
+  Id, RegionX, RegionY, BaseX, BaseY: Integer;
+  Loaded: Boolean;
+  Settings: TByteArray;
+  Locs: array of TLocation;
+  TileXY, PlaneStart: TIntegerArray;
+end;
+```
+One region, kept in the shape the tile loop wants rather than the shape
+{ref}`TRegion` decodes into.
+
+The dump visits every region four times, once per plane, so the alternative to
+holding this is decoding all 2933 regions four times over - 48 s a pass on this
+machine. Only the settings byte and the locations are kept, not the 16384 full
+tiles.
+
+`Locs` is sorted by `(tile, plane)`, stably, so a tile's locations for one plane
+are a contiguous run. `TileXY` lists the `x * 64 + y` of every tile that has at
+least one location, ascending - which is exactly the `localX` outer / `localY`
+inner order the Java walks - and `PlaneStart` holds five offsets per such tile:
+the start of planes 0..3 and the end of plane 3. A tile with no locations on any
+plane can never emit anything, so skipping it is not a shortcut with a behaviour
+attached; it turns a 16384-iteration sweep per region-plane into one over the
+handful of tiles that can produce output.
+*)
+  TObjectDumpRegion = record
+    Id, RegionX, RegionY, BaseX, BaseY: Integer;
+    Loaded: Boolean;
+    Settings: TByteArray;
+    Locs: array of TLocation;
+    TileXY: TIntegerArray;
+    PlaneStart: TIntegerArray;
+  end;
+
+(*
+## TObjectDump
+```pascal
+TObjectDump = record
+  Defs: array of TObjectDumpDef;
+  Regions: array of TObjectDumpRegion;
+  Order: TIntegerArray;
+  TableSize, HighestBaseY: Integer;
+  Names, Chunks: TStringArray;
+  MorphResolved, CategoryMutations: Integer;
+  MutatedIds: TIntegerArray;
+end;
+```
+The whole dump: build it with {ref}`TObjectDump.Create`, run it with
+{ref}`TObjectDump.Run`, then read `Names` and `Chunks` - two parallel arrays in
+zip-entry order.
+
+`MorphResolved`, `CategoryMutations` and `MutatedIds` are not diagnostics for
+their own sake: they are the measurement of how much of the output depends on
+`resolveMorphedObject`'s shared-state write, which is the one thing here that is
+sensitive to the order regions are walked in.
+*)
+  TObjectDump = record
+    // OBJECT archive, addressed by position; PosOf maps an id to one.
+    Defs: array of TObjectDumpDef;
+    PosOf: TIntegerArray;
+    MaxObjectId: Integer;
+
+    // Model geometry, memoised per model id. See the unit docstring.
+    Textures: array of TTextureDefinition;
+    ModelHeight: TIntegerArray;
+    ModelColors: array of TIntegerArray;
+    ModelKnown: TBooleanArray;
+
+    Regions: array of TObjectDumpRegion;
+    Order: TIntegerArray;
+    TableSize: Integer;
+    HighestBaseY: Integer;
+
+    Names: TStringArray;
+    Chunks: TStringArray;
+
+    MorphResolved: Integer;
+    CategoryMutations: Integer;
+    MutatedIds: TIntegerArray;
+
+    // cleanJSON's "have I already emitted this id in this chunk?" lookup.
+    // A generation stamp instead of clearing 62201 slots per chunk.
+    Stamp: TIntegerArray;
+    StampSlot: TIntegerArray;
+    Gen: Integer;
+  end;
+
+(*
+## TObjectDump.DefPos
+```pascal
+function TObjectDump.DefPos(id: Integer): Integer;
+```
+Position of object `id` in {ref}`TObjectDump.Defs`.
+
+Raises when the OBJECT archive has no such id. That is not defensive - it is
+what the Java does, loudly instead of quietly: `findObject` returns `null` from
+a `HashMap` and the very next line dereferences it, so a location naming an
+absent object crashes `SimbaObjectInfoDumper` with a `NullPointerException`.
+Measured on cache 2625: it never happens, for a location id or for a
+`configChangeDest` entry.
+*)
+function TObjectDump.DefPos(id: Integer): Integer;
+begin
+  if (id < 0) or (id > Self.MaxObjectId) then
+    raise 'DumpObjects: object ' + ToStr(id) + ' is outside the OBJECT archive';
+  Result := Self.PosOf[id];
+  if Result = -1 then
+    raise 'DumpObjects: the OBJECT archive has no object ' + ToStr(id);
+end;
+
+(*
+## TObjectDump.IsValidObject
+```pascal
+function TObjectDump.IsValidObject(locType, pos: Integer): Boolean;
+```
+`SimbaObjectInfoDumper.isValidObject` (`:225-238`), which decides whether a
+placement is drawn at all.
+
+Four gates, in order: a wall/door loc type (0..3, or 9) needs
+`WallOrDoor <> 0`; `InteractType` must not be 0; the object must have models;
+and its name must not be `null` case-insensitively. `TObjectDefinition` stores
+an absent model list as an **empty** array - the loader only ever allocates one
+from a non-zero length - so `Length(Models) = 0` is Java's
+`getObjectModels() == null`.
+
+Reads no category, which is what makes the morph *selection* independent of the
+mutation {ref}`TObjectDump.ResolveMorph` performs.
+*)
+function TObjectDump.IsValidObject(locType, pos: Integer): Boolean;
+begin
+  if ((locType >= 0) and (locType <= 3)) or (locType = 9) then
+    if Self.Defs[pos].WallOrDoor = 0 then Exit(False);
+
+  if Self.Defs[pos].InteractType = 0 then Exit(False);
+  if Length(Self.Defs[pos].Models) = 0 then Exit(False);
+
+  Result := not Self.Defs[pos].IsNullName;
+end;
+
+(*
+## TObjectDump.ResolveMorph
+```pascal
+function TObjectDump.ResolveMorph(locType, basePos: Integer): Integer;
+```
+`SimbaObjectInfoDumper.resolveMorphedObject` (`:243-263`): the position of the
+definition this placement should be drawn as, or **-1** for "skip this location
+entirely".
+
+A valid base object is returned as-is. Otherwise the base's
+`configChangeDest` list is walked in order and the first valid morph wins.
+
+**The side effect is contract, not incidental.** When the chosen morph has
+category 0 and the base does not, the base's category is written into the
+morph's shared definition and stays there for the rest of the run (`:255`). A
+morphed object's category is therefore decided by whichever base reached it
+first, and chunks dumped earlier ship a different value from chunks dumped
+later - 33 ids in the committed zip appear with two categories because of it.
+Reproducing it is why {ref}`TObjectDump.Run` keeps the Java's plane-major walk.
+
+Each id can be mutated at most once: the guard only fires while the target's
+category is still 0, and the write always makes it non-zero.
+*)
+function TObjectDump.ResolveMorph(locType, basePos: Integer): Integer;
+var
+  i, id, pos: Integer;
+begin
+  if Self.IsValidObject(locType, basePos) then Exit(basePos);
+
+  // A null configChangeDest is an empty array here; the loader only allocates
+  // it from opcode 77 or 92, both of which give it at least two entries.
+  if Length(Self.Defs[basePos].ConfigChangeDest) = 0 then Exit(-1);
+
+  for i := 0 to High(Self.Defs[basePos].ConfigChangeDest) do
+  begin
+    id := Self.Defs[basePos].ConfigChangeDest[i];
+    if id = -1 then Continue;
+
+    pos := Self.DefPos(id);
+    if not Self.IsValidObject(locType, pos) then Continue;
+
+    Inc(Self.MorphResolved);
+    if (Self.Defs[pos].Category = 0) and (Self.Defs[basePos].Category <> 0) then
+    begin
+      Self.Defs[pos].Category := Self.Defs[basePos].Category;
+      Inc(Self.CategoryMutations);
+      Self.MutatedIds += id;
+    end;
+    Exit(pos);
+  end;
+
+  Result := -1;
+end;
+
+(*
+## TObjectDump.ModelStat
+```pascal
+function TObjectDump.ModelStat(var store: TCacheStore; model: Integer): TModelStats;
+```
+{ref}`TModelStats.OfModel` for `model`, memoised by model id.
+
+This is the only memo in the unit, and it is a different thing from the one that
+broke the Java: a model's height and colour list are a pure function of that
+model's own bytes, so caching them by id cannot change any result. The Java's
+cache was keyed by an *entity* field that was never assigned, which is a
+correctness bug wearing a performance bug's clothes. The entity-level loop above
+it is deliberately re-run every time.
+
+Without this the 15882 objects the dump emits would decode the same shared
+models tens of thousands of times over.
+*)
+function TObjectDump.ModelStat(var store: TCacheStore; model: Integer): TModelStats;
+begin
+  if (model >= 0) and (model <= High(Self.ModelKnown)) and Self.ModelKnown[model] then
+  begin
+    Result.Height := Self.ModelHeight[model];
+    Result.Colors := Self.ModelColors[model];
+    Exit;
+  end;
+
+  Result := TModelStats.OfModel(store, Self.Textures, model);
+
+  if (model >= 0) and (model <= High(Self.ModelKnown)) then
+  begin
+    Self.ModelKnown[model] := True;
+    Self.ModelHeight[model] := Result.Height;
+    Self.ModelColors[model] := Result.Colors;
+  end;
+end;
+
+(*
+## TObjectDump.EntityStats
+```pascal
+function TObjectDump.EntityStats(var store: TCacheStore; models: TIntegerArray): TModelStats;
+```
+The `height` and `colors` one object contributes, from its `ObjectModels` list.
+
+Byte for byte the loop {ref}`TModelStats.OfModels` spells out - height from the
+first model and only the first, colours concatenated in array order with the
+per-model dedup already applied and no cross-model dedup - just routed through
+{ref}`TObjectDump.ModelStat` so a shared model is decoded once. Kept here rather
+than calling `OfModels` directly for that one reason; the arithmetic is
+identical.
+
+`Result` is a record and is zero-filled per call, so `Height` already starts at
+0 and `Colors` already starts empty - the two seeds the Java writes by hand.
+Appending to `Result.Colors` reallocates, so the memo's array is never mutated
+through the reference this hands out.
+*)
+function TObjectDump.EntityStats(var store: TCacheStore; models: TIntegerArray): TModelStats;
+var
+  i: Integer;
+  one: TModelStats;
+begin
+  for i := 0 to High(models) do
+  begin
+    one := Self.ModelStat(store, models[i]);
+    if Result.Height = 0 then Result.Height := one.Height;
+    Result.Colors := Result.Colors + one.Colors;
+  end;
+end;
+
+(*
+## TObjectDump.Create
+```pascal
+function TObjectDump.Create(var store: TCacheStore): TObjectDump; static;
+```
+Reads everything that does not depend on which regions are dumped: the whole
+OBJECT archive, the texture table, the region id set, and from that set the
+`HashMap` table size, the entry order and `highestY.baseY`.
+
+Cheap enough to do unconditionally - the 62194 object definitions decode in
+under a second on cache 2625 - and it deliberately does **not** load any region.
+{ref}`TObjectDump.LoadRegions` does that, so a caller can dump a subset without
+changing a single coordinate: everything the coordinate maths needs comes from
+the id set, not from the regions that happen to be loaded.
+
+```pascal
+store := TCacheStore.Create(cacheDir);
+dump := TObjectDump.Create(store);
+dump.Run(store, []);
+```
+*)
+function TObjectDump.Create(var store: TCacheStore): TObjectDump; static;
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids, regionIds: TIntegerArray;
+  obj: TObjectDefinition;
+  a, i, n: Integer;
+begin
+  // ---- OBJECT archive ------------------------------------------------------
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.OBJECTS));
+  if a = -1 then
+    raise 'DumpObjects: this cache has no CONFIGS/OBJECT archive';
+
+  ids := table.Archives[a].FileIds;
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.OBJECTS), []);
+  if Length(files) <> Length(ids) then
+    raise 'DumpObjects: the OBJECT archive holds ' + ToStr(Length(files)) +
+          ' files but its reference table names ' + ToStr(Length(ids));
+
+  for i := 0 to High(ids) do
+    if ids[i] > Result.MaxObjectId then Result.MaxObjectId := ids[i];
+
+  Result.PosOf := [];
+  SetLength(Result.PosOf, Result.MaxObjectId + 1);
+  for i := 0 to High(Result.PosOf) do Result.PosOf[i] := -1;
+
+  SetLength(Result.Defs, Length(ids));
+  for i := 0 to High(ids) do
+  begin
+    obj := TObjectDefinition.Load(ids[i], files[i]);
+
+    Result.Defs[i].Id := obj.Id;
+    // JsonElement.toString(), so no HTML-safe escaping: 251 raw '<', 431 raw
+    // apostrophes in the committed zip and not one \uXXXX anywhere.
+    Result.Defs[i].NameJSON := '"' + JSONEscape(obj.Name) + '"';
+    Result.Defs[i].IsNullName := SameText(obj.Name, 'null');
+    Result.Defs[i].ActionsJSON := _ObjDumpActions(obj.Ops);
+    Result.Defs[i].SizeX := obj.SizeX;
+    Result.Defs[i].SizeY := obj.SizeY;
+    Result.Defs[i].InteractType := obj.InteractType;
+    Result.Defs[i].WallOrDoor := obj.WallOrDoor;
+    Result.Defs[i].Category := obj.Category;
+    Result.Defs[i].Models := obj.ObjectModels;
+    Result.Defs[i].ConfigChangeDest := obj.ConfigChangeDest;
+
+    Result.PosOf[ids[i]] := i;
+  end;
+
+  Result.Stamp := [];
+  Result.StampSlot := [];
+  SetLength(Result.Stamp, Result.MaxObjectId + 1);
+  SetLength(Result.StampSlot, Result.MaxObjectId + 1);
+
+  // ---- textures and the per-model memo -------------------------------------
+  Result.Textures := ModelStatsTextures(store);
+
+  n := store.ArchiveCount(Ord(EIndexType.MODELS));
+  Result.ModelHeight := [];
+  Result.ModelColors := [];
+  Result.ModelKnown := [];
+  SetLength(Result.ModelHeight, n);
+  SetLength(Result.ModelColors, n);
+  SetLength(Result.ModelKnown, n);
+
+  // ---- regions -------------------------------------------------------------
+  // RegionLoader walks 0 .. MAX_REGION-1 and keeps every archive it finds, so
+  // the loaded set is exactly the idx5 ids below that bound.
+  table := store.GetRefTable(Ord(EIndexType.MAPS));
+  if table.Named then
+    raise 'DumpObjects: index 5 is named (an OpenRS2-style dump); only the ' +
+          'unnamed live-cache layout is implemented';
+
+  for i := 0 to High(table.Archives) do
+    if (table.Archives[i].Id >= 0) and (table.Archives[i].Id < REGION_MAX_ID) then
+      regionIds += table.Archives[i].Id;
+
+  if Length(regionIds) = 0 then
+    raise 'DumpObjects: index 5 declares no regions';
+
+  SetLength(Result.Regions, Length(regionIds));
+  for i := 0 to High(regionIds) do
+  begin
+    Result.Regions[i].Id := regionIds[i];
+    Result.Regions[i].RegionX := RegionXOf(regionIds[i]);
+    Result.Regions[i].RegionY := RegionYOf(regionIds[i]);
+    Result.Regions[i].BaseX := Result.Regions[i].RegionX shl 6;
+    Result.Regions[i].BaseY := Result.Regions[i].RegionY shl 6;
+
+    // calculateBounds' highestY, and the only one of the four bounds that
+    // reaches the output: drawBaseY = highestY.baseY - region.baseY.
+    if Result.Regions[i].BaseY > Result.HighestBaseY then
+      Result.HighestBaseY := Result.Regions[i].BaseY;
+  end;
+
+  Result.TableSize := ObjectDumpTableSize(Length(regionIds));
+  Result.Order := ObjectDumpBucketOrder(regionIds);
+end;
+
+(*
+## TObjectDump.LoadRegions
+```pascal
+procedure TObjectDump.LoadRegions(var store: TCacheStore; only: TIntegerArray);
+```
+Decodes the regions the run will walk and indexes each one by tile and plane.
+
+`only` is a list of region ids; **empty means every region**. A subset changes
+nothing about coordinates or entry order - both come from the full id set
+{ref}`TObjectDump.Create` read - so it is a way to test a few chunks quickly,
+not a different dump. The one thing it does change is how much of
+`resolveMorphedObject`'s category mutation has happened by the time a given
+chunk is written.
+
+A declared region that decodes without terrain **raises**. Java would simply not
+have that region in its map, which would move `highestY` and shift every Y
+coordinate in the file; that is not a thing to discover from a diff.
+*)
+procedure TObjectDump.LoadRegions(var store: TCacheStore; only: TIntegerArray);
+var
+  wanted: TBooleanArray;
+  start, fill: TIntegerArray;
+  region: TRegion;
+  sorted: array of TLocation;
+  filtering: Boolean;
+  i, j, k, b, t: Integer;
+begin
+  filtering := Length(only) > 0;
+  if filtering then
+  begin
+    wanted := [];
+    SetLength(wanted, REGION_MAX_ID);
+    for i := 0 to High(only) do
+    begin
+      if (only[i] < 0) or (only[i] >= REGION_MAX_ID) then
+        raise 'DumpObjects: region ' + ToStr(only[i]) + ' is not a region id';
+      wanted[only[i]] := True;
+    end;
+  end;
+
+  for i := 0 to High(Self.Regions) do
+  begin
+    if filtering and not wanted[Self.Regions[i].Id] then Continue;
+
+    region := TRegion.Load(store, Self.Regions[i].Id, []);
+    if not region.HasTerrain then
+      raise 'DumpObjects: idx5 declares region ' + ToStr(Self.Regions[i].Id) +
+            ' but it decodes with no terrain; that region is in the Java''s ' +
+            'bounds calculation and its absence would move every Y coordinate';
+
+    Self.Regions[i].Loaded := True;
+
+    Self.Regions[i].Settings := [];
+    SetLength(Self.Regions[i].Settings, REGION_Z * REGION_X * REGION_Y);
+    for j := 0 to High(Self.Regions[i].Settings) do
+      Self.Regions[i].Settings[j] := region.Tiles[j].Settings;
+
+    // ---- index the locations by (tile, plane) -------------------------------
+    // Java rebuilds a HashMap<Long, List<Location>> per region per plane; the
+    // key is the absolute position, which is the region-local one plus a
+    // constant, so a flat (x * 64 + y) * 4 + plane slot is the same partition.
+    // Counting sort, stable, so a slot's locations keep cache order - which is
+    // the order LocationsLoader produced them in and the order the Java's
+    // ArrayList holds them in.
+    start := [];
+    SetLength(start, OBJDUMP_SLOTS + 1);
+    for j := 0 to High(region.Locations) do
+    begin
+      b := ((region.Locations[j].X * REGION_Y) + region.Locations[j].Y) * REGION_Z +
+           region.Locations[j].Plane;
+      Inc(start[b + 1]);
+    end;
+    for b := 1 to OBJDUMP_SLOTS do
+      start[b] += start[b - 1];
+
+    fill := Copy(start);
+    sorted := [];
+    SetLength(sorted, Length(region.Locations));
+    for j := 0 to High(region.Locations) do
+    begin
+      b := ((region.Locations[j].X * REGION_Y) + region.Locations[j].Y) * REGION_Z +
+           region.Locations[j].Plane;
+      sorted[fill[b]] := region.Locations[j];
+      Inc(fill[b]);
+    end;
+    Self.Regions[i].Locs := sorted;
+
+    // Tiles that hold at least one location on any plane, ascending in
+    // x * 64 + y - which is the localX-outer, localY-inner order the Java walks.
+    Self.Regions[i].TileXY := [];
+    Self.Regions[i].PlaneStart := [];
+    for t := 0 to OBJDUMP_TILES - 1 do
+    begin
+      k := t * REGION_Z;
+      if start[k + REGION_Z] = start[k] then Continue;
+      Self.Regions[i].TileXY += t;
+      for b := 0 to REGION_Z do
+        Self.Regions[i].PlaneStart += start[k + b];
+    end;
+  end;
+end;
+
+(*
+## TObjectDump.BuildChunk
+```pascal
+function TObjectDump.BuildChunk(var store: TCacheStore; r, z: Integer): String;
+```
+The JSON array for one chunk - region `r` of {ref}`TObjectDump.Regions`, plane
+`z` - or `''` when it holds nothing, which is the case the Java skips instead of
+writing `[]` (`exportEmptyJSONs` is false).
+
+Three pieces of `mapObjects` (`:277-417`) are load-bearing:
+
+1. **Which locations a tile contributes.** The bridge bit of plane 1 shifts the
+   plane a tile reads from; a `settings and 24` on plane `z` suppresses the
+   tile's own locations; and a `settings and 8` on plane `z + 1` pulls that
+   plane's locations down onto this one. Plane locations are emitted before
+   pushed-down ones (`:320`).
+2. **The image-space transform** (`:355-369`), with `drawBaseX` the region's own
+   `baseX` and `drawBaseY` the *inverted* `highestY.baseY - baseY`. Y is flipped
+   because image space runs top-left and game space bottom-left. The rotated
+   branch only applies to non-square objects.
+3. **`cleanJSON`** (`:203-223`), merging on `id` **alone**: the first placement
+   of an object in a chunk fixes its `name`, `type`, `category`, `size` and
+   `colors`, and every later one only appends a coordinate and a rotation. A
+   second placement with a different loc type silently loses that type. Entry
+   order is order of first occurrence.
+
+Because the merge keeps only the first placement's geometry, the model work runs
+once per emitted entry rather than once per location.
+*)
+function TObjectDump.BuildChunk(var store: TCacheStore; r, z: Integer): String;
+var
+  settings: TByteArray;
+  locs: array of TLocation;
+  tileXY, planeStart: TIntegerArray;
+  heads, coords, rots, sizes, colours: TStringArray;
+  st: TModelStats;
+  drawBaseX, drawBaseY, count: Integer;
+  i, t, localX, localY, plane, pass, lo, hi, k: Integer;
+  tileZ, setZ, locType, basePos, pos, id, slot: Integer;
+  sizeX, sizeY, rotation, rotOut, x, y, xs, ys, cx, cy: Integer;
+begin
+  if not Self.Regions[r].Loaded then Exit('');
+  if Length(Self.Regions[r].TileXY) = 0 then Exit('');
+
+  // Hoisted: a dynamic-array assignment shares by reference, and reaching
+  // through Self.Regions[r] per tile is the difference between one indexed
+  // read and three.
+  settings := Self.Regions[r].Settings;
+  locs := Self.Regions[r].Locs;
+  tileXY := Self.Regions[r].TileXY;
+  planeStart := Self.Regions[r].PlaneStart;
+
+  drawBaseX := Self.Regions[r].BaseX;
+  drawBaseY := Self.HighestBaseY - Self.Regions[r].BaseY;
+
+  Inc(Self.Gen);
+  count := 0;
+
+  for i := 0 to High(tileXY) do
+  begin
+    t := tileXY[i];
+    localX := t div REGION_Y;
+    localY := t mod REGION_Y;
+
+    // getTileSetting(1, x, y) - always plane 1, whatever z is.
+    tileZ := z;
+    if (settings[(REGION_X * REGION_Y) + (localX * REGION_Y) + localY] and 2) <> 0 then
+      Inc(tileZ);
+
+    for pass := 0 to 1 do
+    begin
+      if pass = 0 then
+      begin
+        setZ := settings[(z * REGION_X * REGION_Y) + (localX * REGION_Y) + localY];
+        if (setZ and 24) <> 0 then Continue;
+        plane := tileZ;
+      end
+      else
+      begin
+        if z >= REGION_Z - 1 then Continue;
+        setZ := settings[((z + 1) * REGION_X * REGION_Y) + (localX * REGION_Y) + localY];
+        if (setZ and 8) = 0 then Continue;
+        plane := tileZ + 1;
+      end;
+
+      // tileZ can reach 4 and tileZ + 1 can reach 5; no location decodes above
+      // plane 3, so those lookups are empty in the Java too.
+      if (plane < 0) or (plane >= REGION_Z) then Continue;
+
+      lo := planeStart[i * (REGION_Z + 1) + plane];
+      hi := planeStart[i * (REGION_Z + 1) + plane + 1];
+
+      for k := lo to hi - 1 do
+      begin
+        locType := locs[k].LocType;
+        basePos := Self.DefPos(locs[k].Id);
+        pos := Self.ResolveMorph(locType, basePos);
+        if pos = -1 then Continue;
+
+        rotation := locs[k].Orientation;
+        sizeX := Self.Defs[pos].SizeX;
+        sizeY := Self.Defs[pos].SizeY;
+
+        x := (drawBaseX + localX) * OBJDUMP_MAP_SCALE;
+        y := (drawBaseY + (REGION_Y - sizeY - localY)) * OBJDUMP_MAP_SCALE;
+
+        xs := sizeX * OBJDUMP_MAP_SCALE;
+        ys := sizeY * OBJDUMP_MAP_SCALE;
+
+        cx := x + xs div 2 - 2;
+        cy := y + ys div 2;
+
+        if (sizeX <> sizeY) and ((rotation = 1) or (rotation = 3)) then
+        begin
+          cx := x + ys div 2 - 2;
+          cy := y + ys - xs div 2;
+        end;
+
+        rotOut := rotation;
+        if sizeX = sizeY then rotOut := 0;
+
+        id := Self.Defs[pos].Id;
+        if Self.Stamp[id] = Self.Gen then
+        begin
+          // cleanJSON: same id, so only the coordinate and the rotation land.
+          slot := Self.StampSlot[id];
+          coords[slot] += ',[' + ToStr(cx) + ',' + ToStr(cy) + ']';
+          rots[slot] += ',' + ToStr(rotOut);
+          Continue;
+        end;
+
+        Self.Stamp[id] := Self.Gen;
+        Self.StampSlot[id] := count;
+
+        st := Self.EntityStats(store, Self.Defs[pos].Models);
+
+        heads += '{"id":' + ToStr(id) +
+                 ',"name":' + Self.Defs[pos].NameJSON +
+                 ',"type":' + ToStr(locType) +
+                 ',"category":' + ToStr(Self.Defs[pos].Category) +
+                 ',"actions":' + Self.Defs[pos].ActionsJSON;
+        coords += '[' + ToStr(cx) + ',' + ToStr(cy) + ']';
+        rots += ToStr(rotOut);
+        sizes += '[' + ToStr(sizeX) + ',' + ToStr(sizeY) + ',' + ToStr(st.Height) + ']';
+        colours += _ObjDumpInts(st.Colors);
+        Inc(count);
+      end;
+    end;
+  end;
+
+  if count = 0 then Exit('');
+
+  Result := '[';
+  for i := 0 to count - 1 do
+  begin
+    if i > 0 then Result += ',';
+    Result += heads[i] +
+              ',"coordinates":[' + coords[i] + ']' +
+              ',"size":' + sizes[i] +
+              ',"rotations":[' + rots[i] + ']' +
+              ',"colors":' + colours[i] + '}';
+  end;
+  Result += ']';
+end;
+
+(*
+## TObjectDump.Run
+```pascal
+procedure TObjectDump.Run(var store: TCacheStore; only: TIntegerArray);
+```
+Walks every plane and every region and fills `Names` and `Chunks` - two parallel
+arrays in zip-entry order.
+
+`only` is passed straight to {ref}`TObjectDump.LoadRegions`; empty means the
+whole map.
+
+The walk is **plane-major over regions in `HashMap` bucket order**, which is the
+Java's and is not negotiable for two independent reasons: it is the entry order
+of the zip, and it is the order `resolveMorphedObject`'s category mutation
+happens in. Region-major would be one region decode instead of four and would
+still produce the right coordinates - and the wrong categories.
+
+**One run per {ref}`TObjectDump.Create`.** The category mutations
+{ref}`TObjectDump.ResolveMorph` performs are not undone, so a second `Run` on
+the same record starts from a definition table that is already partly mutated
+and produces different categories - the same thing a second dump against one
+live `ObjectManager` would do in Java. Build a fresh dump instead.
+*)
+procedure TObjectDump.Run(var store: TCacheStore; only: TIntegerArray);
+var
+  z, i, r: Integer;
+  text: String;
+begin
+  Self.LoadRegions(store, only);
+
+  Self.Names := [];
+  Self.Chunks := [];
+
+  // Gen is deliberately NOT reset: `Stamp` still holds the generation numbers
+  // the previous run wrote, and restarting the counter would make a stale slot
+  // read as current. It only ever counts up.
+
+  for z := 0 to REGION_Z - 1 do
+    for i := 0 to High(Self.Order) do
+    begin
+      r := Self.Order[i];
+      if not Self.Regions[r].Loaded then Continue;
+
+      text := Self.BuildChunk(store, r, z);
+      if text = '' then Continue;
+
+      Self.Names += ToStr(z) + '-' + ToStr(Self.Regions[r].RegionX) + '-' +
+                    ToStr(Self.Regions[r].RegionY) + '.json';
+      Self.Chunks += text;
+    end;
+end;
+
+(*
+## DumpObjects
+```pascal
+procedure DumpObjects(var store: TCacheStore; zipPath: String);
+```
+Writes the whole `map/objects.zip` for `store`: 2785 chunks on cache 2625, in
+the Java's entry order, with correct per-object heights and colours.
+
+**The container's bytes will not match the committed zip, and neither will two
+of its fields.** `TZipWriter` pins its own timestamps and Simba's deflate
+compresses harder than the JDK's, so the archive is never byte-comparable; and
+`size[2]` and `colors` are deliberately right here and wrong there. See the unit
+docstring. `dev/tests/413_objects.simba` is what checks the rest.
+
+```pascal
+store := TCacheStore.Create(cacheDir);
+DumpObjects(store, dump.Path('map/objects.zip'));
+```
+*)
+procedure DumpObjects(var store: TCacheStore; zipPath: String);
+var
+  dump: TObjectDump;
+  zip: TZipWriter;
+  i: Integer;
+begin
+  dump := TObjectDump.Create(store);
+  dump.Run(store, []);
+
+  zip.Init();
+  for i := 0 to High(dump.Names) do
+    zip.AddBytes(dump.Names[i], _ObjDumpBytes(dump.Chunks[i]));
+  zip.Save(zipPath);
+end;

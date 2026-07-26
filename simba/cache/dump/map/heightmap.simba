@@ -1,0 +1,511 @@
+(*
+# Heightmap
+The `map/zips/heightmap.zip` renderer: one 256x256 greyscale chunk per region
+per plane, named `<plane>-<regionX>-<regionY>.png`. Ported from
+`net.runelite.cache.SimbaHeightMapDumper`, plus the two pieces of
+`net.runelite.cache.region` it leans on that our `region.simba` deliberately
+does not carry - `Region.loadTerrain`'s height accumulation and `HeightCalc`.
+
+```pascal
+var hm: THeightMap;
+hm := THeightMap.Create(TRegion.Load(store, RegionIdOf(50, 50), []));
+dump.SaveImage('map/heightmap/' + hm.ChunkName(0), hm.Render(0));
+```
+
+## The height a chunk draws is not `TMapTile.Height`
+`TMapTile.Height` is the raw byte off the wire. What the dumper reads is
+`Region.getTileHeight`, an **accumulated** value that `Region.loadTerrain`
+(`region/Region.java:78-105`) builds while it decodes:
+
+- plane 0 is `-height * 8`, or `-HeightCalc.calculate(...) * 8` when the tile
+  carries no explicit height at all;
+- every plane above it is *the plane below minus* `height * 8`, or minus 240
+  when there is no explicit height.
+
+So a plane-3 value is a running total of four tiles, and a renderer that reads
+the raw byte is wrong on every tile of every plane above 0 as well as on every
+tile that never got an attribute-1 opcode.
+
+Two details in that loop are easy to drop and cost real pixels:
+
+1. **`height = 1` is forced to 0** (`Region.java:92-95`). One raw unit is a
+   "this tile exists" marker, not a height.
+2. **Absent and zero are different.** Java's `Tile.height` is a nullable
+   `Integer`; a Simba `Integer` cannot be null, which is what
+   `TMapTile.HasHeight` is for. Absent falls back to {ref}`HeightCalc`, an
+   explicit 0 does not.
+
+## HeightCalc is live, not a curiosity
+{ref}`HeightCalc` is a deterministic integer noise function - the terrain
+generator for tiles the map data never stored a height for. Measured on cache
+2625, three of five sampled regions had 135, 460 and 405 of their 4096 plane-0
+tiles fall through to it, so it is on the hot path for real chunks, not an edge
+case. It needs three things to be bit-exact:
+
+- **32-bit signed wraparound** in `noise` (`region/HeightCalc.java:87-92`).
+  Lape's `Integer` is 32-bit and its `*`, `+`, `shl` and `xor` all wrap exactly
+  like Java's when the result lands in an `Integer` variable (probed), so the
+  arithmetic is written stepwise through locals rather than as one expression.
+- **Arithmetic right shifts.** Java's `>>` is arithmetic, Lape's `shr` is
+  logical, and `HeightCalc.calculate` shifts values that are genuinely negative
+  (`interpolateNoise(...) - 128 >> 1`). That is what `_HeightMapSar` is for. The
+  shift inside `noise` is *not* one of those - it is masked with
+  `Integer.MAX_VALUE` first, so the operand is never negative.
+- **Truncation toward zero**, in the `COS` table's `(int)` cast and in
+  `(int) ((double) n * 0.3D)`. Lape's `Trunc` and `div` both truncate toward
+  zero, matching Java.
+
+Only four entries of the 2048-entry `COS` table are ever reachable - the
+frequencies are 1, 2 and 4, so `1024 * frac / frequency` can only be 0, 256, 512
+or 768 - but the whole table is built rather than hardcoded, and it comes out as
+`65536 / 46340 / 0 / -46340` on this build.
+
+## The bridge rule
+`SimbaHeightMapDumper.java:121-123`: a tile whose settings have neither bit 3
+nor bit 4 set, on plane 0, whose *plane 1* settings have bit 1 set, is drawn
+with **plane 1's** height. That is a bridge - the deck is what you see from
+above, not the water under it. Skipping it leaves every bridge in the game
+rendered as the terrain beneath it.
+
+## Grey conversion
+Java is `Math.round((-h / 6048f) * 255f)` clamped to 0..255
+(`SimbaHeightMapDumper.java:147-154`). {ref}`HeightMapGray` is an integer form
+of exactly that; see its docstring for why the two cannot disagree.
+
+## Output
+`R = G = B = gray, A = 255`. The committed PNGs are 8-bit greyscale and load
+back that way. Tile `(x, y)` fills the 4x4 block at columns `x*4 .. x*4+3` and
+rows `(63-y)*4 .. (63-y)*4+3` - image space has a top-left origin, game space a
+bottom-left one. All 4096 tiles are drawn, so no pixel is ever left unwritten.
+*)
+{$DEFINE WL_CACHE_DUMP_HEIGHTMAP_INCLUDED}
+{$IFNDEF WL_CACHE_REGION_INCLUDED}{$INCLUDE_ONCE ../../region.simba}{$ENDIF}
+
+const
+  // net.runelite.cache.SimbaHeightMapDumper.MAP_SCALE
+  HEIGHTMAP_SCALE: Integer = 4;
+  // Region.X * MAP_SCALE - the side of one exported chunk, in pixels.
+  HEIGHTMAP_CHUNK_SIZE: Integer = 256;
+  // SimbaHeightMapDumper.MAX_HEIGHT, as its two integer factors. See HeightMapGray.
+  HEIGHTMAP_MAX_HEIGHT: Integer = 6048;
+
+  // Region.loadTerrain's world-coordinate offsets into the noise field
+  // (Region.java:82). They are what makes the generated terrain continuous
+  // across region borders.
+  HEIGHTCALC_OFFSET_X: Integer = $E3B7B;
+  HEIGHTCALC_OFFSET_Y: Integer = $87CCE;
+
+  // HeightCalc.JAGEX_CIRCULAR_ANGLE
+  HEIGHTCALC_ANGLE: Integer = 2048;
+
+var
+  // HeightCalc's static COS table, built on first use. SIN is declared next to
+  // it in the Java and never read by anything, so it is not ported.
+  _HeightCalcCos: TIntegerArray;
+
+(*
+## _HeightMapSar
+```pascal
+function _HeightMapSar(v, n: Integer): Integer;
+```
+Java's `>>`: an **arithmetic** right shift, which keeps the sign bit. Lape's
+`shr` is logical - `-5 shr 1` is 2147483645 on this build, not -3 - so every
+`>>` in `HeightCalc` that can see a negative operand goes through here.
+*)
+function _HeightMapSar(v, n: Integer): Integer;
+begin
+  if v < 0 then
+    Result := not ((not v) shr n)
+  else
+    Result := v shr n;
+end;
+
+// HeightCalc's static initialiser (HeightCalc.java:37-44). Idempotent; the
+// table is 2048 entries even though only 0, 256, 512 and 768 are reachable.
+procedure _HeightCalcInit();
+var
+  i: Integer;
+  radian: Double;
+begin
+  if Length(_HeightCalcCos) = HEIGHTCALC_ANGLE then Exit;
+
+  // ANGULAR_RATIO = 360D / JAGEX_CIRCULAR_ANGLE, then Math.toRadians, which is
+  // `x / 180.0 * PI` - written in that order so the rounding matches.
+  radian := ((360.0 / HEIGHTCALC_ANGLE) / 180.0) * PI;
+
+  SetLength(_HeightCalcCos, HEIGHTCALC_ANGLE);
+  for i := 0 to HEIGHTCALC_ANGLE - 1 do
+    _HeightCalcCos[i] := Trunc(65536.0 * Cos(i * radian));
+end;
+
+(*
+## HeightCalcNoise
+```pascal
+function HeightCalcNoise(x, y: Integer): Integer;
+```
+`HeightCalc.noise` (`region/HeightCalc.java:87-92`): a hash of the lattice point
+`(x, y)` to 0..255.
+
+Every step is written into an `Integer` local on purpose. The multiplies
+overflow constantly and Lape wraps them at 32 bits exactly as Java does, but
+only once the result has landed somewhere 32 bits wide - leaving the chain as
+one expression risks the compiler widening an intermediate.
+
+The `shr` here is deliberately *not* {ref}`_HeightMapSar`: `and $7FFFFFFF` has
+already cleared the sign bit, which is precisely what Java's
+`& Integer.MAX_VALUE` is doing before its own `>> 19`.
+*)
+function HeightCalcNoise(x, y: Integer): Integer;
+var
+  n, s, t: Integer;
+begin
+  n := x + y * 57;
+  s := n shl 13;
+  n := n xor s;
+
+  t := n * n;
+  t := t * 15731;
+  t := t + 789221;
+  t := n * t;
+  t := t + 1376312589;
+
+  t := t and $7FFFFFFF;
+  Result := (t shr 19) and 255;
+end;
+
+(*
+## HeightCalcSmoothed
+```pascal
+function HeightCalcSmoothed(x, y: Integer): Integer;
+```
+`HeightCalc.smoothedNoise1` (`:79-85`): the 3x3 box filter around `(x, y)`,
+weighted 1/4 centre, 1/8 sides, 1/16 corners. Every term is a
+{ref}`HeightCalcNoise` result in 0..255, so the three `div`s never see a
+negative numerator and Java's truncating `/` and Lape's `div` agree trivially.
+*)
+function HeightCalcSmoothed(x, y: Integer): Integer;
+var
+  corners, sides, center: Integer;
+begin
+  corners := HeightCalcNoise(x - 1, y - 1) + HeightCalcNoise(x + 1, y - 1) +
+             HeightCalcNoise(x - 1, 1 + y) + HeightCalcNoise(x + 1, y + 1);
+  sides := HeightCalcNoise(x - 1, y) + HeightCalcNoise(1 + x, y) +
+           HeightCalcNoise(x, y - 1) + HeightCalcNoise(x, 1 + y);
+  center := HeightCalcNoise(x, y);
+  Result := (center div 4) + (sides div 8) + (corners div 16);
+end;
+
+(*
+## HeightCalcInterpolate
+```pascal
+function HeightCalcInterpolate(a, b, x, y: Integer): Integer;
+```
+`HeightCalc.interpolate` (`:94-98`): a cosine-weighted blend of `a` and `b` at
+fraction `x / y`.
+
+Java is `int f = 65536 - COS[1024 * x / y] >> 1;`, where `-` binds tighter than
+`>>` - so the subtraction happens first and `f` lands in 0..65536, never
+negative.
+*)
+function HeightCalcInterpolate(a, b, x, y: Integer): Integer;
+var
+  f: Integer;
+begin
+  _HeightCalcInit();
+  f := _HeightMapSar(65536 - _HeightCalcCos[(1024 * x) div y], 1);
+  Result := _HeightMapSar(f * b, 16) + _HeightMapSar(a * (65536 - f), 16);
+end;
+
+(*
+## HeightCalcInterpolateNoise
+```pascal
+function HeightCalcInterpolateNoise(x, y, frequency: Integer): Integer;
+```
+`HeightCalc.interpolateNoise` (`:64-77`): the noise lattice sampled at
+`frequency` and bilinearly cosine-interpolated between its four corners.
+
+`frequency` is always 1, 2 or 4, so `frequency - 1` is a valid mask and
+`x div frequency` never has to round a negative - the callers offset `x` and `y`
+by `$E3B7B` / `$87CCE` plus a further five figures, and world coordinates are
+non-negative.
+*)
+function HeightCalcInterpolateNoise(x, y, frequency: Integer): Integer;
+var
+  intX, fracX, intY, fracY, v1, v2, v3, v4, i1, i2: Integer;
+begin
+  intX := x div frequency;
+  fracX := x and (frequency - 1);
+  intY := y div frequency;
+  fracY := y and (frequency - 1);
+
+  v1 := HeightCalcSmoothed(intX, intY);
+  v2 := HeightCalcSmoothed(intX + 1, intY);
+  v3 := HeightCalcSmoothed(intX, intY + 1);
+  v4 := HeightCalcSmoothed(1 + intX, 1 + intY);
+
+  i1 := HeightCalcInterpolate(v1, v2, fracX, frequency);
+  i2 := HeightCalcInterpolate(v3, v4, fracX, frequency);
+  Result := HeightCalcInterpolate(i1, i2, fracY, frequency);
+end;
+
+(*
+## HeightCalc
+```pascal
+function HeightCalc(x, y: Integer): Integer;
+```
+`HeightCalc.calculate` (`region/HeightCalc.java:46-62`): the generated terrain
+height, 10..60, at noise-field coordinate `(x, y)`.
+
+Three octaves at frequency 4, 2 and 1, weighted 1, 1/2 and 1/4. **Those two
+halvings are arithmetic shifts of a value that is routinely negative** - an
+octave contributes `interpolateNoise(...) - 128`, and `interpolateNoise` returns
+roughly 0..255 - so they go through {ref}`_HeightMapSar`. A logical `shr` there
+turns a small negative contribution into a value near 2^31 and the clamp below
+hides it as a flat 60.
+
+`Trunc` matches Java's `(int)` cast: both truncate toward zero, and `n` here can
+be either sign.
+
+`Region.loadTerrain` calls this as `-HeightCalc(baseX + x + $E3B7B,
+baseY + y + $87CCE) * 8`, so the drawn range is -480..-80.
+*)
+function HeightCalc(x, y: Integer): Integer;
+var
+  n: Integer;
+begin
+  n := HeightCalcInterpolateNoise(x + 45365, y + 91923, 4) - 128
+     + _HeightMapSar(HeightCalcInterpolateNoise(10294 + x, y + 37821, 2) - 128, 1)
+     + _HeightMapSar(HeightCalcInterpolateNoise(x, y, 1) - 128, 2);
+
+  n := 35 + Trunc(n * 0.3);
+
+  if n < 10 then n := 10
+  else if n > 60 then n := 60;
+
+  Result := n;
+end;
+
+(*
+## HeightMapGray
+```pascal
+function HeightMapGray(h: Integer): Integer;
+```
+The 0..255 grey a `Region.getTileHeight` value is drawn as.
+
+Java is float: `height = -height; v = Math.round((height / 6048f) * 255f)`,
+clamped (`SimbaHeightMapDumper.java:147-154`). `Math.round(float)` is specified
+as "the closest int, ties toward positive infinity", and its implementation is
+bit-exact rather than a float add - it is `floor(v + 1/2)` on the float's exact
+value. So the whole function is `floor(255h/6048 + 1/2)` clamped, which is
+`(510h + 6048) div 12096`.
+
+That leaves one question - whether the `float` round-trip through
+`h / 6048f * 255f` ever lands on the wrong side of a `.5` boundary and rounds
+differently from the exact rational. It does not, and it is cheap to check:
+evaluating the Java expression in real IEEE-754 binary32 with exact
+`Math.round` semantics and diffing it against this integer form over every
+`h` in **-2,000,000 .. 2,000,000** gives **0 disagreements**, as does the same
+sweep against the double-precision form. Real heights never leave -8160..0.
+*)
+function HeightMapGray(h: Integer): Integer;
+begin
+  h := -h;
+  if h <= 0 then Exit(0);
+  // (510h + 6048) div 12096, spelled so the two 6048s are visibly MAX_HEIGHT:
+  // numerator 2*255*h + MAX, denominator 2*MAX.
+  Result := (2 * 255 * h + HEIGHTMAP_MAX_HEIGHT) div (2 * HEIGHTMAP_MAX_HEIGHT);
+  if Result > 255 then Result := 255;
+end;
+
+type
+(*
+## THeightMap
+```pascal
+THeightMap = record
+  RegionX, RegionY: Integer;
+  Heights: TIntegerArray;   // Region.getTileHeight, TRegion.TileIndex order
+  Settings: TIntegerArray;  // Region.getTileSetting, same order
+end;
+```
+One region's terrain reduced to what the heightmap renderer needs: the
+accumulated per-plane heights and the settings byte. Both are flat and strided
+by `TRegion.TileIndex(z, x, y)`, the same layout `TRegion.Tiles` uses.
+
+`Settings` is copied out rather than read back through the region so that a
+rendered chunk never depends on the region record staying alive.
+*)
+  THeightMap = record
+    RegionX, RegionY: Integer;
+    Heights: TIntegerArray;
+    Settings: TIntegerArray;
+  end;
+
+(*
+## THeightMap.Create
+```pascal
+function THeightMap.Create(region: TRegion): THeightMap; static;
+```
+Runs `Region.loadTerrain`'s height accumulation (`region/Region.java:78-105`)
+over `region`.
+
+Raises on a region with no terrain - a caller sweeping an id space should test
+`HasTerrain` and skip, rather than render a blank chunk that looks plausible.
+*)
+function THeightMap.Create(region: TRegion): THeightMap; static;
+var
+  z, x, y, i, plane, h: Integer;
+begin
+  if not region.HasTerrain then
+    raise 'Heightmap: region ' + ToStr(region.Id) + ' has no terrain';
+
+  Result.RegionX := region.RegionX;
+  Result.RegionY := region.RegionY;
+
+  plane := REGION_X * REGION_Y;
+  SetLength(Result.Heights, REGION_Z * plane);
+  SetLength(Result.Settings, REGION_Z * plane);
+
+  // z outermost so that `Result.Heights[i - plane]` - tile (z-1, x, y) - is
+  // always already accumulated. i tracks TRegion.TileIndex(z, x, y) by
+  // construction; that function strides in exactly this order.
+  i := 0;
+  for z := 0 to REGION_Z - 1 do
+    for x := 0 to REGION_X - 1 do
+      for y := 0 to REGION_Y - 1 do
+      begin
+        Result.Settings[i] := region.Tiles[i].Settings;
+
+        if not region.Tiles[i].HasHeight then
+        begin
+          // Java's `tile.height == null`: no attribute-1 opcode for this tile.
+          if z = 0 then
+            Result.Heights[i] := -HeightCalc(region.BaseX + x + HEIGHTCALC_OFFSET_X,
+                                             region.BaseY + y + HEIGHTCALC_OFFSET_Y) * 8
+          else
+            Result.Heights[i] := Result.Heights[i - plane] - 240;
+        end
+        else
+        begin
+          h := region.Tiles[i].Height;
+          // Region.java:92-95. One raw unit means "flat", not "one unit up".
+          if h = 1 then h := 0;
+
+          if z = 0 then
+            Result.Heights[i] := -h * 8
+          else
+            Result.Heights[i] := Result.Heights[i - plane] - h * 8;
+        end;
+
+        Inc(i);
+      end;
+end;
+
+(*
+## THeightMap.Height
+```pascal
+function THeightMap.Height(z, x, y: Integer): Integer;
+function THeightMap.Setting(z, x, y: Integer): Integer;
+```
+`Region.getTileHeight` and `Region.getTileSetting`. Range-checked through
+`TRegion.TileIndex`, so an out-of-range coordinate raises instead of quietly
+answering for the wrong plane.
+*)
+function THeightMap.Height(z, x, y: Integer): Integer;
+begin
+  Result := Self.Heights[TRegion.TileIndex(z, x, y)];
+end;
+
+function THeightMap.Setting(z, x, y: Integer): Integer;
+begin
+  Result := Self.Settings[TRegion.TileIndex(z, x, y)];
+end;
+
+(*
+## THeightMap.DrawnHeight
+```pascal
+function THeightMap.DrawnHeight(z, x, y: Integer): Integer;
+```
+The height tile `(z, x, y)` is actually *drawn* at, i.e.
+{ref}`THeightMap.Height` with the bridge rule applied
+(`SimbaHeightMapDumper.java:121-123`).
+
+A plane-0 tile that is neither a roof nor hidden (`settings and 24 = 0`) and
+whose plane-1 counterpart is marked as a bridge deck (`settings and 2`) is drawn
+at plane 1's height. Without this, every bridge in the game renders as the
+water or road underneath it.
+*)
+function THeightMap.DrawnHeight(z, x, y: Integer): Integer;
+var
+  i: Integer;
+begin
+  i := TRegion.TileIndex(z, x, y);
+  Result := Self.Heights[i];
+
+  if (Self.Settings[i] and 24) = 0 then
+    if (z = 0) and ((Self.Settings[TRegion.TileIndex(1, x, y)] and 2) <> 0) then
+      Result := Self.Heights[TRegion.TileIndex(1, x, y)];
+end;
+
+(*
+## THeightMap.ChunkName
+```pascal
+function THeightMap.ChunkName(z: Integer): String;
+```
+The zip entry name for plane `z`: `<plane>-<regionX>-<regionY>.png`
+(`SimbaHeightMapDumper.java:137`). This exact spelling is what WaspLib's map
+loader looks chunks up by - see `main/position/map/maploader.simba`.
+*)
+function THeightMap.ChunkName(z: Integer): String;
+begin
+  Result := ToStr(z) + '-' + ToStr(Self.RegionX) + '-' + ToStr(Self.RegionY) + '.png';
+end;
+
+(*
+## THeightMap.Render
+```pascal
+function THeightMap.Render(z: Integer): TImage;
+```
+Plane `z` as a 256x256 chunk: each of the 64x64 tiles as a 4x4 block of
+`R = G = B =` {ref}`HeightMapGray`, `A = 255`.
+
+Y is flipped - tile `(x, y)` lands on rows `(63 - y) * 4 .. +3` - because the
+image has a top-left origin and the game world a bottom-left one. Every tile is
+drawn, so the image is fully written and its initial contents never show.
+
+`Data` is hoisted into a local `PColorBGRA` before the pixel loop: it is a
+property, and going through it four times per pixel costs about 64 ms per 250k
+pixels against nothing for the pointer.
+*)
+function THeightMap.Render(z: Integer): TImage;
+var
+  data: PColorBGRA;
+  x, y, i, j, gray, col, row, p: Integer;
+begin
+  if (z < 0) or (z >= REGION_Z) then
+    raise 'Heightmap: plane ' + ToStr(z) + ' is out of range';
+
+  Result := new TImage(HEIGHTMAP_CHUNK_SIZE, HEIGHTMAP_CHUNK_SIZE);
+  data := Result.Data;
+
+  for x := 0 to REGION_X - 1 do
+  begin
+    col := x * HEIGHTMAP_SCALE;
+    for y := 0 to REGION_Y - 1 do
+    begin
+      gray := HeightMapGray(Self.DrawnHeight(z, x, y));
+      row := (REGION_Y - 1 - y) * HEIGHTMAP_SCALE;
+
+      for j := 0 to HEIGHTMAP_SCALE - 1 do
+      begin
+        p := (row + j) * HEIGHTMAP_CHUNK_SIZE + col;
+        for i := 0 to HEIGHTMAP_SCALE - 1 do
+        begin
+          data[p + i]^.R := gray;
+          data[p + i]^.G := gray;
+          data[p + i]^.B := gray;
+          data[p + i]^.A := 255;
+        end;
+      end;
+    end;
+  end;
+end;

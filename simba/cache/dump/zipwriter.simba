@@ -1,0 +1,418 @@
+(*
+# ZipWriter
+Writes a zip container whose bytes depend only on its contents, so the same
+input always produces the same file.
+
+Simba's builtin `ZipFiles` stamps every entry with its source file's
+modification time, and this build exposes no way to set one - `FileAge` and
+`FileSetDate` are both `Unknown declaration`. An asset tree rebuilt from
+identical input therefore hashed differently on every run, which makes
+`hashes.json` useless as a change detector. Writing the container here removes
+the only non-deterministic input: the DOS timestamp is a constant, entries keep
+insertion order, and the payload is a pure function of the bytes handed in. "Did
+my change alter the output?" becomes one CRC32 comparison.
+
+## This is not a byte-parity target for the Java pipeline
+Do not try to make these files match the zips committed to `wasp-assets`.
+Measured: identical entries, names, order and timestamps still produced 12149
+bytes against the committed 14237 for `finders/prayer.zip`, because Simba's
+deflate compresses harder than the JDK's. Reproducibility run to run is the
+goal; parity with Java is not reachable and is not wanted.
+
+## Scope
+Only what a reader needs is emitted - no data descriptors, no zip64, no extra
+fields, no archive comment, one disk. Sizes and offsets are u32, so a member or
+container above 4 GiB is out of range; the dumps are orders of magnitude below
+that. Entry names are written with the general-purpose flags at 0, which means
+they are read as cp437, so `AddBytes` rejects non-ASCII names rather than
+silently writing mojibake.
+
+## Design notes
+1. Dependency-free, like the rest of `utils/cache/`: no `WaspLib/main.simba`,
+   so no `GetDebugLn` and no `String` helper methods. Failures `raise` a
+   `'ZipWriter: ...'`-prefixed string.
+2. `Save` sizes the output buffer exactly up front and fills it through a
+   cursor. Appending with `+=` per field would reallocate and copy the whole
+   buffer on every call, which is quadratic in the container size.
+3. CRC32s are carried as the 8-character hex string `HashData` returns and
+   converted two characters at a time. Routing one through an Integer would trip
+   over `StrToInt('$FFFFFFFF') = -1`.
+*)
+{$DEFINE WL_CACHE_DUMP_ZIPWRITER_INCLUDED}
+
+const
+  ZIP_LOCAL_SIG: Int64 = $04034B50;
+  ZIP_CENTRAL_SIG: Int64 = $02014B50;
+  ZIP_EOCD_SIG: Int64 = $06054B50;
+
+  // 2.0: the minimum that understands deflate.
+  ZIP_VERSION: Integer = 20;
+  ZIP_METHOD_STORE: Integer = 0;
+  ZIP_METHOD_DEFLATE: Integer = 8;
+
+  // The pinned timestamp, in the packed MS-DOS form the zip format inherited:
+  // date = (year - 1980) shl 9 or (month shl 5) or day,
+  // time = (hour shl 11) or (minute shl 5) or (second div 2).
+  // 1980-01-01 00:00:00 - the earliest date the field can express. A date of 0
+  // is not a valid one (month 0, day 0) and some readers reject it.
+  ZIP_DOS_TIME: Integer = 0;
+  ZIP_DOS_DATE: Integer = 33;
+
+  ZIP_LOCAL_HEADER: Integer = 30;   // + name
+  ZIP_CENTRAL_HEADER: Integer = 46; // + name
+  ZIP_EOCD_SIZE: Integer = 22;
+
+type
+  (*
+  ## TZipWriterEntry
+  ```pascal
+  TZipWriterEntry = record
+    Name: String;
+    Method: Integer;
+    CRC: String;
+    Size: Integer;
+    Payload: TByteArray;
+  end;
+  ```
+  One member, already compressed. `Size` is the uncompressed length and
+  `Length(Payload)` the compressed one; for a stored entry they are equal.
+  `CRC` is the uppercase 8-character hex CRC32 of the *uncompressed* bytes.
+  *)
+  TZipWriterEntry = record
+    Name: String;
+    Method: Integer;
+    CRC: String;
+    Size: Integer;
+    Payload: TByteArray;
+  end;
+
+  // Fixed-size output buffer plus a write cursor. See design note 2.
+  TZipWriterBuffer = record
+    Data: TByteArray;
+    Position: Integer;
+  end;
+
+  (*
+  ## TZipWriter
+  ```pascal
+  TZipWriter = record
+    Entries: array of TZipWriterEntry;
+  end;
+  ```
+  Call `Init`, then `AddBytes`/`AddImage` once per member, then `Save`. Members
+  are written in the order they were added.
+  *)
+  TZipWriter = record
+    Entries: array of TZipWriterEntry;
+  end;
+
+procedure TZipWriterBuffer.PutU8(value: Integer);
+begin
+  Self.Data[Self.Position] := value and $FF;
+  Inc(Self.Position);
+end;
+
+procedure TZipWriterBuffer.PutU16(value: Integer);
+begin
+  Self.Data[Self.Position]     := value and $FF;
+  Self.Data[Self.Position + 1] := (value shr 8) and $FF;
+  Self.Position += 2;
+end;
+
+procedure TZipWriterBuffer.PutU32(value: Int64);
+begin
+  Self.Data[Self.Position]     := value and $FF;
+  Self.Data[Self.Position + 1] := (value shr 8) and $FF;
+  Self.Data[Self.Position + 2] := (value shr 16) and $FF;
+  Self.Data[Self.Position + 3] := (value shr 24) and $FF;
+  Self.Position += 4;
+end;
+
+// The 8 hex characters HashData returns are big-endian; the field is
+// little-endian, so the pairs go out back to front.
+procedure TZipWriterBuffer.PutHexU32(hex: String);
+begin
+  if Length(hex) <> 8 then
+    raise 'ZipWriter: expected an 8-character hash, got "' + hex + '"';
+  Self.PutU8(StrToInt('$' + Copy(hex, 7, 2)));
+  Self.PutU8(StrToInt('$' + Copy(hex, 5, 2)));
+  Self.PutU8(StrToInt('$' + Copy(hex, 3, 2)));
+  Self.PutU8(StrToInt('$' + Copy(hex, 1, 2)));
+end;
+
+procedure TZipWriterBuffer.PutStr(s: String);
+var
+  i: Integer;
+begin
+  for i := 1 to Length(s) do
+  begin
+    Self.Data[Self.Position] := Ord(s[i]);
+    Inc(Self.Position);
+  end;
+end;
+
+procedure TZipWriterBuffer.PutBytes(data: TByteArray);
+begin
+  if Length(data) = 0 then Exit;
+  if Self.Position + Length(data) > Length(Self.Data) then
+    raise 'ZipWriter: buffer overrun writing ' + ToStr(Length(data)) + ' bytes at ' +
+          ToStr(Self.Position);
+  Move(data[0], Self.Data[Self.Position], Length(data));
+  Self.Position += Length(data);
+end;
+
+(*
+## ZipCRC32
+```pascal
+function ZipCRC32(data: TByteArray): String;
+```
+CRC32 of `data` as 8 uppercase hex characters, zero padded. Simba's CRC32 is
+byte-identical to zlib's, which is the one the zip format specifies.
+
+The empty case is special: `@data[0]` on an empty array is not addressable, and
+CRC32 of nothing is 0.
+
+`data` is deliberately not `const` - Lape rejects `@data[0]` on a `const` or
+`constref` parameter with "Variable expected", and a dynamic array is passed by
+reference anyway.
+*)
+function ZipCRC32(data: TByteArray): String;
+begin
+  if Length(data) = 0 then Exit('00000000');
+  Result := HashData(EHashAlgo.CRC32, @data[0], Length(data));
+end;
+
+(*
+## ZipDeflate
+```pascal
+function ZipDeflate(data: TByteArray): TByteArray;
+```
+Raw deflate stream for `data`, which is what a zip member holds.
+
+`CompressBytes(ECompressAlgo.ZLIB, ...)` returns a zlib wrapper - a 2-byte
+header (`78 9C`) and a 4-byte adler32 trailer around the deflate data - so the
+raw stream is that array with the first 2 and last 4 bytes removed. The header
+is checked rather than assumed: a preset dictionary would add 4 more bytes and
+silently shift everything.
+*)
+function ZipDeflate(data: TByteArray): TByteArray;
+var
+  z: TByteArray;
+begin
+  if Length(data) = 0 then Exit;
+
+  z := CompressBytes(ECompressAlgo.ZLIB, data);
+  if Length(z) < 6 then
+    raise 'ZipWriter: zlib stream too short (' + ToStr(Length(z)) + ' bytes)';
+  if (z[0] and $0F) <> 8 then
+    raise 'ZipWriter: zlib stream is not deflate, CMF=' + ToStr(z[0]);
+  if (z[1] and $20) <> 0 then
+    raise 'ZipWriter: zlib preset dictionaries are not supported';
+
+  Result := Copy(z, 2, Length(z) - 6);
+end;
+
+// Names go out with the general-purpose flags at 0, i.e. as cp437. Anything
+// above 127 would need flag bit 11 and UTF-8, which nothing here emits, so
+// reject it instead of writing a name that reads back wrong.
+procedure ZipCheckName(name: String);
+var
+  i: Integer;
+begin
+  if name = '' then
+    raise 'ZipWriter: entry name is empty';
+
+  for i := 1 to Length(name) do
+    if Ord(name[i]) >= $80 then
+      raise 'ZipWriter: entry name is not ASCII: "' + name + '"';
+
+  if Pos('\', name) > 0 then
+    raise 'ZipWriter: entry name must use "/" as its separator: "' + name + '"';
+end;
+
+(*
+## TZipWriter.Init
+```pascal
+procedure TZipWriter.Init();
+```
+Empties the writer. Required before the first use and before every reuse: a
+`TZipWriter` local is not zero-filled per call, and `SetLength` preserves the
+overlapping prefix, so a stale entry list would otherwise leak into the next
+container.
+*)
+procedure TZipWriter.Init();
+begin
+  Self.Entries := [];
+end;
+
+(*
+## TZipWriter.AddBytes
+```pascal
+procedure TZipWriter.AddBytes(name: String; data: TByteArray);
+```
+Appends `data` as a member called `name`.
+
+The entry is deflated, and stored uncompressed instead when deflating did not
+make it smaller - four incompressible bytes deflate to six, and a zip that grows
+its own members is a bug every real writer avoids. Either way the bytes are
+copied, so the caller is free to reuse its buffer afterwards.
+*)
+procedure TZipWriter.AddBytes(name: String; data: TByteArray);
+var
+  entry: TZipWriterEntry;
+  deflated: TByteArray;
+begin
+  ZipCheckName(name);
+
+  entry.Name := name;
+  entry.Size := Length(data);
+  entry.CRC := ZipCRC32(data);
+
+  deflated := ZipDeflate(data);
+  if (Length(deflated) > 0) and (Length(deflated) < Length(data)) then
+  begin
+    entry.Method := ZIP_METHOD_DEFLATE;
+    entry.Payload := deflated;
+  end
+  else
+  begin
+    entry.Method := ZIP_METHOD_STORE;
+    // Copy rather than alias, so both branches behave the same way. ZipDeflate
+    // already returns a fresh array; without this, a stored entry would follow
+    // later writes to the caller's buffer and a deflated one would not.
+    entry.Payload := Copy(data);
+  end;
+
+  Self.Entries += entry;
+end;
+
+(*
+## TZipWriter.AddImage
+```pascal
+procedure TZipWriter.AddImage(name: String; img: TImage);
+```
+Appends `img` as a member called `name`, encoded from the extension of `name`
+(`.png` when it has none).
+
+There is no in-memory encoder on `TImage`, so this goes through a scratch file
+in `SimbaEnv.TempPath`. `TImage.Save` raises when the target already exists, so
+the scratch path is deleted first, both before and after.
+*)
+procedure TZipWriter.AddImage(name: String; img: TImage);
+var
+  ext, tmp: String;
+  data: TByteArray;
+begin
+  ZipCheckName(name);
+
+  ext := PathExtractExt(name);
+  if ext = '' then ext := '.png';
+  tmp := SimbaEnv.TempPath + 'wl-zipwriter-scratch' + ext;
+
+  FileDelete(tmp);
+  img.Save(tmp);
+
+  data := FileReadBytes(tmp);
+  FileDelete(tmp);
+
+  if Length(data) = 0 then
+    raise 'ZipWriter: encoding "' + name + '" produced no bytes';
+
+  Self.AddBytes(name, data);
+end;
+
+(*
+## TZipWriter.Save
+```pascal
+procedure TZipWriter.Save(path: String);
+```
+Writes the container to `path`, overwriting it.
+
+The output is sized exactly before anything is written, and the cursor is
+asserted to land on the last byte afterwards - an off-by-one in the size
+arithmetic would otherwise leave a tail of zeroes that most readers still open.
+Calling `Save` twice writes the same bytes; it does not consume the writer.
+*)
+procedure TZipWriter.Save(path: String);
+var
+  buf: TZipWriterBuffer;
+  offsets: TIntegerArray;
+  total, cdSize, cdOffset, i: Integer;
+begin
+  if Length(Self.Entries) > $FFFF then
+    raise 'ZipWriter: ' + ToStr(Length(Self.Entries)) +
+          ' entries does not fit the 16-bit count (zip64 is not implemented)';
+
+  SetLength(offsets, Length(Self.Entries));
+  total := 0;
+  cdSize := 0;
+  for i := 0 to High(Self.Entries) do
+  begin
+    offsets[i] := total;
+    total += ZIP_LOCAL_HEADER + Length(Self.Entries[i].Name) +
+             Length(Self.Entries[i].Payload);
+    cdSize += ZIP_CENTRAL_HEADER + Length(Self.Entries[i].Name);
+  end;
+  cdOffset := total;
+
+  // A record local is not zero-filled per call and SetLength keeps the
+  // overlapping prefix, so drop any previous buffer before sizing this one.
+  buf.Data := [];
+  SetLength(buf.Data, total + cdSize + ZIP_EOCD_SIZE);
+  buf.Position := 0;
+
+  for i := 0 to High(Self.Entries) do
+  begin
+    buf.PutU32(ZIP_LOCAL_SIG);
+    buf.PutU16(ZIP_VERSION);
+    buf.PutU16(0);                                  // general purpose flags
+    buf.PutU16(Self.Entries[i].Method);
+    buf.PutU16(ZIP_DOS_TIME);
+    buf.PutU16(ZIP_DOS_DATE);
+    buf.PutHexU32(Self.Entries[i].CRC);
+    buf.PutU32(Length(Self.Entries[i].Payload));    // compressed size
+    buf.PutU32(Self.Entries[i].Size);               // uncompressed size
+    buf.PutU16(Length(Self.Entries[i].Name));
+    buf.PutU16(0);                                  // extra field length
+    buf.PutStr(Self.Entries[i].Name);
+    buf.PutBytes(Self.Entries[i].Payload);
+  end;
+
+  for i := 0 to High(Self.Entries) do
+  begin
+    buf.PutU32(ZIP_CENTRAL_SIG);
+    buf.PutU16(ZIP_VERSION);                        // version made by
+    buf.PutU16(ZIP_VERSION);                        // version needed
+    buf.PutU16(0);                                  // general purpose flags
+    buf.PutU16(Self.Entries[i].Method);
+    buf.PutU16(ZIP_DOS_TIME);
+    buf.PutU16(ZIP_DOS_DATE);
+    buf.PutHexU32(Self.Entries[i].CRC);
+    buf.PutU32(Length(Self.Entries[i].Payload));
+    buf.PutU32(Self.Entries[i].Size);
+    buf.PutU16(Length(Self.Entries[i].Name));
+    buf.PutU16(0);                                  // extra field length
+    buf.PutU16(0);                                  // file comment length
+    buf.PutU16(0);                                  // disk number start
+    buf.PutU16(0);                                  // internal attributes
+    buf.PutU32(0);                                  // external attributes
+    buf.PutU32(offsets[i]);
+    buf.PutStr(Self.Entries[i].Name);
+  end;
+
+  buf.PutU32(ZIP_EOCD_SIG);
+  buf.PutU16(0);                                    // this disk
+  buf.PutU16(0);                                    // disk with the central dir
+  buf.PutU16(Length(Self.Entries));                 // entries on this disk
+  buf.PutU16(Length(Self.Entries));                 // entries total
+  buf.PutU32(cdSize);
+  buf.PutU32(cdOffset);
+  buf.PutU16(0);                                    // archive comment length
+
+  if buf.Position <> Length(buf.Data) then
+    raise 'ZipWriter: wrote ' + ToStr(buf.Position) + ' of ' +
+          ToStr(Length(buf.Data)) + ' bytes';
+
+  if not FileWriteBytes(path, buf.Data) then
+    raise 'ZipWriter: could not write ' + path;
+end;

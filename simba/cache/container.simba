@@ -1,0 +1,71 @@
+(*
+# CacheContainer
+Decodes a cache container: `[type u8][compressedLength i32][payload]`.
+
+Type 0 = stored, 1 = bzip2, 2 = gzip. For types 1 and 2 the payload starts with a
+4-byte decompressed length. Encrypted archives (maps) have the payload XTEA-encrypted;
+the encrypted region is `compressedLength + 4` bytes for types 1 and 2, and
+`compressedLength` bytes for type 0.
+*)
+{$DEFINE WL_CACHE_CONTAINER_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_XTEA_INCLUDED}{$INCLUDE_ONCE xtea.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_BZIP2_INCLUDED}{$INCLUDE_ONCE bzip2.simba}{$ENDIF}
+
+type
+  ECacheCompression = enum(NONE, BZIP2, GZIP);
+
+  TCacheContainer = record
+    const HEADER_SIZE: Integer = 5;
+  end;
+
+function TCacheContainer.Decompress(const container: TByteArray; const keys: TIntegerArray): TByteArray; static;
+var
+  s: TByteStream;
+  ctype, clen, declen, payloadLen: Integer;
+  payload, header: TByteArray;
+begin
+  if Length(container) < TCacheContainer.HEADER_SIZE then
+    raise 'CacheContainer: too short (' + ToStr(Length(container)) + ' bytes)';
+
+  s := TByteStream.Create(container);
+  ctype := s.ReadUByte();
+  clen := s.ReadInt();
+  if clen < 0 then
+    raise 'CacheContainer: negative compressed length ' + ToStr(clen);
+
+  if ctype = Ord(ECacheCompression.NONE) then
+    payloadLen := clen
+  else
+    payloadLen := clen + 4;
+
+  payload := s.ReadBytes(payloadLen);
+  if Length(keys) = 4 then
+    XTEADecrypt(payload, keys);
+
+  case ctype of
+    Ord(ECacheCompression.NONE): Exit(payload);
+
+    Ord(ECacheCompression.GZIP):
+    begin
+      s := TByteStream.Create(payload);
+      declen := s.ReadInt();
+      Result := DecompressBytes(ECompressAlgo.GZ, s.ReadBytes(clen));
+      if Length(Result) <> declen then
+        raise 'CacheContainer: gzip length mismatch, got ' + ToStr(Length(Result)) + ' want ' + ToStr(declen);
+    end;
+
+    Ord(ECacheCompression.BZIP2):
+    begin
+      s := TByteStream.Create(payload);
+      declen := s.ReadInt();
+      // The cache stores headerless block data at level 1.
+      header := [Ord('B'), Ord('Z'), Ord('h'), Ord('1')];
+      Result := BZip2Decompress(header + s.ReadBytes(clen));
+      if Length(Result) <> declen then
+        raise 'CacheContainer: bzip2 length mismatch, got ' + ToStr(Length(Result)) + ' want ' + ToStr(declen);
+    end;
+  else
+    raise 'CacheContainer: unknown compression type ' + ToStr(ctype);
+  end;
+end;

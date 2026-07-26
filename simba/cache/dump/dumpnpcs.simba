@@ -1,0 +1,276 @@
+(*
+# Dump NPCs
+`map/zips/npcs_helper.zip`: one compact json document per NPC definition, named
+`<id>.json`, 16292 of them on cache 2625. Ports `SimbaNPCDumper.export` plus
+`NpcExporter.simbaExport`.
+
+## This is the *helper*, not `map/npcs.zip`
+
+Two different files, and only one of them can be produced from a cache.
+`map/npcs.zip` is what WaspLib actually reads, and building it needs NPC spawn
+coordinates, which are not in the cache at all - `wasp-assets/tools/update_npcs.simba`
+downloads them from `mejrs/data_osrs`. What that script *does* get from here is
+every non-positional field: it opens `npcs_helper.zip`, looks the spawn's id up
+as `<id>.json`, and copies `name`, `level`, `category`, `minimapdot`, `actions`,
+`size` and `colors` across verbatim (`update_npcs.simba:90,215-233`).
+
+So this unit's contract is the seven keys, and nothing else.
+
+## The shape, which is literal
+
+`NpcExporter.simbaExport` builds a `JsonObject` by hand, so the key order is
+whatever the source says and there is nothing clever to reproduce:
+
+```java
+name, level, category, minimapdot, actions, size, colors
+```
+
+- `name` <- `npc.name`, which is the string `"null"` and not a json null when the
+  definition never set it.
+- `level` <- `npc.combatLevel`. Declared `-1` in `NpcDefinition.java:61`, but no
+  definition in cache 2625 leaves it there: 0 is the lowest value in the archive
+  and in the committed zip alike.
+- `category` <- `npc.category`.
+- `minimapdot` <- `npc.isMinimapVisible`, a json boolean - `true` / `false`,
+  lowercase.
+- `actions` <- the op slots, **compacted**. Java grows `ops` to fit the highest
+  index it sets and leaves `null` in the gaps, then skips those on the way out
+  (`NpcExporter.java:76-78`), so a definition with slots 0, 2 and 3 filled
+  writes a three-element array and the indices are gone. 5993 of the 16292
+  definitions have such a gap; NPC 0, the Tool Leprechaun, is the first.
+- `size` <- `[npc.size, npc.size, height]`. Both of the first two really do come
+  from the same scalar field - there is no separate Y size.
+- `colors` <- {ref}`TModelStats.OfModels`, order and repeats included.
+
+**No filtering.** Every file of the CONFIGS/NPC archive is loaded and exported,
+which is what makes the entry count exactly the archive's file count.
+
+## Escaping: the plain form, not the item dump's
+
+`simbaExport` returns `obj.toString()`, and `JsonElement.toString()` builds a
+bare `JsonWriter` whose `htmlSafe` is **false**. `ItemExporter` goes through
+`GsonBuilder`, whose default is **true**. So this file uses {ref}`JSONEscape`
+and `jsons/item-definitions.zip` uses {ref}`JSONEscapeHTML`, and swapping them
+is a silent parity loss rather than a crash.
+
+Measured on the committed zip: 297 entries carry `<col=..>` markup and 206
+carry an apostrophe, all raw, and there is not one `\uXXXX` escape anywhere in
+the 16292 files. Not one `"` or `\` either, so the escapes the two forms agree
+on are unexercised here - the only escaping this artifact ever performs is the
+escaping it must *not* do.
+
+Non-ASCII passes through as raw UTF-8: NPC 5521 is `Le-sabr<C3><A8>`.
+
+## One divergence the loader cannot avoid
+
+Java distinguishes "op slot never set" (`null`) from "op slot set to the empty
+string", and would emit the latter as `""`. {ref}`TEntityOps` stores both as
+`''`, so this writer skips both. Unobservable on real data - no entry in the
+committed zip has an empty action - and it would take a cache revision that
+stores a zero-length op string to make it observable.
+
+## Entry order is ours to choose, because the committed one is not reproducible
+
+CI ran `cd .../NPCs && zip -r npcs-helper.zip .`, and `zip -r` on a directory
+walks in **readdir order**. The committed archive starts `9929.json`,
+`11762.json`, `5764.json` - ext4 hash order, not sorted, not numeric, and not a
+function of anything in the cache. It is also not `HashMap` bucket order, which
+was checked: `values()` over int keys below 32768 comes out ascending, and the
+committed file is not ascending.
+
+Nothing reads it, either - `update_npcs.simba` opens entries by name. So
+{ref}`DumpEntryOrder` emits byte-lexicographic order, matching
+`DumpItemDefinitions` and matching what the shell glob `zip -r x.zip ./*.json`
+would have produced.
+
+## Verification, and the revision this settles
+Byte-for-byte against every one of the 16292 committed entries: **16292/16292
+on cache 2625, and 16286/16292 on 2639**. See `dev/tests/412_npchelper.simba`.
+
+So the committed `npcs_helper.zip` **is** from cache 2625, which nothing outside
+the data said - the file is absent from `git show --stat 7b40e8c`, the commit
+that named the revision. The six entries that separate the two are the
+Gauntlet's `Crystalline`/`Corrupted` `Rat`/`Unicorn`/`Wolf` (9026, 9029, 9031,
+9040, 9043, 9045), each differing in `level` alone: 24->23, 48->45, 74->69,
+34->33, 64->61, 102->97, a combat-level rebalance between the revisions.
+
+Note what that corrects and what it does not. `TModelStats.OfModels` really is
+byte-identical across the two revisions for all 16292 definitions
+(`dev/tests/410_modelstats.simba`) - the six drifted entries have unchanged
+`size` and `colors`, which 412 re-checks. `combatLevel` is a definition field,
+not a model one, so it was outside that measurement.
+
+The zip's own bytes do **not** match the committed container and are not meant
+to: {ref}`TZipWriter` deflates harder than the JDK's and pins its own
+timestamps. Verification is per entry, never whole-file CRC32.
+*)
+{$DEFINE WL_CACHE_DUMP_NPCS_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ZIPWRITER_INCLUDED}{$INCLUDE_ONCE zipwriter.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_MODELSTATS_INCLUDED}{$INCLUDE_ONCE modelstats.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_NPC_INCLUDED}{$INCLUDE_ONCE ../defs/npc.simba}{$ENDIF}
+
+// Gson writes a json boolean, which is lowercase. Lape's ToStr(Boolean) is
+// 'True' / 'False', so it cannot be used here.
+function _NpcJsonBool(b: Boolean): String;
+begin
+  if b then Result := 'true' else Result := 'false';
+end;
+
+(*
+## NpcHelperJSON
+```pascal
+function NpcHelperJSON(npc: TNpcDefinition; height: Integer; colors: TIntegerArray): String;
+```
+One helper document, exactly as `NpcExporter.simbaExport(height, colors)` writes
+it: compact, no HTML escaping, no trailing newline.
+
+`height` and `colors` are the entity's model statistics -
+{ref}`TModelStats.OfModels` computes both. They are parameters rather than being
+derived here for the same reason the Java passes them in: the loop that produces
+them needs the store, and this function needs nothing but the definition, which
+is what makes it testable on a definition alone.
+
+Every number goes out as an integer. There is no floating-point value anywhere
+in this artifact and there is no path by which one could appear: `level`,
+`category`, `size` and `height` are `Integer` fields and `colors` is a packed
+RGB, so `ToStr` is safe on all of them.
+
+Example:
+```pascal
+WriteLn NpcHelperJSON(npc, 0, []);
+// {"name":"null","level":0,"category":1458,"minimapdot":true,"actions":[],"size":[1,1,0],"colors":[]}
+```
+*)
+function NpcHelperJSON(npc: TNpcDefinition; height: Integer; colors: TIntegerArray): String;
+var
+  i, written: Integer;
+begin
+  Result := '{"name":"' + JSONEscape(npc.Name) + '"' +
+            ',"level":' + ToStr(npc.CombatLevel) +
+            ',"category":' + ToStr(npc.Category) +
+            ',"minimapdot":' + _NpcJsonBool(npc.IsMinimapVisible) +
+            ',"actions":[';
+
+  // `if (get(i) != null) actions.add(...)`. An unset slot is '' here, so the
+  // separator has to count what was written, not the loop index.
+  for i := 0 to High(npc.Ops.Ops) do
+  begin
+    if npc.Ops.Ops[i] = '' then Continue;
+    if written > 0 then Result += ',';
+    Result += '"' + JSONEscape(npc.Ops.Ops[i]) + '"';
+    Inc(written);
+  end;
+
+  // size.add(npc.size); size.add(npc.size); size.add(height);
+  Result += '],"size":[' + ToStr(npc.Size) + ',' + ToStr(npc.Size) + ',' +
+            ToStr(height) + '],"colors":[';
+
+  for i := 0 to High(colors) do
+  begin
+    if i > 0 then Result += ',';
+    Result += ToStr(colors[i]);
+  end;
+
+  Result += ']}';
+end;
+
+(*
+## NpcHelperJSONOf
+```pascal
+function NpcHelperJSONOf(var store: TCacheStore; textures: array of TTextureDefinition; id: Integer; data: TByteArray): String;
+```
+{ref}`NpcHelperJSON` for one raw CONFIGS/NPC file: decode it, compute its model
+statistics against `store`, serialise.
+
+`data` is one element of `store.ReadFiles(2, Ord(EConfigType.NPC), [])` and `id`
+is the matching entry of the reference table's `FileIds`.
+
+`textures` is {ref}`ModelStatsTextures` for the same store. It is a parameter
+because it is the one thing here that is worth loading once: rebuilding it per
+definition would decompress the TEXTURES archive 16292 times.
+
+There is **no memoisation**, per definition or per model, matching
+`SimbaNPCDumper` - see the note in `modelstats.simba` on why a memo here is the
+one optimisation worth refusing.
+*)
+function NpcHelperJSONOf(var store: TCacheStore; textures: array of TTextureDefinition; id: Integer; data: TByteArray): String;
+var
+  npc: TNpcDefinition;
+  stats: TModelStats;
+begin
+  npc := TNpcDefinition.Load(id, data);
+  stats := TModelStats.OfModels(store, textures, npc.Models);
+  Result := NpcHelperJSON(npc, stats.Height, stats.Colors);
+end;
+
+// A String as its raw bytes. `Result := []` first because SetLength keeps the
+// overlapping prefix of whatever the slot held before.
+function _NpcHelperBytes(s: String): TByteArray;
+begin
+  Result := [];
+  if s = '' then Exit;
+  SetLength(Result, Length(s));
+  Move(s[1], Result[0], Length(s));
+end;
+
+
+(*
+## DumpNPCHelper
+```pascal
+procedure DumpNPCHelper(var store: TCacheStore; zipPath: String);
+```
+Writes the whole `map/zips/npcs_helper.zip` for `store`: every file of the
+CONFIGS/NPC archive, unfiltered, named `<id>.json`, in byte-lexicographic entry
+order.
+
+This is the slow half of the NPC pipeline - it decodes every model every NPC
+points at, ~30 s over the 16292 definitions on this machine. Nothing here is
+cached between entities on purpose; see `modelstats.simba`.
+
+```pascal
+store := TCacheStore.Create(cacheDir);
+DumpNPCHelper(store, dump.Path('map/zips/npcs_helper.zip'));
+```
+*)
+procedure DumpNPCHelper(var store: TCacheStore; zipPath: String);
+var
+  files: array of TByteArray;
+  textures: array of TTextureDefinition;
+  table: TCacheRefTable;
+  ids, order: TIntegerArray;
+  names: TStringArray;
+  zip: TZipWriter;
+  a, i, k: Integer;
+begin
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.NPC));
+  if a = -1 then
+    raise 'DumpNPCs: this cache has no CONFIGS/NPC archive';
+
+  ids := table.Archives[a].FileIds;
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.NPC), []);
+  if Length(files) <> Length(ids) then
+    raise 'DumpNPCs: the NPC archive holds ' + ToStr(Length(files)) +
+          ' files but its reference table names ' + ToStr(Length(ids));
+
+  textures := ModelStatsTextures(store);
+
+  SetLength(names, Length(ids));
+  for i := 0 to High(ids) do
+    names[i] := ToStr(ids[i]) + '.json';
+  order := DumpEntryOrder(names);
+
+  zip.Init();
+  for i := 0 to High(order) do
+  begin
+    if i mod 1000 = 0 then
+      WriteLn('DumpNPCs: helper ', i, '/', Length(order));
+    k := order[i];
+    zip.AddBytes(names[k], _NpcHelperBytes(NpcHelperJSONOf(store, textures, ids[k], files[k])));
+  end;
+
+  zip.Save(zipPath);
+end;

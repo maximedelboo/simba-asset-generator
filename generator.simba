@@ -1,0 +1,105 @@
+program GenerateAssets;
+(**
+# Generate Assets
+
+Standalone Simba entry point. The entire cache reader and asset dumper lives in
+`simba/`; its only runtime requirements are Simba and an internet connection.
+
+```text
+Simba --run asset-generator/generator.simba
+Simba --revision=2639 --run asset-generator/generator.simba
+Simba --cache=/path/to/unpacked/cache --run asset-generator/generator.simba
+```
+
+With no arguments, the generator asks OpenRS2 for the latest valid Old School
+live English Jagex cache and dumps it. Downloaded caches live in `cache/` and a
+complete fresh asset tree is always written to this directory's own `out/`.
+The bundled `static/` directory supplies the sixteen curated assets that cannot
+be derived from an OSRS cache. `--only=<dumper>` is intended for development and
+preserves an existing output tree; a normal full run first recreates `out/` so
+it cannot accidentally retain an old cache's files.
+
+The `itemfinder` dumper also writes `out/finders/items/items-imgs.zip`: a
+direct RGBA PNG corpus alongside the runtime `items.bin`, encoded entirely via
+Simba's public compression API.
+*)
+{$INCLUDE_ONCE simba/cache/manager.simba}
+{$INCLUDE_ONCE simba/cache/dump/dumpassets.simba}
+
+procedure RestoreNPCFallback(sourceRoot, outputRoot: String);
+var
+  sourceZip, outputZip, outputMapDir: String;
+begin
+  outputZip := PathIncludeTrailingSep(outputRoot) + 'map' + PATH_SEP + 'npcs.zip';
+  if FileExists(outputZip) then Exit;
+
+  sourceZip := PathIncludeTrailingSep(sourceRoot) + 'static' + PATH_SEP + 'map' + PATH_SEP + 'npcs.zip';
+  if not FileExists(sourceZip) then
+    raise 'AssetGenerator: spawn source failed and packaged fallback is absent: ' + sourceZip;
+  outputMapDir := PathExtractDir(outputZip);
+  if not DirExists(outputMapDir) and not DirCreate(outputMapDir) then
+    raise 'AssetGenerator: could not create ' + outputMapDir;
+  if not FileCopy(sourceZip, outputZip) then
+    raise 'AssetGenerator: could not copy NPC fallback to ' + outputZip;
+
+  WriteLn('AssetGenerator: [WARN] live NPC spawn data unavailable; using packaged ',
+          'map/npcs.zip fallback');
+end;
+
+var
+  rootDir, cacheRoot, cacheDir, outDir, revision, only: String;
+  manager: TCacheManager;
+  run: TAssetDumpRun;
+  ran, present, verified: Integer;
+  t: Double;
+begin
+  rootDir := PathIncludeTrailingSep(PathNormalize({$MACRO DIR}));
+  cacheRoot := rootDir + 'cache' + PATH_SEP;
+  outDir := rootDir + 'out' + PATH_SEP;
+
+  if GetProcessArg('revision') then revision := Trim(GetProcessArg('revision'));
+  if GetProcessArg('cache') then cacheDir := Trim(GetProcessArg('cache'));
+  if GetProcessArg('only') then only := Trim(GetProcessArg('only'));
+  if (revision <> '') and (cacheDir <> '') then
+    raise 'AssetGenerator: --revision and --cache cannot be combined';
+
+  manager := TCacheManager.Create(cacheRoot);
+
+  if (revision = '') and (cacheDir = '') then
+  begin
+    revision := manager.LatestOpenRS2Revision();
+    WriteLn('AssetGenerator: latest OpenRS2 cache revision is ', revision);
+  end;
+
+  if revision <> '' then
+    cacheDir := manager.EnsureOpenRS2(revision);
+  if not FileExists(PathIncludeTrailingSep(cacheDir) + 'main_file_cache.dat2') then
+    raise 'AssetGenerator: not an unpacked cache: ' + cacheDir;
+
+  // `out` is owned by this package. A normal run starts with a clean output so
+  // failures cannot leave a manifest that quietly covers an older revision.
+  if (only = '') and DirExists(outDir) then DirDelete(outDir, False);
+  if not DirExists(outDir) and not DirCreate(outDir) then
+    raise 'AssetGenerator: could not create ' + outDir;
+
+  t := PerformanceTime();
+  run.Setup(cacheDir, outDir);
+  run.Context.StaticDir := rootDir + 'static';
+  run.Only := only;
+  RegisterAssetDumpers(run);
+
+  WriteLn('============================================================');
+  WriteLn('Asset Generator');
+  WriteLn('  source  ', rootDir);
+  WriteLn('  cache   ', run.Context.Store.Directory);
+  WriteLn('  output  ', run.Context.Dump.Root);
+  WriteLn('============================================================');
+  ran := run.Execute();
+  if (only = '') or SameText(only, 'npcs') then
+    RestoreNPCFallback(rootDir, run.Context.Dump.Root);
+  WriteLn('AssetGenerator: writing and verifying manifest…');
+  present := run.WriteManifest();
+  verified := VerifyAssetManifest(run.Context.Dump.Root, only = '');
+  WriteLn('AssetGenerator: [PASS] ', ran, ' dumper(s), ', verified, '/', present,
+          ' manifest files verified in ', Round(PerformanceTime() - t), ' ms');
+end.

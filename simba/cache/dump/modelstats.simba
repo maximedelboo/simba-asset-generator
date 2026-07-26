@@ -1,0 +1,244 @@
+(*
+# Model Stats
+The one piece of model work the object and NPC dumps do: a `height` and a
+`colors` list per entity, computed from the models the definition points at.
+
+Nothing else in either dumper touches a model, and both compute this the same
+way, so it lives here rather than twice.
+
+The per-**model** halves are already in `utils/cache/defs/model.simba` -
+{ref}`TModelDefinition.Height` (`ObjExporter.getSimbaHeight`) and
+{ref}`TModelDefinition.Colors` (`ObjExporter.getSimbaColors`), both validated in
+phase 2. What this unit adds is the per-**entity** wiring around them, which is
+`SimbaNPCDumper.java:88-101`:
+
+```java
+int height = 0;
+List<Integer> colors = new ArrayList<>();
+if (def.getModels() != null) {
+    for (int i = 0; i < def.getModels().length; i++) {
+        ...
+        ObjExporter exporter = new ObjExporter(textureManager, model);
+        if (height == 0) height = exporter.getSimbaHeight();
+        colors.addAll(exporter.getSimbaColors());
+    }
+}
+```
+
+Three properties of that loop are contract, not incidental:
+
+- **`height` is the first model's, and only the first model's.**
+  `getSimbaHeight` seeds its lower bound at `0xffffffff` = -1 and can therefore
+  never return 0, so the `height == 0` guard fires on model 0 and never again.
+  The guard is kept here rather than replaced with "model 0", because it is what
+  the Java says and it is what makes `height = 0` mean *"this entity has no
+  models at all"* - 2462 of the 16292 NPC definitions.
+
+  Do **not** shorten {ref}`TModelDefinition.Height` to `max(-vertexY) + 1` on
+  the theory that Jagex Y never goes positive. Measured over the 7801 distinct
+  models the NPC archive references (1790942 vertices): **953 of them carry a
+  vertex at `vertexY >= 2`**, which pushes `lo` below the -1 seed, and **1316 of
+  the 16292 NPCs take their height from such a model** - NPC 124 "Yama" among
+  them. The shortcut is wrong for 8% of the corpus; the full loop is not
+  optional.
+- **Colours are deduplicated per model and concatenated across models with no
+  cross-model dedup.** 8454 of the 16292 committed helper files carry a value
+  more than once because of it. Deduplicating globally is the single easiest way
+  to break this and it breaks it for half the corpus.
+- **No recolour or retexture is applied.** `RecolorToFind`/`RecolorToReplace`
+  and the retexture pair sit right there on the definition and are ignored: the
+  colours are the raw shared model's, not the entity's as it appears in game.
+  Reproduce that, do not "fix" it.
+
+## What this is NOT
+
+`SimbaObjectInfoDumper` runs the same loop but memoises the result under
+`ObjectDefinition.getObjectID()`, a field that is declared and never assigned,
+so every lookup and store uses key 0 and all 48857 entries of the committed
+`map/objects.zip` carry the *first* processed object's height and colour set.
+That is a Java defect. There is deliberately no memo in this unit - not per
+entity, and not per model either, because a model-level memo is a performance
+choice that would sit exactly where the Java's correctness bug does. A full NPC
+sweep of 16292 definitions over 7801 distinct models measures ~29 s on this
+machine, which is fine for a one-off asset generation.
+
+## Verification
+Measured against the committed `wasp-assets/map/zips/npcs_helper.zip`, which
+`SimbaNPCDumper` wrote with no memoisation and no filtering: **16292 / 16292
+heights and 16292 / 16292 colour sets**, on OpenRS2 cache 2625 *and* on 2639 -
+the two revisions produce byte-identical stats for every NPC. See
+`dev/tests/410_modelstats.simba`.
+*)
+{$DEFINE WL_CACHE_DUMP_MODELSTATS_INCLUDED}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_TERRAIN_INCLUDED}{$INCLUDE_ONCE ../defs/terrain.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_MODEL_INCLUDED}{$INCLUDE_ONCE ../defs/model.simba}{$ENDIF}
+
+(*
+## ModelStatsTextures
+```pascal
+function ModelStatsTextures(var store: TCacheStore): array of TTextureDefinition;
+```
+The whole TEXTURES table (index 9, archive 0), in file order, ready to hand to
+{ref}`TModelStats.OfModel`. Load it **once** per dump and pass it down: it is
+210 definitions on cache 2625 and rebuilding it per entity would decompress the
+same archive tens of thousands of times.
+
+Position is not id - the live cache has no texture 54 - which is why the ids
+come from the reference table and travel with each definition rather than being
+implied by the array index.
+
+Textures are what makes a face come out with a red byte of 0:
+`TTextureDefinition.AverageRGB` is a 16-bit field, so `rgb shr 16` is 0 before
+the brightness pass and stays 0 through it. That is the Java's behaviour too,
+and it is visible in the committed data (11557 of 277783 helper colour entries
+have a zero red byte).
+
+**The `rev233` field order is the real one, and that is now measured rather than
+assumed.** `TextureLoader` picks between two layouts on a hardcoded flag, and
+they disagree about whether the sprite id or `averageRGB` comes first - get it
+wrong and every textured face is wrong. On cache 2625 all 210 texture files are
+**exactly 7 bytes**, which only the `rev233` layout (u16 sprite id, u16 average
+colour, 3 flag bytes) can be: the legacy one needs at least 12 for a single
+file, because it carries a per-file `field1786` int and a trailing count. The
+payloads agree - the first field runs 447, 448, 449, ... in id order, which is a
+sprite-id run, while the second jumps around like a colour.
+
+Raises if index 9 is missing or does not describe archive 0 - a cache that
+cannot answer for its textures cannot produce a colour list, and returning an
+empty table would silently mis-colour every textured face instead.
+*)
+function ModelStatsTextures(var store: TCacheStore): array of TTextureDefinition;
+var
+  files: array of TByteArray;
+  table: TCacheRefTable;
+  ids: TIntegerArray;
+  a, i: Integer;
+begin
+  files := store.ReadFiles(Ord(EIndexType.TEXTURES), 0, []);
+  if Length(files) = 0 then
+    raise 'ModelStats: the TEXTURES index holds no files';
+
+  table := store.GetRefTable(Ord(EIndexType.TEXTURES));
+  a := table.IndexOfArchive(0);
+  if a = -1 then
+    raise 'ModelStats: the TEXTURES reference table has no archive 0';
+
+  ids := table.Archives[a].FileIds;
+  if Length(ids) <> Length(files) then
+    raise 'ModelStats: TEXTURES archive 0 has ' + ToStr(Length(files)) +
+          ' files but ' + ToStr(Length(ids)) + ' file ids';
+
+  SetLength(Result, Length(files));
+  for i := 0 to High(files) do
+    Result[i] := TTextureDefinition.Load(ids[i], files[i]);
+end;
+
+type
+(*
+## TModelStats
+```pascal
+TModelStats = record
+  Height: Integer;
+  Colors: TIntegerArray;
+end;
+```
+What an entity's models contribute to its dumped JSON: `Height` lands in
+`size[2]`, `Colors` becomes the `colors` array verbatim, order and duplicates
+included.
+
+`Height = 0` means and can only mean "no models" - see the note on the
+`height == 0` guard above.
+*)
+  TModelStats = record
+    Height: Integer;
+    Colors: TIntegerArray;
+  end;
+
+(*
+## TModelStats.OfModel
+```pascal
+function TModelStats.OfModel(var store: TCacheStore; textures: array of TTextureDefinition; model: Integer): TModelStats; static;
+```
+One model's own height and colours: read index 7, decode, then
+{ref}`TModelDefinition.Height` and {ref}`TModelDefinition.Colors`.
+
+`Height` here is the model's raw `getSimbaHeight` and **is** allowed to be 1 for
+an empty model - the "0 means no models" rule belongs to
+{ref}`TModelStats.OfModels`, one level up.
+
+Raises on a model id index 7 cannot answer for. That is deliberate rather than a
+skip: the first model decides the entity's height, so quietly dropping one would
+silently hand the height to the second. Measured on cache 2625, every model id
+referenced by the NPC archive (16292 definitions) and by the OBJECT archive
+(62194 definitions, 75781 references) resolves, so this raise is unreachable on
+real data - which is exactly why it should be a raise and not a `Continue`.
+*)
+function TModelStats.OfModel(var store: TCacheStore; textures: array of TTextureDefinition; model: Integer): TModelStats; static;
+var
+  data: TByteArray;
+  def: TModelDefinition;
+begin
+  if (model < 0) or (model >= store.ArchiveCount(Ord(EIndexType.MODELS))) then
+    raise 'ModelStats: model ' + ToStr(model) + ' is outside the MODELS index';
+
+  data := store.Read(Ord(EIndexType.MODELS), model, []);
+  if Length(data) = 0 then
+    raise 'ModelStats: model ' + ToStr(model) + ' is empty in the MODELS index';
+
+  def := TModelDefinition.Load(model, data);
+  Result.Height := def.Height();
+  Result.Colors := def.Colors(textures);
+end;
+
+(*
+## TModelStats.OfModels
+```pascal
+function TModelStats.OfModels(var store: TCacheStore; textures: array of TTextureDefinition; models: TIntegerArray): TModelStats; static;
+```
+The entity-level computation both dumpers share: pass an NPC's `Models` or an
+object's `ObjectModels` and get the `height` and `colors` the Java pipeline
+writes.
+
+`models` may be empty - a null `getModels()` in Java - and then the result is
+`Height = 0` with no colours.
+
+Example:
+```pascal
+var
+  store: TCacheStore;
+  tex: array of TTextureDefinition;
+  npc: TNpcDefinition;
+  st: TModelStats;
+begin
+  store := TCacheStore.Create(cacheDir);
+  tex := ModelStatsTextures(store);
+  npc := TNpcDefinition.Load(3096, npcData);
+  st := TModelStats.OfModels(store, tex, npc.Models);
+  WriteLn(st.Height);  // 211
+end;
+```
+*)
+function TModelStats.OfModels(var store: TCacheStore; textures: array of TTextureDefinition; models: TIntegerArray): TModelStats; static;
+var
+  i: Integer;
+  one: TModelStats;
+begin
+  // A record Result is zero-filled per call, so Height already starts at 0 and
+  // Colors already starts empty - the two seeds the Java writes out by hand.
+  for i := 0 to High(models) do
+  begin
+    one := TModelStats.OfModel(store, textures, models[i]);
+
+    // `if (height == 0) height = ...`, kept literally. getSimbaHeight never
+    // returns 0, so this takes the first model's height and no other's.
+    if Result.Height = 0 then
+      Result.Height := one.Height;
+
+    // addAll: append, do NOT deduplicate. The per-model dedup already happened
+    // inside TModelDefinition.Colors; across models the Java repeats itself and
+    // half the committed corpus shows it.
+    Result.Colors := Result.Colors + one.Colors;
+  end;
+end;

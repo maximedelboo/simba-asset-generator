@@ -1,0 +1,566 @@
+(*
+# Render: ItemSprite
+The entry point: one item definition plus its inventory model in, one 36x32
+inventory icon out. Ported from
+`net.runelite.cache.item.ItemSpriteFactory.createSpritePixels` and
+`net.runelite.cache.item.SpritePixels.drawBorder` / `drawShadow`, verified
+against `LostCityRS/OS1 ObjType.getSprite()`.
+
+```pascal
+BuildCircularAngle();
+BuildPalette(JAGEX_BRIGHTNESS_MAX);
+RenderItemSprite(defs.Item(id), defs.Model(item.InventoryModel));
+// the icon is now in graphicsPixels, 36*32 packed 0xRRGGBB
+```
+
+The direct API mirrors the ItemFinder arguments (quantity 1, border 1, shadow
+`$302020`, noted false); `RenderItemSpriteFromSource` additionally links and
+composites noted, bought and placeholder variants. The model preparation order
+is render spec 2.1: {ref}`ModelResize` (3D.4), then {ref}`ModelRecolor`
+(3D.3), then {ref}`LightModel`. `retexture` (3D.12) remains refused by the
+caller through {ref}`ITEM_SPRITE_UNSUPPORTED_ITEM` rather than silently
+rendered as its base.
+
+## Why the output is a bare `TIntegerArray` and not a `TImage`
+Because the thing consuming it is a CRC32, not a screen. `TItemFinder` hashes
+the raw 36x32 slot, and every extra conversion between here and that hash is a
+chance to permute a channel. The zip-writing dumper converts once, at the edge.
+Note the packing is `0xRRGGBB` - **not** Simba's BGR `TColor` - so anything
+handing these pixels to `TImage` must swap red and blue.
+
+## The post-processing order is load-bearing
+Border first, then shadow: `drawShadow` tests for a **non-zero** pixel up and to
+the left, so a border drawn afterwards would cast no shadow of its own and the
+silhouette would differ by a one-pixel diagonal fringe.
+
+`drawBorder` writes into a **fresh** buffer rather than in place, because it
+reads neighbours that would already have been turned into border pixels
+otherwise - one pass would then grow a two-pixel border along any diagonal.
+`drawShadow` writes in place and walks bottom-right to top-left, which is the
+Java's own order and is *not* interchangeable with the other diagonal.
+*)
+{$DEFINE WL_CACHE_RENDER_ITEMSPRITE_INCLUDED}
+{$IFNDEF WL_CACHE_RENDER_MODELLIT_INCLUDED}{$INCLUDE_ONCE modellit.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_ITEM_INCLUDED}{$INCLUDE_ONCE ../../defs/item.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_TERRAIN_INCLUDED}{$INCLUDE_ONCE ../../defs/terrain.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_SPRITE_INCLUDED}{$INCLUDE_ONCE ../../defs/sprite.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../../store.simba}{$ENDIF}
+
+(*
+## CONTRAST_SCALE
+```pascal
+var CONTRAST_SCALE: Integer = 5;
+```
+Multiplier applied to `TItemDefinition.Contrast` before lighting.
+
+The decompiled OSRS client (`LostCityRS/OS1 ObjType.java:311`) decodes opcode
+114 as `contrast = g1b() * 5`. RuneLite's cache `ItemLoader` - and therefore
+`utils/cache/defs/item.simba`, which is ported from it and must keep the raw
+value for `item-definitions.zip` parity - reads the raw signed byte with no
+scale, so every item with a non-zero contrast would be lit with a 5x too small
+attenuation.
+
+Measured over 3331 items against the committed hashes: raw scores 3158 (94.8%),
+`x5` scores 3331 (100%). All 173 misses had non-zero contrast and no
+zero-contrast item ever missed. Set to 1 to reproduce RuneLite's behaviour.
+*)
+var
+  CONTRAST_SCALE: Integer = 5;
+
+(*
+## TItemSpriteSource
+```pascal
+TItemSpriteSource = record ... end;
+procedure ItemSpriteSourceSetup(var source: TItemSpriteSource;
+                                var store: TCacheStore;
+                                files: array of TByteArray;
+                                positions: TIntegerArray);
+```
+The cache-backed input for recursive item renders. `Files` is the already split
+ITEM archive and `Positions[id]` maps sparse ids to that archive position; this
+avoids the quadratic `TCacheDefs.Item` lookup in a 19k-item sweep. `Store` is
+used only for individual model archives.
+*)
+type
+  TItemSpriteSource = record
+    Store: TCacheStore;
+    Files: array of TByteArray;
+    Positions: TIntegerArray;
+  end;
+
+procedure ItemSpriteLoadTextures(var source: TItemSpriteSource);
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids, palette, pixels: TIntegerArray;
+  frames: array of TSpriteDefinition;
+  texture: TTextureDefinition;
+  sprite: TSpriteDefinition;
+  archive, i, j, x, y, maxId: Integer;
+begin
+  files := source.Store.ReadFiles(Ord(EIndexType.TEXTURES), 0, []);
+  if Length(files) = 0 then
+  begin
+    TextureProviderClear(-1);
+    Exit;
+  end;
+
+  table := source.Store.GetRefTable(Ord(EIndexType.TEXTURES));
+  archive := table.IndexOfArchive(0);
+  if archive = -1 then
+  begin
+    TextureProviderClear(-1);
+    Exit;
+  end;
+  ids := table.Archives[archive].FileIds;
+  maxId := -1;
+  for i := 0 to High(ids) do
+    if ids[i] > maxId then maxId := ids[i];
+  TextureProviderClear(maxId);
+
+  for i := 0 to High(files) do
+  begin
+    texture := TTextureDefinition.Load(ids[i], files[i]);
+    if Length(texture.FileIds) > 0 then
+    begin
+      frames := TSpriteDefinition.LoadAll(texture.FileIds[0],
+        source.Store.Read(Ord(EIndexType.SPRITES), texture.FileIds[0], []));
+      if Length(frames) > 0 then
+      begin
+        sprite := frames[0].Normalize();
+        palette := Copy(sprite.Palette);
+        for j := 0 to High(palette) do
+          palette[j] := JagexAdjustForBrightness(palette[j], JAGEX_BRIGHTNESS_MAX);
+        pixels := [];
+        SetLength(pixels, 128 * 128);
+        if (sprite.Width = 128) and (sprite.Height = 128) then
+        begin
+          for j := 0 to 128 * 128 - 1 do
+            pixels[j] := palette[sprite.PixelIdx[j] and $FF];
+          TextureProviderPut(texture.Id, pixels, texture.AverageRGB, texture.Field1778);
+        end
+        else if (sprite.Width = 64) and (sprite.Height = 64) then
+        begin
+          for y := 0 to 127 do
+            for x := 0 to 127 do
+              pixels[x + y * 128] := palette[sprite.PixelIdx[(x div 2) + (y div 2) * 64] and $FF];
+          TextureProviderPut(texture.Id, pixels, texture.AverageRGB, texture.Field1778);
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure ItemSpriteSourceSetup(var source: TItemSpriteSource;
+                                var store: TCacheStore;
+                                files: array of TByteArray;
+                                positions: TIntegerArray);
+begin
+  source.Store := store;
+  source.Files := files;
+  source.Positions := positions;
+  ItemSpriteLoadTextures(source);
+end;
+
+function ItemSpriteSourceRaw(var source: TItemSpriteSource; id: Integer): TItemDefinition;
+var
+  pos: Integer;
+begin
+  if (id < 0) or (id > High(source.Positions)) then Exit(TItemDefinition.Default(-1));
+  pos := source.Positions[id];
+  if (pos < 0) or (pos > High(source.Files)) then Exit(TItemDefinition.Default(-1));
+  Result := TItemDefinition.Load(id, source.Files[pos]);
+end;
+
+function ItemSpriteSourceModel(var source: TItemSpriteSource; id: Integer): TModelDefinition;
+var
+  data: TByteArray;
+begin
+  if (id < 0) or (id >= source.Store.ArchiveCount(Ord(EIndexType.MODELS))) then
+  begin
+    Result.Reset(-1);
+    Exit;
+  end;
+  data := source.Store.Read(Ord(EIndexType.MODELS), id, []);
+  if Length(data) = 0 then
+  begin
+    Result.Reset(-1);
+    Exit;
+  end;
+  Result := TModelDefinition.Load(id, data);
+end;
+
+function ItemSpriteSourceLinked(var source: TItemSpriteSource; id: Integer): TItemDefinition;
+var
+  template, linked: TItemDefinition;
+begin
+  Result := ItemSpriteSourceRaw(source, id);
+  if Result.Id = -1 then Exit;
+
+  // These are ItemDefinition.linkNote/linkBought/linkPlaceholder. They mutate
+  // the manager's decoded records in Java; here Result is a fresh record, so
+  // assigning scalar fields and read-only array references cannot contaminate
+  // a later render.
+  if Result.NotedTemplate <> -1 then
+  begin
+    template := ItemSpriteSourceRaw(source, Result.NotedTemplate);
+    linked := ItemSpriteSourceRaw(source, Result.NotedId);
+    Result.InventoryModel := template.InventoryModel;
+    Result.Zoom2D := template.Zoom2D;
+    Result.XAn2D := template.XAn2D; Result.YAn2D := template.YAn2D; Result.ZAn2D := template.ZAn2D;
+    Result.XOffset2D := template.XOffset2D; Result.YOffset2D := template.YOffset2D;
+    Result.ColorFind := template.ColorFind; Result.ColorReplace := template.ColorReplace;
+    Result.TextureFind := template.TextureFind; Result.TextureReplace := template.TextureReplace;
+    Result.Name := linked.Name; Result.Members := linked.Members; Result.Cost := linked.Cost;
+    Result.Stackable := 1;
+  end;
+
+  if Result.BoughtTemplateId <> -1 then
+  begin
+    template := ItemSpriteSourceRaw(source, Result.BoughtTemplateId);
+    linked := ItemSpriteSourceRaw(source, Result.BoughtId);
+    Result.InventoryModel := template.InventoryModel;
+    Result.Zoom2D := template.Zoom2D;
+    Result.XAn2D := template.XAn2D; Result.YAn2D := template.YAn2D; Result.ZAn2D := template.ZAn2D;
+    Result.XOffset2D := template.XOffset2D; Result.YOffset2D := template.YOffset2D;
+    Result.ColorFind := linked.ColorFind; Result.ColorReplace := linked.ColorReplace;
+    Result.TextureFind := linked.TextureFind; Result.TextureReplace := linked.TextureReplace;
+    Result.Name := linked.Name; Result.Members := linked.Members; Result.Stackable := linked.Stackable;
+    Result.MaleModel0 := linked.MaleModel0; Result.MaleModel1 := linked.MaleModel1;
+    Result.MaleModel2 := linked.MaleModel2; Result.FemaleModel0 := linked.FemaleModel0;
+    Result.FemaleModel1 := linked.FemaleModel1; Result.FemaleModel2 := linked.FemaleModel2;
+    Result.MaleHeadModel := linked.MaleHeadModel; Result.MaleHeadModel2 := linked.MaleHeadModel2;
+    Result.FemaleHeadModel := linked.FemaleHeadModel; Result.FemaleHeadModel2 := linked.FemaleHeadModel2;
+    Result.Team := linked.Team; Result.Ops := linked.Ops;
+    Result.InterfaceOptions := Copy(linked.InterfaceOptions);
+    if Length(Result.InterfaceOptions) = 0 then SetLength(Result.InterfaceOptions, ITEM_INTERFACE_OPTIONS);
+    Result.InterfaceOptions[ITEM_INTERFACE_OPTIONS - 1] := 'Discard';
+    Result.Cost := 0;
+  end;
+
+  if Result.PlaceholderTemplateId <> -1 then
+  begin
+    template := ItemSpriteSourceRaw(source, Result.PlaceholderTemplateId);
+    linked := ItemSpriteSourceRaw(source, Result.PlaceholderId);
+    Result.InventoryModel := template.InventoryModel;
+    Result.Zoom2D := template.Zoom2D;
+    Result.XAn2D := template.XAn2D; Result.YAn2D := template.YAn2D; Result.ZAn2D := template.ZAn2D;
+    Result.XOffset2D := template.XOffset2D; Result.YOffset2D := template.YOffset2D;
+    Result.ColorFind := template.ColorFind; Result.ColorReplace := template.ColorReplace;
+    Result.TextureFind := template.TextureFind; Result.TextureReplace := template.TextureReplace;
+    Result.Stackable := template.Stackable;
+    Result.Name := linked.Name; Result.Cost := 0; Result.Members := False;
+    Result.Tradeable := False; Result.GeTradeable := False;
+  end;
+end;
+
+
+(*
+## The feature bitfield, and the two refusal masks
+```pascal
+function ItemFeatureFlags(item: TItemDefinition): Integer;
+function ModelFeatureFlags(model: TModelDefinition): Integer;
+const ITEM_SPRITE_UNSUPPORTED_ITEM, ITEM_SPRITE_UNSUPPORTED_MODEL: Integer;
+```
+**The renderer does not raise for everything it cannot draw, so the refusal set
+has to live somewhere - and it lives here, once.** An item needing a template
+or a texture find is invisible from inside {ref}`RenderItemSprite`: nothing
+raises, and a caller that forgets the check gets a plausible, wrong icon, which
+a corpus sweep cannot distinguish from cache drift.
+
+Face **priorities** were the same hazard on the model side until task 3D.5, and
+are the reason this pair of masks exists at all - a model carrying them was
+silently drawn in plain depth order by {ref}`ModelDraw`. {ref}`ModelDrawPriority`
+now implements the sort, so `MODEL_FEAT_PRIORITIES` is a reported flag rather
+than a refusal. Render types and alpha are now rendered too; textures are the
+one remaining model bit that raises inside {ref}`LightModel`. For the item bits
+the mask is the only protection against a plausible but wrong render.
+
+Before these lived here the same ten-bit test was written out longhand in both
+`dev/spike/itemsprite/sweepx.simba` and `dev/tests/431_render_regression.simba`,
+and task 3D.13's dumper would have made a third copy. Every caller now shares
+one definition, and each feature task deletes its bit from one mask - which is
+also what makes the "+N items" delta in the plan's 6 table mean anything.
+
+The bit values are `sweepx.simba`'s and are part of its CSV contract, so they
+are stable even as bits leave the masks:
+
+```
+ 1 noted template      8 colorFind      64 model textures   512 model priorities
+ 2 bought template    16 textureFind   128 model face alpha
+ 4 placeholder        32 resize        256 model render types
+```
+
+Implemented so far, hence absent from the masks: `colorFind` (3D.3), `resize`
+(3D.4), model face `priorities` (3D.5), render types (3D.6/3D.7) and alpha
+(3D.8).
+*)
+const
+  ITEM_FEAT_NOTED: Integer        = 1;
+  ITEM_FEAT_BOUGHT: Integer       = 2;
+  ITEM_FEAT_PLACEHOLDER: Integer  = 4;
+  ITEM_FEAT_COLORFIND: Integer    = 8;
+  ITEM_FEAT_TEXTUREFIND: Integer  = 16;
+  ITEM_FEAT_RESIZE: Integer       = 32;
+  MODEL_FEAT_TEXTURES: Integer    = 64;
+  MODEL_FEAT_ALPHA: Integer       = 128;
+  MODEL_FEAT_RENDERTYPES: Integer = 256;
+  MODEL_FEAT_PRIORITIES: Integer  = 512;
+
+  ITEM_SPRITE_UNSUPPORTED_ITEM: Integer  = 0;
+  ITEM_SPRITE_UNSUPPORTED_MODEL: Integer = 0;
+
+function ItemFeatureFlags(item: TItemDefinition): Integer;
+begin
+  Result := 0;
+  if item.NotedTemplate         <> -1 then Result := Result or ITEM_FEAT_NOTED;
+  if item.BoughtTemplateId      <> -1 then Result := Result or ITEM_FEAT_BOUGHT;
+  if item.PlaceholderTemplateId <> -1 then Result := Result or ITEM_FEAT_PLACEHOLDER;
+  if Length(item.ColorFind)     >   0 then Result := Result or ITEM_FEAT_COLORFIND;
+  if Length(item.TextureFind)   >   0 then Result := Result or ITEM_FEAT_TEXTUREFIND;
+  if (item.ResizeX <> 128) or (item.ResizeY <> 128) or (item.ResizeZ <> 128) then
+    Result := Result or ITEM_FEAT_RESIZE;
+end;
+
+function ModelFeatureFlags(model: TModelDefinition): Integer;
+begin
+  Result := 0;
+  if Length(model.FaceTextures)         > 0 then Result := Result or MODEL_FEAT_TEXTURES;
+  if Length(model.FaceTransparencies)   > 0 then Result := Result or MODEL_FEAT_ALPHA;
+  if Length(model.FaceRenderTypes)      > 0 then Result := Result or MODEL_FEAT_RENDERTYPES;
+  if Length(model.FaceRenderPriorities) > 0 then Result := Result or MODEL_FEAT_PRIORITIES;
+end;
+
+// The recursive render can touch an auxiliary item's model as well as the
+// visible item's own model. A preflight that inspects only the outer model lets
+// an unported textured auxiliary reach LightModel and turn a deliberate refusal
+// into an exception. Keep the same traversal the compositor uses.
+function _ItemSpriteSourceFeatureFlags(var source: TItemSpriteSource; id, depth: Integer): Integer;
+var
+  item: TItemDefinition;
+  model: TModelDefinition;
+begin
+  if depth > 8 then raise 'ItemSpriteSourceFeatureFlags: template cycle at ' + ToStr(id);
+  item := ItemSpriteSourceLinked(source, id);
+  if item.Id = -1 then Exit(0);
+  Result := ItemFeatureFlags(item);
+  model := ItemSpriteSourceModel(source, item.InventoryModel);
+  if model.Id <> -1 then Result := Result or ModelFeatureFlags(model);
+  if item.NotedTemplate <> -1 then
+    Result := Result or _ItemSpriteSourceFeatureFlags(source, item.NotedId, depth + 1)
+  else if item.BoughtTemplateId <> -1 then
+    Result := Result or _ItemSpriteSourceFeatureFlags(source, item.BoughtId, depth + 1)
+  else if item.PlaceholderTemplateId <> -1 then
+    Result := Result or _ItemSpriteSourceFeatureFlags(source, item.PlaceholderId, depth + 1);
+end;
+
+function ItemSpriteSourceFeatureFlags(var source: TItemSpriteSource; id: Integer): Integer;
+begin
+  Result := _ItemSpriteSourceFeatureFlags(source, id, 0);
+end;
+
+(*
+## DrawBorder
+```pascal
+procedure DrawBorder(color: Integer);
+```
+`SpritePixels.drawBorder`: every transparent pixel orthogonally adjacent to a
+drawn one becomes `color`. `ItemSpriteFactory` passes a literal `1`, written
+straight into the buffer as `$000001` - black, but not the transparency key,
+which is 0. `update_items.simba` finds it back as `$010000` because Simba's
+`TColor` is BGR.
+
+Reads the old buffer and writes a new one; see the unit note.
+*)
+procedure DrawBorder(color: Integer);
+var
+  np: TIntegerArray;
+  x, y, p, pixel: Integer;
+begin
+  np := []; SetLength(np, graphicsPixelsWidth * graphicsPixelsHeight);
+  p := 0;
+  for y := 0 to graphicsPixelsHeight - 1 do
+    for x := 0 to graphicsPixelsWidth - 1 do
+    begin
+      pixel := graphicsPixels[p];
+      if pixel = 0 then
+      begin
+        if (x > 0) and (graphicsPixels[p - 1] <> 0) then pixel := color
+        else if (y > 0) and (graphicsPixels[p - graphicsPixelsWidth] <> 0) then pixel := color
+        else if (x < graphicsPixelsWidth - 1) and (graphicsPixels[p + 1] <> 0) then pixel := color
+        else if (y < graphicsPixelsHeight - 1) and (graphicsPixels[p + graphicsPixelsWidth] <> 0) then pixel := color;
+      end;
+      np[p] := pixel;
+      p += 1;
+    end;
+  graphicsPixels := np;
+end;
+
+(*
+## DrawShadow
+```pascal
+procedure DrawShadow(color: Integer);
+```
+`SpritePixels.drawShadow`: a transparent pixel whose up-left neighbour is drawn
+becomes `color`. `SpritePixels.DEFAULT_SHADOW_COLOR = 3153952 = $302020`.
+
+The shadow colour is not part of the committed hash - `update_items.simba`
+replaces `$302020` with transparent before hashing - but it *is* part of the
+committed PNGs, and the pixels it writes change which neighbours the next
+row sees. It is drawn, then dropped.
+*)
+procedure DrawShadow(color: Integer);
+var
+  x, y, row: Integer;
+begin
+  for y := graphicsPixelsHeight - 1 downto 1 do
+  begin
+    row := y * graphicsPixelsWidth;
+    for x := graphicsPixelsWidth - 1 downto 1 do
+      if (graphicsPixels[x + row] = 0) and (graphicsPixels[x + row - 1 - graphicsPixelsWidth] <> 0) then
+        graphicsPixels[x + row] := color;
+  end;
+end;
+
+(*
+## RenderPreparedItemSprite
+```pascal
+procedure RenderPreparedItemSprite(item: TItemDefinition; model: TModelDefinition;
+                                   border, shadow: Integer; noted: Boolean;
+                                   beforeModel, afterModel, afterEffects: TIntegerArray);
+```
+The non-recursive body of `ItemSpriteFactory.createSpritePixels`. The three
+overlay arguments are the already-rendered auxiliary icon for respectively a
+placeholder (before the model), bought item (after the model) and noted item
+(after border and shadow). An empty array means no overlay.
+
+`RenderItemSprite` below preserves the original direct item+model API for unit
+tests and callers that already own both records. `RenderItemSpriteFromSource`
+adds recursive template linking/compositing for the real dumper path.
+
+The order here is `ItemSpriteFactory`'s and matters twice over: `light()` runs
+before the bounds, and {ref}`CalculateBoundsCylinder` runs before the camera
+offset is computed from `mModelHeight`, which
+{ref}`CalculateBoundsAABB` then deliberately does not disturb.
+
+The light vector `(-50, -10, -50)` and the `ambient + 64` / `contrast + 768`
+biases are the item constants; NPCs use different ones (render spec 2).
+*)
+procedure CompositeSprite(src: TIntegerArray);
+var
+  i: Integer;
+begin
+  if Length(src) <> Length(graphicsPixels) then Exit;
+  for i := 0 to High(src) do
+    if src[i] <> 0 then graphicsPixels[i] := src[i];
+end;
+
+procedure RenderPreparedItemSprite(item: TItemDefinition; model: TModelDefinition;
+                                   border, shadow: Integer; noted: Boolean;
+                                   beforeModel, afterModel, afterEffects: TIntegerArray);
+var
+  zoom2d, v17, v18, i: Integer;
+begin
+  graphicsPixels := []; SetLength(graphicsPixels, 36 * 32);
+  SetRasterClipping();
+  SetOffset(16, 16);
+  rasterGouraudLowRes := False;
+  CompositeSprite(beforeModel);
+
+  // ItemSpriteFactory.getModel / OS1 ObjType.getModelLit, render spec 2.1:
+  // resize, then recolour, then retexture, then light. `model` is this call's
+  // own record, but its arrays are still the caller's - the transforms rebind
+  // rather than mutate, which is what keeps a cached definition intact.
+  mResizeHeight := -1;
+  if (item.ResizeX <> 128) or (item.ResizeY <> 128) or (item.ResizeZ <> 128) then
+    model := ModelResize(model, item.ResizeX, item.ResizeY, item.ResizeZ);
+
+  for i := 0 to High(item.ColorFind) do
+    model := ModelRecolor(model, item.ColorFind[i], item.ColorReplace[i]);
+  for i := 0 to High(item.TextureFind) do
+    model := ModelRetexture(model, item.TextureFind[i], item.TextureReplace[i]);
+
+  LightModel(model, item.Ambient + 64, item.Contrast * CONTRAST_SCALE + 768,
+             -50, -10, -50);
+
+  zoom2d := item.Zoom2D;
+  if noted then zoom2d := Trunc(zoom2d * 1.5)
+  else if border = 2 then zoom2d := Trunc(zoom2d * 1.04);
+  v17 := JSar(zoom2d * ANGLE_SINE[item.XAn2D], 16);
+  v18 := JSar(zoom2d * ANGLE_COSINE[item.XAn2D], 16);
+
+  CalculateBoundsCylinder();
+  // A resized model's camera height is the one ModelResize measured, not the
+  // one the vertex array yields - see that routine's note. -1 means no resize
+  // ran, and then nothing overrides.
+  if mResizeHeight >= 0 then mModelHeight := mResizeHeight;
+  ProjectAndDraw(0, item.YAn2D, item.ZAn2D, item.XAn2D, item.XOffset2D,
+                 mModelHeight div 2 + v17 + item.YOffset2D,
+                 v18 + item.YOffset2D);
+
+  CompositeSprite(afterModel);
+  if border >= 1 then DrawBorder(1);
+  if border >= 2 then DrawBorder($FFFFFF);
+  if shadow <> 0 then DrawShadow(shadow);
+  CompositeSprite(afterEffects);
+  rasterGouraudLowRes := True;
+end;
+
+(*
+## RenderItemSprite
+```pascal
+procedure RenderItemSprite(item: TItemDefinition; model: TModelDefinition);
+```
+Renders one already-linked item and model with the item-finder constants. This
+is the direct, non-recursive API used by the focused model tests.
+*)
+procedure RenderItemSprite(item: TItemDefinition; model: TModelDefinition);
+begin
+  RenderPreparedItemSprite(item, model, 1, $302020, False, [], [], []);
+end;
+
+(*
+## RenderItemSpriteFromSource
+```pascal
+procedure RenderItemSpriteFromSource(var source: TItemSpriteSource; id: Integer);
+```
+Links an item from the cache source, recursively renders any template auxiliary
+icon, and leaves the final 36×32 icon in {ref}`graphicsPixels`. The recursion is
+safe because every child finishes before its parent reinitialises the raster
+buffer, and its pixels are copied into a local dynamic array first.
+*)
+procedure RenderItemSpriteFromSource(var source: TItemSpriteSource; id: Integer;
+                                     quantity, border, shadow: Integer; noted: Boolean);
+var
+  item: TItemDefinition;
+  model: TModelDefinition;
+  aux: TIntegerArray;
+  beforeModel, afterModel, afterEffects: TIntegerArray;
+begin
+  item := ItemSpriteSourceLinked(source, id);
+  if item.Id = -1 then raise 'RenderItemSpriteFromSource: missing item ' + ToStr(id);
+  model := ItemSpriteSourceModel(source, item.InventoryModel);
+  if model.Id = -1 then raise 'RenderItemSpriteFromSource: missing model ' + ToStr(item.InventoryModel);
+
+  aux := [];
+  if item.NotedTemplate <> -1 then
+    RenderItemSpriteFromSource(source, item.NotedId, 10, 1, 0, True)
+  else if item.BoughtTemplateId <> -1 then
+    // The real client forwards the caller's shadow colour here. RuneLite's
+    // cache ItemSpriteFactory passes 0, which is wrong for all three bought
+    // template ids in cache 2625: their auxiliary shadow participates in the
+    // outer border/shadow pass.
+    RenderItemSpriteFromSource(source, item.BoughtId, quantity, border, shadow, False)
+  else if item.PlaceholderTemplateId <> -1 then
+    RenderItemSpriteFromSource(source, item.PlaceholderId, quantity, 0, 0, False);
+  if (item.NotedTemplate <> -1) or (item.BoughtTemplateId <> -1) or
+     (item.PlaceholderTemplateId <> -1) then
+    aux := Copy(graphicsPixels);
+
+  beforeModel := []; afterModel := []; afterEffects := [];
+  if item.PlaceholderTemplateId <> -1 then beforeModel := aux
+  else if item.BoughtTemplateId <> -1 then afterModel := aux
+  else if item.NotedTemplate <> -1 then afterEffects := aux;
+  RenderPreparedItemSprite(item, model, border, shadow, noted,
+                            beforeModel, afterModel, afterEffects);
+end;

@@ -1,0 +1,145 @@
+(*
+# Render: Raster2D
+The canvas the item-sprite rasteriser draws into, and the clipping window that
+decides which of its pixels a triangle may touch. Ported from
+`net.runelite.cache.item.Graphics3D`'s Rasterizer2D-derived state plus
+`setRasterClipping`, `Rasterizer3D_method3` and `setOffset`.
+
+There is no `TRaster` record: this is one canvas, process-wide, exactly as the
+client's static `Rasterizer2D` is. The generated triangle fillers in
+{ref}`Render: Raster3D` index `graphicsPixels` directly by a precomputed row
+offset, which is the shape of the Java and the reason a per-instance canvas
+would cost an indirection on every pixel of every scanline.
+
+## The canvas is 36x32 and the window is the whole of it
+`ITEM_SPRITE_WIDTH 36`, `ITEM_SPRITE_HEIGHT 32` - the inventory-slot geometry
+`TItemFinder` CRC32s at runtime. `drawingAreaTop/Bottom/Right` and
+`draw_region_x` are the Rasterizer2D clip rectangle, defaulted to the full
+canvas because `ItemSpriteFactory` never narrows it.
+
+## Four of these are set and never read - on purpose
+`Rasterizer3D_clipNegativeMidX`, `Rasterizer3D_clipMidX2`,
+`Rasterizer3D_clipNegativeMidY` and `Rasterizer3D_clipMidY2` are recomputed by
+both routines below and read by nothing in this slice (measured: zero
+occurrences across the other four units): they belong to the
+texture and low-detail paths that are not ported. They are kept because
+dropping a write from a ported routine is exactly the kind of "obviously inert"
+edit that turns out not to be, and because the moment
+`rasterTextureAffine` lands they become live with no further change here.
+
+## `rasterClipY` is a row-offset table, not a clip mask
+`SetRasterClipping` fills it with the index of the first pixel of each row -
+`draw_region_x + width * (top + row)` - so a scanline walker adds a column
+index to `rasterClipY[y]` and is done.
+
+It is 1024 entries because that is the Java's initial allocation
+(`Graphics3D.java:46`). The Java **grows** it to the next power of two whenever
+`Rasterizer3D_clipHeight` exceeds its length (`:65-75`); this port allocates
+1024 unconditionally and drops the growth branch instead. Identical for any
+canvas up to 1024 rows, which the 32-row item canvas is by a wide margin - but
+a taller canvas would index out of range here where the Java would resize.
+Kept as the spike had it: this is a promotion, not a fix.
+*)
+{$DEFINE WL_CACHE_RENDER_RASTER2D_INCLUDED}
+{$IFNDEF WL_CACHE_RENDER_PALETTE_INCLUDED}{$INCLUDE_ONCE palette.simba}{$ENDIF}
+
+// -------------------------------------------------------- Rasterizer2D state
+var
+  graphicsPixels: TIntegerArray;
+  graphicsPixelsWidth: Integer = 36;
+  graphicsPixelsHeight: Integer = 32;
+  drawingAreaTop: Integer = 0;
+  drawingAreaBottom: Integer = 32;
+  drawingAreaRight: Integer = 36;
+  draw_region_x: Integer = 0;
+
+// -------------------------------------------------------- Graphics3D state
+var
+  rasterClipY: TIntegerArray;
+  rasterClipEnable: Boolean;
+  rasterGouraudLowRes: Boolean = True;
+  rasterAlpha: Integer = 0;
+  Rasterizer3D_zoom: Integer = 512;
+  centerX, centerY: Integer;
+  rasterClipX, Rasterizer3D_clipHeight: Integer;
+  Rasterizer3D_clipNegativeMidX, Rasterizer3D_clipMidX2: Integer;
+  Rasterizer3D_clipNegativeMidY, Rasterizer3D_clipMidY2: Integer;
+
+(*
+## Rasterizer3D_method3
+```pascal
+procedure Rasterizer3D_method3();
+```
+`Graphics3D.Rasterizer3D_method3()` (`:86`): recentres the projection on the
+middle of the current clip window. Called by both {ref}`SetRasterClipping` and
+{ref}`SetOffset`; kept as its own routine because that is how the Java factors
+it and both callers must agree exactly.
+*)
+procedure Rasterizer3D_method3();
+begin
+  centerX := rasterClipX div 2;
+  centerY := Rasterizer3D_clipHeight div 2;
+  Rasterizer3D_clipNegativeMidX := -centerX;
+  Rasterizer3D_clipMidX2 := rasterClipX - centerX;
+  Rasterizer3D_clipNegativeMidY := -centerY;
+  Rasterizer3D_clipMidY2 := Rasterizer3D_clipHeight - centerY;
+end;
+
+(*
+## SetRasterClipping
+```pascal
+procedure SetRasterClipping();
+```
+`Graphics3D.setRasterClipping()` (`:54`) with its four-argument body (`:59`)
+inlined: the no-argument form is nothing but
+`setRasterClipping(draw_region_x, drawingAreaTop, drawingAreaRight, drawingAreaBottom)`,
+and it is the only caller in the item path, so the arguments are read from
+those globals directly. The one branch that is not carried over is the
+`rasterClipY` growth; see the unit note.
+*)
+procedure SetRasterClipping();
+var
+  area, i: Integer;
+begin
+  rasterClipX := drawingAreaRight - draw_region_x;
+  Rasterizer3D_clipHeight := drawingAreaBottom - drawingAreaTop;
+  Rasterizer3D_method3();
+
+  rasterClipY := []; SetLength(rasterClipY, 1024);
+  area := draw_region_x + graphicsPixelsWidth * drawingAreaTop;
+  for i := 0 to Rasterizer3D_clipHeight - 1 do
+  begin
+    rasterClipY[i] := area;
+    area := area + graphicsPixelsWidth;
+  end;
+end;
+
+(*
+## SetOffset
+```pascal
+procedure SetOffset(x, y: Integer);
+```
+`Graphics3D.setOffset(x, y)` (`:96`): moves the projection origin to `(x, y)`
+**relative to the clip window's first pixel**, which it recovers by dividing
+`rasterClipY[0]` back out into a row and a column. `ItemSpriteFactory` calls
+`setOffset(16, 16)`.
+
+Note 16, not (18, 16): the horizontal centre of a 36-wide canvas is 18, and the
+client deliberately does not use it. `xrsps-typescript` reaches the same
+`setViewport(16, 16)` independently (render spec 1). Changing it shifts every
+icon two pixels and fails every hash.
+*)
+procedure SetOffset(x, y: Integer);
+var
+  v2, v3, v4: Integer;
+begin
+  v2 := rasterClipY[0];
+  v3 := v2 div graphicsPixelsWidth;
+  v4 := v2 - v3 * graphicsPixelsWidth;
+  centerX := x - v4;
+  centerY := y - v3;
+  Rasterizer3D_clipNegativeMidX := -centerX;
+  Rasterizer3D_clipMidX2 := rasterClipX - centerX;
+  Rasterizer3D_clipNegativeMidY := -centerY;
+  Rasterizer3D_clipMidY2 := Rasterizer3D_clipHeight - centerY;
+end;

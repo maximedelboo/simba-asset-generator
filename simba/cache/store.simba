@@ -1,0 +1,251 @@
+(*
+# CacheStore
+Reads raw container bytes out of a Jagex disk store (main_file_cache.dat2 + .idx<n> files).
+
+Layout:
+- `.idx<n>` is a flat table of 6-byte entries, one per archive id:
+  3 bytes size (big endian), 3 bytes first sector.
+- `.dat2` is a list of 520-byte sectors. Each sector: 8-byte header
+  (archive id u16, chunk u16, next sector u24, index id u8) + 512 bytes of data.
+
+## Design notes
+1. The units in `utils/cache/` do not include `WaspLib/main.simba`, unlike the
+   rest of the library. They use direct sibling includes (see the
+   `{$INCLUDE_ONCE}` guards at the top of each file) and stay dependency-free
+   on purpose: it lets them compile and be tested standalone in milliseconds,
+   and it keeps a cache reader from dragging in the GUI, input and plugin
+   layers. The consequence: they cannot use WaspLib's `GetDebugLn` logging
+   helper, so they raise plain prefixed strings instead - the prefix
+   identifies the unit (e.g. `'CacheStore: ...'`, `'BZip2: ...'`).
+2. `main/cacheparser.simba` also contains an `.idx` sector reader (`TIndex`,
+   `ReadIndex`), unused elsewhere in the library and possibly not working.
+   `TCacheStore` here is the maintained implementation; the older one should
+   be consolidated into it or removed in a later pass - nobody should add a
+   third.
+*)
+{$DEFINE WL_CACHE_STORE_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_CONTAINER_INCLUDED}{$INCLUDE_ONCE container.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_REFTABLE_INCLUDED}{$INCLUDE_ONCE reftable.simba}{$ENDIF}
+
+type
+  TCacheStore = record
+    Directory: String;
+    const SECTOR_SIZE: Integer = 520;
+    const SECTOR_HEADER: Integer = 8;
+    const SECTOR_DATA: Integer = 512;
+    const IDX_ENTRY: Integer = 6;
+
+    // Per-index reference table cache, see TCacheStore.GetRefTable.
+    RefTableIndexes: TIntegerArray;
+    RefTables: array of TCacheRefTable;
+
+    // Per-index archive count cache, see TCacheStore.ArchiveCount.
+    CountIndexes, Counts: TIntegerArray;
+  end;
+
+function TCacheStore.Create(directory: String): TCacheStore; static;
+begin
+  Result.Directory := PathIncludeTrailingSep(PathNormalize(directory));
+  if not FileExists(Result.Directory + 'main_file_cache.dat2') then
+    raise 'CacheStore: no main_file_cache.dat2 in ' + Result.Directory;
+end;
+
+function TCacheStore.IndexPath(index: Integer): String;
+begin
+  Result := Self.Directory + 'main_file_cache.idx' + ToStr(index);
+end;
+
+function TCacheStore.DataPath(): String;
+begin
+  Result := Self.Directory + 'main_file_cache.dat2';
+end;
+
+function TCacheStore.IndexExists(index: Integer): Boolean;
+begin
+  Result := FileExists(Self.IndexPath(index));
+end;
+
+(*
+## TCacheStore.ArchiveCount
+```pascal
+function TCacheStore.ArchiveCount(index: Integer): Integer;
+```
+How many archive slots index `index` declares - its `.idx` file length divided
+by the 6-byte entry size. 0 for an index that does not exist.
+
+Cached per index, the same two-parallel-array way `GetRefTable` caches reference
+tables, and with the same by-value caveat: the cache lives on whichever
+`TCacheStore` variable holds it, so a copy of the record starts cold.
+
+The cache is not an optimisation for its own sake. `TCacheDefs.Model` and
+`TCacheDefs.Sprites` call this once per lookup as a range guard, and the
+uncached form is two filesystem calls (`FileExists` + `FileSize`) every time -
+about 2.6 us here, i.e. ~160 ms of pure `stat` across a 60484-model dump, paid
+again for every sweep. It also means a run's answer cannot change halfway
+through: a cache being rewritten by a running game client under a dumper would
+otherwise move the bound mid-sweep.
+*)
+function TCacheStore.ArchiveCount(index: Integer): Integer;
+var
+  i: Integer;
+begin
+  for i := 0 to High(Self.CountIndexes) do
+    if Self.CountIndexes[i] = index then
+      Exit(Self.Counts[i]);
+
+  Result := 0;
+  if Self.IndexExists(index) then
+    Result := FileSize(Self.IndexPath(index)) div Self.IDX_ENTRY;
+
+  Self.CountIndexes += index;
+  Self.Counts += Result;
+end;
+
+// Returns [size, firstSector]; size 0 means the archive slot is empty.
+function TCacheStore.IndexEntry(index, archive: Integer): TIntegerArray;
+var
+  b: TByteArray;
+  offset: Integer;
+begin
+  Result := [0, 0];
+  if not Self.IndexExists(index) then Exit;
+  offset := archive * Self.IDX_ENTRY;
+  if (archive < 0) or (offset + Self.IDX_ENTRY > FileSize(Self.IndexPath(index))) then Exit;
+
+  // NOTE: FileReadBytesEx is inclusive on both ends.
+  b := FileReadBytesEx(Self.IndexPath(index), offset, offset + Self.IDX_ENTRY - 1);
+  if Length(b) < Self.IDX_ENTRY then Exit;
+
+  Result := [(b[0] shl 16) or (b[1] shl 8) or b[2],
+             (b[3] shl 16) or (b[4] shl 8) or b[5]];
+end;
+
+function TCacheStore.ReadRaw(index, archive: Integer): TByteArray;
+var
+  entry: TIntegerArray;
+  size, sector, remaining, chunk, n, i, pos: Integer;
+  s: TByteArray;
+  hdrArchive, hdrChunk, hdrIndex, nextSector: Integer;
+  dataPath: String;
+begin
+  if archive >= 65536 then
+    raise 'CacheStore: archive ' + ToStr(archive) + ' needs the extended sector format (not implemented)';
+
+  entry := Self.IndexEntry(index, archive);
+  size := entry[0];
+  sector := entry[1];
+  if (size = 0) or (sector = 0) then Exit([]);
+
+  dataPath := Self.DataPath();
+  SetLength(Result, size);
+  remaining := size;
+  chunk := 0;
+  pos := 0;
+
+  while remaining > 0 do
+  begin
+    s := FileReadBytesEx(dataPath, sector * Self.SECTOR_SIZE,
+                         sector * Self.SECTOR_SIZE + Self.SECTOR_SIZE - 1);
+    if Length(s) < Self.SECTOR_HEADER then
+      raise 'CacheStore: short sector ' + ToStr(sector);
+
+    hdrArchive := (s[0] shl 8) or s[1];
+    hdrChunk   := (s[2] shl 8) or s[3];
+    nextSector := (s[4] shl 16) or (s[5] shl 8) or s[6];
+    hdrIndex   := s[7];
+
+    if hdrArchive <> archive then
+      raise 'CacheStore: sector archive mismatch, got ' + ToStr(hdrArchive) + ' want ' + ToStr(archive);
+    if hdrChunk <> chunk then
+      raise 'CacheStore: sector chunk mismatch, got ' + ToStr(hdrChunk) + ' want ' + ToStr(chunk);
+    if hdrIndex <> index then
+      raise 'CacheStore: sector index mismatch, got ' + ToStr(hdrIndex) + ' want ' + ToStr(index);
+
+    n := remaining;
+    if n > Self.SECTOR_DATA then n := Self.SECTOR_DATA;
+    for i := 0 to n - 1 do
+      Result[pos + i] := s[Self.SECTOR_HEADER + i];
+
+    pos += n;
+    remaining -= n;
+    sector := nextSector;
+    Inc(chunk);
+  end;
+end;
+
+(*
+## TCacheStore.Read
+```pascal
+function TCacheStore.Read(index, archive: Integer; keys: TIntegerArray): TByteArray;
+```
+Raw container to decrypted, decompressed archive bytes. Pass an empty array for
+unencrypted indexes.
+*)
+function TCacheStore.Read(index, archive: Integer; keys: TIntegerArray): TByteArray;
+var
+  raw: TByteArray;
+begin
+  raw := Self.ReadRaw(index, archive);
+  if Length(raw) = 0 then Exit([]);
+  Result := TCacheContainer.Decompress(raw, keys);
+end;
+
+(*
+## TCacheStore.GetRefTable
+```pascal
+function TCacheStore.GetRefTable(index: Integer): TCacheRefTable;
+```
+Returns index `index`'s reference table (the idx255 archive that describes it),
+parsing and caching it on the first call. For index 2 this table is a bzip2
+container that is genuinely slow to decompress, and Phase 2 calls into this
+per archive across tens of thousands of archives, so re-parsing it every time
+would dominate runtime.
+
+The cache is two parallel arrays (`RefTableIndexes`/`RefTables`) scanned linearly
+- there are at most ~25 indexes, so a scan is simpler than a map and just as fast.
+
+`TCacheStore` is a plain record and is passed around by value in places, so this
+cache lives on whichever `TCacheStore` variable holds it: copy the record and the
+copy starts cold. That is fine for how it is used (a single store variable is
+threaded through a call), but do not expect two independent copies to share a cache.
+*)
+function TCacheStore.GetRefTable(index: Integer): TCacheRefTable;
+var
+  i: Integer;
+begin
+  for i := 0 to High(Self.RefTableIndexes) do
+    if Self.RefTableIndexes[i] = index then
+      Exit(Self.RefTables[i]);
+
+  Result := TCacheRefTable.Parse(Self.Read(255, index, []));
+
+  SetLength(Self.RefTableIndexes, Length(Self.RefTableIndexes) + 1);
+  SetLength(Self.RefTables, Length(Self.RefTables) + 1);
+  Self.RefTableIndexes[High(Self.RefTableIndexes)] := index;
+  Self.RefTables[High(Self.RefTables)] := Result;
+end;
+
+(*
+## TCacheStore.ReadFiles
+```pascal
+function TCacheStore.ReadFiles(index, archive: Integer; keys: TIntegerArray): array of TByteArray;
+```
+As Read, but split into the archive's files using the index's reference table.
+*)
+function TCacheStore.ReadFiles(index, archive: Integer; keys: TIntegerArray): array of TByteArray;
+var
+  table: TCacheRefTable;
+  data: TByteArray;
+  i: Integer;
+begin
+  data := Self.Read(index, archive, keys);
+  if Length(data) = 0 then Exit([]);
+
+  table := Self.GetRefTable(index);
+  i := table.IndexOfArchive(archive);
+  if i = -1 then
+    raise 'CacheStore: archive ' + ToStr(archive) + ' is not in the reference table for index ' + ToStr(index);
+
+  Result := SplitArchiveFiles(data, Length(table.Archives[i].FileIds));
+end;

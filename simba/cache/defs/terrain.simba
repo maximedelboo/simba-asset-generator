@@ -1,0 +1,358 @@
+(*
+# Terrain definitions
+The three definition kinds the ground is painted from: underlays (the base
+ground colour of a tile), overlays (the shape drawn on top of it - paths, water,
+rock) and textures (the tiled bitmaps an overlay can reference).
+
+Ported from `UnderlayLoader.java`, `OverlayLoader.java` and `TextureLoader.java`,
+with the colour maths from the `calculateHsl` bodies of `UnderlayDefinition` and
+`OverlayDefinition`.
+
+| kind | index | archive | file id |
+|---|---|---|---|
+| underlay | 2 CONFIGS | `EConfigType.UNDERLAY` (1) | definition id |
+| overlay | 2 CONFIGS | `EConfigType.OVERLAY` (4) | definition id |
+| texture | 9 TEXTURES | 0 | definition id |
+
+## The two calculateHsl bodies are not the same function
+They look alike and the plan for this port assumed they were, but they differ in
+their output: `UnderlayDefinition` derives a `hueMultiplier` from the saturation
+and lightness and scales the hue by it (`hue = (int)(hueMultiplier * h)`), while
+`OverlayDefinition` scales the hue by a flat 256 (`hue = (int)(256.0 * h)`) and
+has no `hueMultiplier` at all. Underlay hues are therefore on a per-colour scale
+and are **not** comparable to overlay hues - the client re-weights them when it
+averages underlay hues across a tile's corners.
+
+Everything up to that point *is* shared, and lives in `TerrainRGBtoHSL`.
+
+## Unknown opcodes desync
+Neither Java loader consumes anything for an opcode it does not recognise; it
+just reads the next byte as the following opcode, which silently produces
+garbage from there on. That behaviour is mirrored here rather than turned into a
+raise, so a definition either decodes byte-identically to the Java or not at all.
+The guard is the test: `dev/tests/260_terrain.simba` decodes every underlay,
+overlay and texture in the cache and asserts each one lands exactly on the end
+of its data, which no desynced parse can do.
+*)
+{$DEFINE WL_CACHE_DEF_TERRAIN_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_JAGEXCOLOR_INCLUDED}{$INCLUDE_ONCE ../jagexcolor.simba}{$ENDIF}
+
+type
+  TUnderlayDefinition = record
+    Id: Integer;
+    Color: Integer;
+    // Derived by CalculateHsl. HueMultiplier is not a colour: it is the weight
+    // the client uses when it averages this underlay's hue with its neighbours',
+    // and Hue is already scaled by it.
+    Hue: Integer;
+    Saturation: Integer;
+    Lightness: Integer;
+    HueMultiplier: Integer;
+  end;
+
+  TOverlayDefinition = record
+    Id: Integer;
+    RgbColor: Integer;
+    Texture: Integer;
+    SecondaryRgbColor: Integer;
+    HideUnderlay: Boolean;
+    // Derived by CalculateHsl: the first triple from RgbColor, the Other* triple
+    // from SecondaryRgbColor and left at 0 when there is no secondary colour.
+    Hue, Saturation, Lightness: Integer;
+    OtherHue, OtherSaturation, OtherLightness: Integer;
+  end;
+
+  TTextureDefinition = record
+    Id: Integer;
+    FileIds: TIntegerArray;
+    AverageRGB: Integer;
+    Field1778: Boolean;
+    AnimationDirection: Integer;
+    AnimationSpeed: Integer;
+  end;
+
+(*
+## TerrainRGBtoHSL
+```pascal
+procedure TerrainRGBtoHSL(rgb: Integer; var hue, saturation, lightness: Double);
+```
+The half of `calculateHsl` that underlays and overlays share: a textbook
+RGB -> HSL conversion over 0..1 channels, before either definition quantises it.
+
+`hue` comes back as a fraction of a turn, already divided by 6. It is **not**
+clamped to 0..1: the red-is-max branch yields `(g - b) / (max - min)`, which is
+negative whenever blue exceeds green, and the Java keeps that sign all the way
+into the packed hue. `saturation` and `lightness` are 0..1.
+
+A grey (min = max) short-circuits to hue 0, saturation 0, which is what keeps
+the divisions below from ever seeing a zero denominator.
+*)
+procedure TerrainRGBtoHSL(rgb: Integer; var hue, saturation, lightness: Double);
+var
+  r, g, b, min, max: Double;
+begin
+  r := ((rgb shr 16) and 255) / 256.0;
+  g := ((rgb shr 8) and 255) / 256.0;
+  b := (rgb and 255) / 256.0;
+
+  min := r;
+  if g < min then min := g;
+  if b < min then min := b;
+
+  max := r;
+  if g > max then max := g;
+  if b > max then max := b;
+
+  hue := 0.0;
+  saturation := 0.0;
+  lightness := (max + min) / 2.0;
+
+  if min <> max then
+  begin
+    if lightness < 0.5 then
+      saturation := (max - min) / (max + min);
+    // Not an else: the Java writes it as a second `if` on >= 0.5. Same effect,
+    // since the two conditions partition, but kept in this shape so the port
+    // reads against the source line for line.
+    if lightness >= 0.5 then
+      saturation := (max - min) / (2.0 - max - min);
+
+    // Exact double equality is deliberate: every channel is k/256 with k an
+    // integer, so these compare bit-exactly and pick the same branch as Java.
+    if r = max then
+      hue := (g - b) / (max - min)
+    else if g = max then
+      hue := 2.0 + (b - r) / (max - min)
+    else if b = max then
+      hue := 4.0 + (r - g) / (max - min);
+  end;
+
+  hue := hue / 6.0;
+end;
+
+// Saturation and lightness are quantised and clamped identically in both
+// definitions; only the hue differs, so it stays with each caller.
+procedure TerrainQuantiseSL(saturation, lightness: Double; var qSat, qLight: Integer);
+begin
+  qSat := Trunc(saturation * 256.0);
+  qLight := Trunc(lightness * 256.0);
+
+  if qSat < 0 then qSat := 0
+  else if qSat > 255 then qSat := 255;
+
+  if qLight < 0 then qLight := 0
+  else if qLight > 255 then qLight := 255;
+end;
+
+(*
+## TUnderlayDefinition.CalculateHsl
+```pascal
+procedure TUnderlayDefinition.CalculateHsl();
+```
+Fills Hue, Saturation, Lightness and HueMultiplier from Color. Called by Load;
+call it again by hand only if you have changed Color.
+*)
+procedure TUnderlayDefinition.CalculateHsl();
+var
+  h, s, l: Double;
+begin
+  TerrainRGBtoHSL(Self.Color, h, s, l);
+  TerrainQuantiseSL(s, l, Self.Saturation, Self.Lightness);
+
+  // The weight this underlay carries when the client blends tile corners.
+  // Floored at 1 so a fully desaturated underlay still contributes.
+  if l > 0.5 then
+    Self.HueMultiplier := Trunc(s * (1.0 - l) * 512.0)
+  else
+    Self.HueMultiplier := Trunc(s * l * 512.0);
+  if Self.HueMultiplier < 1 then Self.HueMultiplier := 1;
+
+  Self.Hue := Trunc(Self.HueMultiplier * h);
+end;
+
+(*
+## TUnderlayDefinition.Decode
+```pascal
+procedure TUnderlayDefinition.Decode(var s: TByteStream);
+```
+Reads the opcode block from an already-positioned stream and derives the HSL,
+leaving `Id` alone. Use `Load` unless you need the stream position afterwards -
+which is exactly what the exhaustion assertion in the tests needs, and the reason
+this is split out rather than inlined into `Load`.
+
+The format is a single optional opcode: 1 sets the 24-bit colour, 0 terminates.
+*)
+procedure TUnderlayDefinition.Decode(var s: TByteStream);
+var
+  opcode: Integer;
+begin
+  Self.Color := 0;
+
+  while True do
+  begin
+    opcode := s.ReadUByte();
+    if opcode = 0 then Break;
+    if opcode = 1 then
+      Self.Color := s.ReadUMedium();
+  end;
+
+  Self.CalculateHsl();
+end;
+
+(*
+## TUnderlayDefinition.Load
+```pascal
+function TUnderlayDefinition.Load(id: Integer; data: TByteArray): TUnderlayDefinition; static;
+```
+Decodes one file of the UNDERLAY archive.
+*)
+function TUnderlayDefinition.Load(id: Integer; data: TByteArray): TUnderlayDefinition; static;
+var
+  s: TByteStream;
+begin
+  Result.Id := id;
+  s := TByteStream.Create(data);
+  Result.Decode(s);
+end;
+
+(*
+## TOverlayDefinition.CalculateHsl
+```pascal
+procedure TOverlayDefinition.CalculateHsl();
+```
+Fills both HSL triples. The secondary colour is converted **first** and its
+result copied into Other*, then the primary overwrites Hue/Saturation/Lightness -
+the Java reuses one set of fields and does exactly this shuffle.
+
+Sharp edge, faithful to the Java: when `SecondaryRgbColor` is -1 this writes
+nothing to Other*, it does not zero them. Java never notices because its loader
+always hands `calculateHsl` a freshly constructed object; here it is `Decode`
+that resets them. Call this directly on a record you have reused and the previous
+colour's secondary triple survives into the new one.
+*)
+procedure TOverlayDefinition.CalculateHsl();
+var
+  h, s, l: Double;
+begin
+  if Self.SecondaryRgbColor <> -1 then
+  begin
+    TerrainRGBtoHSL(Self.SecondaryRgbColor, h, s, l);
+    Self.OtherHue := Trunc(256.0 * h);
+    TerrainQuantiseSL(s, l, Self.OtherSaturation, Self.OtherLightness);
+  end;
+
+  TerrainRGBtoHSL(Self.RgbColor, h, s, l);
+  Self.Hue := Trunc(256.0 * h);
+  TerrainQuantiseSL(s, l, Self.Saturation, Self.Lightness);
+end;
+
+(*
+## TOverlayDefinition.Decode
+```pascal
+procedure TOverlayDefinition.Decode(var s: TByteStream);
+```
+Reads the opcode block from an already-positioned stream and derives both HSL
+triples, leaving `Id` alone. See TUnderlayDefinition.Decode for why this is split
+out of `Load`.
+
+| opcode | field |
+|---|---|
+| 1 | RgbColor, 24-bit |
+| 2 | Texture, one byte |
+| 5 | HideUnderlay := False |
+| 7 | SecondaryRgbColor, 24-bit |
+
+Opcode 5 carries no payload - it is a flag whose presence *clears* the default.
+*)
+procedure TOverlayDefinition.Decode(var s: TByteStream);
+var
+  opcode: Integer;
+begin
+  Self.RgbColor := 0;
+  Self.Texture := -1;
+  Self.SecondaryRgbColor := -1;
+  Self.HideUnderlay := True;
+  Self.Hue := 0;
+  Self.Saturation := 0;
+  Self.Lightness := 0;
+  Self.OtherHue := 0;
+  Self.OtherSaturation := 0;
+  Self.OtherLightness := 0;
+
+  while True do
+  begin
+    opcode := s.ReadUByte();
+    if opcode = 0 then Break;
+
+    case opcode of
+      1: Self.RgbColor := s.ReadUMedium();
+      2: Self.Texture := s.ReadUByte();
+      5: Self.HideUnderlay := False;
+      7: Self.SecondaryRgbColor := s.ReadUMedium();
+    end;
+  end;
+
+  Self.CalculateHsl();
+end;
+
+(*
+## TOverlayDefinition.Load
+```pascal
+function TOverlayDefinition.Load(id: Integer; data: TByteArray): TOverlayDefinition; static;
+```
+Decodes one file of the OVERLAY archive.
+*)
+function TOverlayDefinition.Load(id: Integer; data: TByteArray): TOverlayDefinition; static;
+var
+  s: TByteStream;
+begin
+  Result.Id := id;
+  s := TByteStream.Create(data);
+  Result.Decode(s);
+end;
+
+(*
+## TTextureDefinition.Decode
+```pascal
+procedure TTextureDefinition.Decode(var s: TByteStream);
+```
+Reads the fixed field block from an already-positioned stream, leaving `Id`
+alone. See TUnderlayDefinition.Decode for why this is split out of `Load`.
+*)
+procedure TTextureDefinition.Decode(var s: TByteStream);
+begin
+  Self.FileIds := [s.ReadUShort()];
+  Self.AverageRGB := s.ReadUShort();
+  Self.Field1778 := s.ReadUByte() = 1;
+  Self.AnimationDirection := s.ReadUByte();
+  Self.AnimationSpeed := s.ReadUByte();
+end;
+
+(*
+## TTextureDefinition.Load
+```pascal
+function TTextureDefinition.Load(id: Integer; data: TByteArray): TTextureDefinition; static;
+```
+Decodes one file of index 9 archive 0. Fixed layout, no opcodes: a u16 sprite
+id, a u16 average colour, a flag byte, then the animation direction and speed.
+
+**Assumes the rev233 layout**, which is what `TextureLoader` defaults to
+(`rev233 = true`) and what the live cache uses. The older layout it can be
+switched to is a different shape entirely - the sprite ids come last, there can
+be several of them, and it carries three extra arrays (`field1780`, `field1781`,
+`field1786`) plus a per-file colour used when compositing. None of that is
+ported: those fields exist on the Java `TextureDefinition` but are only ever
+filled by the non-rev233 branch, so reproducing them here would be dead code
+that has never been exercised against real data. If a cache ever needs the old
+layout this raises nothing - it silently misparses, so check the exhaustion
+assertion in `dev/tests/260_terrain.simba` first.
+*)
+function TTextureDefinition.Load(id: Integer; data: TByteArray): TTextureDefinition; static;
+var
+  s: TByteStream;
+begin
+  Result.Id := id;
+  s := TByteStream.Create(data);
+  Result.Decode(s);
+end;

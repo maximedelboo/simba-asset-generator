@@ -1,0 +1,118 @@
+(*
+# CacheTypes
+Index and archive numbering for the OSRS cache, plus the file-id lookup that
+turns a definition id into a position in the array `TCacheStore.ReadFiles`
+returns.
+
+The two enums mirror `net.runelite.cache.IndexType` and
+`net.runelite.cache.ConfigType` exactly, with two forced renames: `OBJECT` and
+`ENUM` are reserved words in Lape and cannot be identifiers, so the OBJECT
+archive is `OBJECTS` and the ENUM archive is `ENUMS`. Members must also be
+declared in ascending numeric order - Lape rejects a member whose explicit
+value is lower than the previous one ("Expression is not a valid range"), so
+the order here differs from the Java where the Java is not sorted.
+*)
+{$DEFINE WL_CACHE_TYPES_INCLUDED}
+{$IFNDEF WL_CACHE_REFTABLE_INCLUDED}{$INCLUDE_ONCE reftable.simba}{$ENDIF}
+
+type
+  // The index (.idx<n>) each kind of data lives in.
+  EIndexType = enum(
+    ANIMATIONS         = 0,
+    SKELETONS          = 1,
+    CONFIGS            = 2,
+    INTERFACES         = 3,
+    SOUNDEFFECTS       = 4,
+    MAPS               = 5,
+    MUSIC_TRACKS       = 6,
+    MODELS             = 7,
+    SPRITES            = 8,
+    TEXTURES           = 9,
+    BINARY             = 10,
+    MUSIC_JINGLES      = 11,
+    CLIENTSCRIPT       = 12,
+    FONTS              = 13,
+    MUSIC_SAMPLES      = 14,
+    MUSIC_PATCHES      = 15,
+    WORLDMAP_GEOGRAPHY = 18,
+    WORLDMAP           = 19,
+    WORLDMAP_GROUND    = 20,
+    DBTABLEINDEX       = 21,
+    ANIMAYAS           = 22,
+    GAMEVALS           = 24
+  );
+
+  // The archive inside index 2 (CONFIGS) each definition kind lives in.
+  EConfigType = enum(
+    UNDERLAY        = 1,
+    IDENTKIT        = 3,
+    OVERLAY         = 4,
+    INV             = 5,
+    OBJECTS         = 6,
+    ENUMS           = 8,
+    NPC             = 9,
+    ITEM            = 10,
+    PARAMS          = 11,
+    SEQUENCE        = 12,
+    SPOTANIM        = 13,
+    VARBIT          = 14,
+    VARCLIENTSTRING = 15,
+    VARPLAYER       = 16,
+    VARCLIENT       = 19,
+    HITSPLAT        = 32,
+    HEALTHBAR       = 33,
+    STRUCT          = 34,
+    AREA            = 35,
+    DBROW           = 38,
+    DBTABLE         = 39
+  );
+
+(*
+## FilePositionOf
+```pascal
+function FilePositionOf(table: TCacheRefTable; archive, fileId: Integer): Integer;
+```
+Maps a definition id to its index in the array `TCacheStore.ReadFiles` returns,
+or -1 if the archive does not contain it. Raises if the archive itself is not in
+the reference table - that is a caller bug, and returning -1 would hide it
+behind "no such id".
+
+This exists because file ids have gaps. The ITEM archive holds 33372 files with
+ids running 0..33459, and OBJECT holds 60710 files with ids 0..60849 on that cache
+(62194 over 0..62200 on OpenRS2 2625 - these counts are revision-specific) - so from
+the first gap onward (item id 25993 sits at position 25992), the positional
+index and the id diverge. Indexing the returned array directly by id yields the
+wrong definition, silently.
+
+Cost: O(n) in the archive's file count in the worst case, so a full 33372-entry
+scan is around 0.7 ms here. Fine for occasional lookups, quadratic if used to
+walk a whole archive. To iterate an archive, walk `FileIds` and the `ReadFiles`
+array together by position instead - `FileIds[i]` is the id of file `i` - and
+never call this per id.
+*)
+function FilePositionOf(table: TCacheRefTable; archive, fileId: Integer): Integer;
+var
+  a, i: Integer;
+  ids: TIntegerArray;
+begin
+  a := table.IndexOfArchive(archive);
+  if a = -1 then
+    raise 'CacheTypes: archive ' + ToStr(archive) + ' is not in the reference table';
+
+  // Hoisted: the triple `table.Archives[a].FileIds` walked two records per
+  // access and cost 36% of the miss-scan runtime (500 full ITEM misses:
+  // 352ms -> 224ms). Dynamic arrays are by reference, so this copies no data.
+  ids := table.Archives[a].FileIds;
+
+  // Fast path for the archives that have no gaps at all (UNDERLAY, OVERLAY,
+  // NPC) and for ids below the first gap: the guess is verified against the
+  // table before it is returned, so it can never answer for the wrong file.
+  if (fileId >= 0) and (fileId <= High(ids)) and (ids[fileId] = fileId) then
+    Exit(fileId);
+
+  for i := 0 to High(ids) do
+    if ids[i] = fileId then
+      Exit(i);
+
+  Result := -1;
+end;

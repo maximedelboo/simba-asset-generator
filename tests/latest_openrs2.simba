@@ -1,0 +1,14 @@
+program TestLatestOpenRS2;
+
+{$INCLUDE_ONCE ../simba/cache/manager.simba}
+
+var
+  manager: TCacheManager;
+  revision: String;
+begin
+  manager := TCacheManager.Create(SimbaEnv.TempPath + 'simba-asset-generator-test');
+  revision := manager.LatestOpenRS2Revision();
+  if StrToInt(revision) <= 0 then
+    raise 'TestLatestOpenRS2: invalid revision "' + revision + '"';
+  WriteLn('Latest valid Old School OpenRS2 revision: ', revision);
+end.

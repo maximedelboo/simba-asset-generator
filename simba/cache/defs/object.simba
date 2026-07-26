@@ -1,0 +1,475 @@
+(*
+# ObjectDefinition
+Decodes one file of the OBJECT archive (index 2 `CONFIGS`, archive 6) into the
+record `SimbaObjectInfoDumper` serialises as `map/objects.zip`. A straight port
+of `net.runelite.cache.definitions.loaders.ObjectLoader`, field for field.
+
+Objects are the largest config archive in the cache. Counts are revision-specific -
+a live client cache measured 60710 files over ids 0..60849, while OpenRS2 cache 2625
+has 62194 over 0..62200 - so the ids have gaps and a definition must be addressed
+through the
+reference table (`FilePositionOf`), never by indexing `ReadFiles` with the id.
+
+Two deliberate divergences from the Java, both turning silent corruption into a
+raise:
+
+1. **An unrecognised opcode raises.** Java logs `Unrecognized opcode {}` and
+   carries on, which leaves the cursor in the middle of that opcode's operands
+   and mis-reads every field after it - the definition still "loads", with
+   garbage. There is no opcode whose width can be guessed, so continuing is
+   never the right call.
+2. **Trailing bytes raise.** After opcode 0 the cursor must sit exactly at the
+   end of the file. Java ignores whatever is left. Every one of the
+   objects in the live cache ends exactly on its terminator, so any leftover
+   means a field above was read at the wrong width - this is the check that
+   catches a bad opcode row, and it catches it on the definition that has it
+   rather than 40000 objects later.
+
+Assumption, from `ObjectLoader.rev220SoundData`: opcodes 78 and 79 carry a
+trailing `AmbientSoundRetain` byte only when the OBJECT archive's revision is
+>= `REV_220_OBJ_ARCHIVE_REV` (1673). `ObjectManager.java:62` feeds that loader
+the archive revision straight from the reference table; the live cache's OBJECT
+archive is at revision 1780391591, and the Java default is `true` regardless, so
+the byte is read unconditionally here. A cache old enough to predate rev 220
+would desynchronise on the first opcode 78 - and, thanks to the trailing-byte
+check above, say so instead of returning nonsense.
+
+`Raise` is a field name, not a typo for something safer: `raise` is only a
+keyword in statement position in Lape, so `Result.Raise := ...`, `obj.Raise` and
+even `with obj do Raise := 1` all compile, and a `raise 'msg'` inside a method of
+this record still raises. It keeps the name `ObjectDefinition.raise` has in Java.
+*)
+{$DEFINE WL_CACHE_DEF_OBJECT_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_ENTITYOPS_INCLUDED}{$INCLUDE_ONCE entityops.simba}{$ENDIF}
+
+type
+(*
+## TObjectDefinition
+```pascal
+TObjectDefinition = record
+  Id: Integer;
+  Name: String;
+  ObjectModels, ObjectTypes: TIntegerArray;
+  SizeX, SizeY, InteractType, WallOrDoor, SupportsItems: Integer;
+  Ops: TEntityOps;
+  ...
+end;
+```
+The Java `short[]` recolour and retexture arrays are `TIntegerArray` here,
+holding the same **signed** values (`is.readShort()`), because Lape has no
+`TShortArray` and the sign is what the renderer needs.
+
+`ObjectModels` / `ObjectTypes` empty stands for Java's `null`: the loader only
+ever allocates them from a non-zero length, so "empty" and "absent" cannot be
+told apart in the cache either. The post step below depends on that reading.
+*)
+  TObjectDefinition = record
+    Id: Integer;
+    Name: String;
+
+    ObjectModels: TIntegerArray;
+    ObjectTypes: TIntegerArray;
+
+    SizeX, SizeY: Integer;
+    InteractType: Integer;
+    BlocksProjectile: Boolean;
+    WallOrDoor: Integer;
+    SupportsItems: Integer;
+
+    ContouredGround: Integer;
+    MergeNormals: Boolean;
+    ModelClipped: Boolean;
+    AnimationId: Integer;
+    DecorDisplacement: Integer;
+    Ambient, Contrast: Integer;
+
+    Ops: TEntityOps;
+
+    RecolorToFind, RecolorToReplace: TIntegerArray;
+    RetextureToFind, TextureToReplace: TIntegerArray;
+
+    Category: Integer;
+    Rotated: Boolean;
+    Shadow: Boolean;
+    ModelSizeX, ModelSizeHeight, ModelSizeY: Integer;
+    MapSceneId: Integer;
+    BlockingMask: Integer;
+    OffsetX, OffsetHeight, OffsetY: Integer;
+    ObstructsGround: Boolean;
+    Hollow: Boolean;
+
+    VarbitId, VarpId: Integer;
+    ConfigChangeDest: TIntegerArray;
+
+    AmbientSoundId: Integer;
+    AmbientSoundDistance: Integer;
+    AmbientSoundRetain: Integer;
+    AmbientSoundChangeTicksMin, AmbientSoundChangeTicksMax: Integer;
+    AmbientSoundIds: TIntegerArray;
+    SoundDistanceFadeCurve: Integer;
+    SoundFadeInCurve, SoundFadeInDuration: Integer;
+    SoundFadeOutCurve, SoundFadeOutDuration: Integer;
+    SoundVisibility: Integer;
+
+    MapAreaId: Integer;
+    RandomizeAnimStart: Boolean;
+    DeferAnimChange: Boolean;
+    Unknown1: Boolean;
+    Raise: Integer;
+
+    Params: TCacheParams;
+  end;
+
+(*
+## TObjectDefinition.Default
+```pascal
+function TObjectDefinition.Default(id: Integer): TObjectDefinition; static;
+```
+The field defaults from `ObjectDefinition.java:35-91`, before any opcode runs.
+
+`WallOrDoor` and `SupportsItems` start at -1 and stay there until `Load`'s post
+step: -1 is not a value either field can hold afterwards, it is the marker that
+the cache did not set them (opcodes 19 and 75). Calling this directly therefore
+hands back a record whose two fields are still unresolved - `Load` is what
+finishes the job.
+
+`Ops` is allocated here, so every definition owns its own op arrays; `TEntityOps`
+shares them across a record copy, which is exactly why a fresh one is built per
+definition instead of copying a prototype.
+*)
+function TObjectDefinition.Default(id: Integer): TObjectDefinition; static;
+begin
+  Result.Id := id;
+  Result.Name := 'null';
+  Result.SizeX := 1;
+  Result.SizeY := 1;
+  Result.InteractType := 2;
+  Result.BlocksProjectile := True;
+  Result.WallOrDoor := -1;
+  Result.SupportsItems := -1;
+  Result.ContouredGround := -1;
+  Result.MergeNormals := False;
+  Result.ModelClipped := False;
+  Result.AnimationId := -1;
+  Result.DecorDisplacement := 16;
+  Result.Ambient := 0;
+  Result.Contrast := 0;
+  Result.Category := 0;
+  Result.Rotated := False;
+  Result.Shadow := True;
+  Result.ModelSizeX := 128;
+  Result.ModelSizeHeight := 128;
+  Result.ModelSizeY := 128;
+  Result.MapSceneId := -1;
+  Result.BlockingMask := 0;
+  Result.OffsetX := 0;
+  Result.OffsetHeight := 0;
+  Result.OffsetY := 0;
+  Result.ObstructsGround := False;
+  Result.Hollow := False;
+  Result.VarbitId := -1;
+  Result.VarpId := -1;
+  Result.AmbientSoundId := -1;
+  Result.AmbientSoundDistance := 0;
+  Result.AmbientSoundRetain := 0;
+  Result.AmbientSoundChangeTicksMin := 0;
+  Result.AmbientSoundChangeTicksMax := 0;
+  Result.SoundDistanceFadeCurve := 0;
+  Result.SoundFadeInCurve := 0;
+  // 300, 300 and 2 are the three non-zero sound defaults; they are only ever
+  // overwritten by opcodes 93 and 95, so an object that carries neither keeps them.
+  Result.SoundFadeInDuration := 300;
+  Result.SoundFadeOutCurve := 0;
+  Result.SoundFadeOutDuration := 300;
+  Result.SoundVisibility := 2;
+  Result.MapAreaId := -1;
+  Result.RandomizeAnimStart := False;
+  Result.DeferAnimChange := False;
+  Result.Unknown1 := False;
+  Result.Raise := 0;
+  Result.Ops := TEntityOps.Create();
+end;
+
+(*
+## TObjectDefinition.Load
+```pascal
+function TObjectDefinition.Load(id: Integer; data: TByteArray): TObjectDefinition; static;
+```
+Decodes one OBJECT file. `data` is the file as `TCacheStore.ReadFiles` returns
+it; `id` is the file id from the reference table, which the record only carries.
+
+Raises on an unknown opcode, on a definition that runs off the end of its data,
+and on one that leaves bytes behind after opcode 0 - see the unit docstring.
+
+Post step (`ObjectLoader.java:454-473`), applied once the opcodes are done:
+
+- `WallOrDoor`, when opcode 19 did not set it, becomes 1 if the object has models
+  and either no types or `ObjectTypes[0] = 10`, or if any op slot was filled, and
+  0 otherwise. Both conditions are checked; the second wins because it is applied
+  second, which matters only in that it can raise a 0 to a 1, never the reverse.
+- `SupportsItems`, when opcode 75 did not set it, follows `InteractType`.
+
+The op condition is Java's `op != null`, i.e. "the slot was written", not "the
+slot holds a non-empty string" - opcode 30..34 with an empty (but not `Hidden`)
+string sets an op whose text is `""`, which `TEntityOps` stores as `''` and could
+not otherwise be told apart from an untouched slot. The one-byte read is used to
+spot it. No object in the live cache does this, so the distinction is currently
+theoretical, but it is a byte-cheap way not to have to trust that.
+*)
+function TObjectDefinition.Load(id: Integer; data: TByteArray): TObjectDefinition; static;
+var
+  s: TByteStream;
+  opcode, n, i, before, last: Integer;
+  hasOp: Boolean;
+begin
+  Result := TObjectDefinition.Default(id);
+  s := TByteStream.Create(data);
+  hasOp := False;
+
+  while True do
+  begin
+    opcode := s.ReadUByte();
+    if opcode = 0 then Break;
+
+    case opcode of
+      // Models and types travel together, and both are only touched when the
+      // count is non-zero - including opcodes 5 and 7, where the clearing of
+      // ObjectTypes sits inside the same `if (length > 0)` in the Java.
+      1: begin
+           n := s.ReadUByte();
+           if n > 0 then
+           begin
+             SetLength(Result.ObjectModels, n);
+             SetLength(Result.ObjectTypes, n);
+             for i := 0 to n - 1 do
+             begin
+               Result.ObjectModels[i] := s.ReadUShort();
+               Result.ObjectTypes[i] := s.ReadUByte();
+             end;
+           end;
+         end;
+
+      2: Result.Name := s.ReadJagexString();
+
+      5: begin
+           n := s.ReadUByte();
+           if n > 0 then
+           begin
+             Result.ObjectTypes := [];
+             SetLength(Result.ObjectModels, n);
+             for i := 0 to n - 1 do
+               Result.ObjectModels[i] := s.ReadUShort();
+           end;
+         end;
+
+      6: begin
+           n := s.ReadUByte();
+           if n > 0 then
+           begin
+             SetLength(Result.ObjectModels, n);
+             SetLength(Result.ObjectTypes, n);
+             for i := 0 to n - 1 do
+             begin
+               Result.ObjectModels[i] := s.ReadInt();
+               Result.ObjectTypes[i] := s.ReadUByte();
+             end;
+           end;
+         end;
+
+      7: begin
+           n := s.ReadUByte();
+           if n > 0 then
+           begin
+             Result.ObjectTypes := [];
+             SetLength(Result.ObjectModels, n);
+             for i := 0 to n - 1 do
+               Result.ObjectModels[i] := s.ReadInt();
+           end;
+         end;
+
+      14: Result.SizeX := s.ReadUByte();
+      15: Result.SizeY := s.ReadUByte();
+
+      17: begin
+            Result.InteractType := 0;
+            Result.BlocksProjectile := False;
+          end;
+      18: Result.BlocksProjectile := False;
+      19: Result.WallOrDoor := s.ReadUByte();
+      21: Result.ContouredGround := 0;
+      22: Result.MergeNormals := True;
+      23: Result.ModelClipped := True;
+
+      24: begin
+            Result.AnimationId := s.ReadUShort();
+            if Result.AnimationId = $FFFF then
+              Result.AnimationId := -1;
+          end;
+
+      27: Result.InteractType := 1;
+      28: Result.DecorDisplacement := s.ReadUByte();
+      29: Result.Ambient := s.ReadByte();
+
+      30, 31, 32, 33, 34:
+          begin
+            before := s.Position;
+            Result.Ops.DecodeOp(s, opcode - 30);
+            // A one-byte read is the empty string: an op that Java records as
+            // set (text "") and that leaves no trace in Ops. See the post step.
+            if (Result.Ops.Ops[opcode - 30] <> '') or (s.Position - before = 1) then
+              hasOp := True;
+          end;
+
+      // The signed byte times 25 - not a byte holding an already-scaled value.
+      39: Result.Contrast := s.ReadByte() * 25;
+
+      40: begin
+            n := s.ReadUByte();
+            SetLength(Result.RecolorToFind, n);
+            SetLength(Result.RecolorToReplace, n);
+            for i := 0 to n - 1 do
+            begin
+              Result.RecolorToFind[i] := s.ReadShort();
+              Result.RecolorToReplace[i] := s.ReadShort();
+            end;
+          end;
+
+      41: begin
+            n := s.ReadUByte();
+            SetLength(Result.RetextureToFind, n);
+            SetLength(Result.TextureToReplace, n);
+            for i := 0 to n - 1 do
+            begin
+              Result.RetextureToFind[i] := s.ReadShort();
+              Result.TextureToReplace[i] := s.ReadShort();
+            end;
+          end;
+
+      61: Result.Category := s.ReadUShort();
+      62: Result.Rotated := True;
+      64: Result.Shadow := False;
+      65: Result.ModelSizeX := s.ReadUShort();
+      66: Result.ModelSizeHeight := s.ReadUShort();
+      67: Result.ModelSizeY := s.ReadUShort();
+      68: Result.MapSceneId := s.ReadUShort();
+      69: Result.BlockingMask := s.ReadByte();
+      // Unsigned, with no $FFFF sentinel: object 24988 really does carry an
+      // OffsetHeight of 65535.
+      70: Result.OffsetX := s.ReadUShort();
+      71: Result.OffsetHeight := s.ReadUShort();
+      72: Result.OffsetY := s.ReadUShort();
+      73: Result.ObstructsGround := True;
+      74: Result.Hollow := True;
+      75: Result.SupportsItems := s.ReadUByte();
+
+      // 77 and 92 are the same block, bar the tail of ConfigChangeDest: 77 ends
+      // it with -1, 92 with an extra value read before the list. Note the array
+      // is n + 2 long while the loop runs n + 1 times - the Java reads
+      // `index <= length`, so a length byte of 0 still reads one entry.
+      77: begin
+            Result.VarbitId := s.ReadUShort();
+            if Result.VarbitId = $FFFF then Result.VarbitId := -1;
+            Result.VarpId := s.ReadUShort();
+            if Result.VarpId = $FFFF then Result.VarpId := -1;
+
+            n := s.ReadUByte();
+            SetLength(Result.ConfigChangeDest, n + 2);
+            for i := 0 to n do
+            begin
+              Result.ConfigChangeDest[i] := s.ReadUShort();
+              if Result.ConfigChangeDest[i] = $FFFF then
+                Result.ConfigChangeDest[i] := -1;
+            end;
+            Result.ConfigChangeDest[n + 1] := -1;
+          end;
+
+      78: begin
+            Result.AmbientSoundId := s.ReadUShort();
+            Result.AmbientSoundDistance := s.ReadUByte();
+            Result.AmbientSoundRetain := s.ReadUByte();
+          end;
+
+      79: begin
+            Result.AmbientSoundChangeTicksMin := s.ReadUShort();
+            Result.AmbientSoundChangeTicksMax := s.ReadUShort();
+            Result.AmbientSoundDistance := s.ReadUByte();
+            Result.AmbientSoundRetain := s.ReadUByte();
+            n := s.ReadUByte();
+            SetLength(Result.AmbientSoundIds, n);
+            for i := 0 to n - 1 do
+              Result.AmbientSoundIds[i] := s.ReadUShort();
+          end;
+
+      // The byte is a count of 256ths, not a raw height.
+      81: Result.ContouredGround := s.ReadUByte() * 256;
+      82: Result.MapAreaId := s.ReadUShort();
+      89: Result.RandomizeAnimStart := True;
+      90: Result.DeferAnimChange := True;
+      91: Result.SoundDistanceFadeCurve := s.ReadUByte();
+
+      92: begin
+            Result.VarbitId := s.ReadUShort();
+            if Result.VarbitId = $FFFF then Result.VarbitId := -1;
+            Result.VarpId := s.ReadUShort();
+            if Result.VarpId = $FFFF then Result.VarpId := -1;
+
+            last := s.ReadUShort();
+            if last = $FFFF then last := -1;
+
+            n := s.ReadUByte();
+            SetLength(Result.ConfigChangeDest, n + 2);
+            for i := 0 to n do
+            begin
+              Result.ConfigChangeDest[i] := s.ReadUShort();
+              if Result.ConfigChangeDest[i] = $FFFF then
+                Result.ConfigChangeDest[i] := -1;
+            end;
+            // The one difference from opcode 77.
+            Result.ConfigChangeDest[n + 1] := last;
+          end;
+
+      93: begin
+            Result.SoundFadeInCurve := s.ReadUByte();
+            Result.SoundFadeInDuration := s.ReadUShort();
+            Result.SoundFadeOutCurve := s.ReadUByte();
+            Result.SoundFadeOutDuration := s.ReadUShort();
+          end;
+
+      94: Result.Unknown1 := True;
+      95: Result.SoundVisibility := s.ReadUByte();
+      96: Result.Raise := s.ReadUByte();
+
+      100: Result.Ops.DecodeSubOp(s);
+      101: Result.Ops.DecodeConditionalOp(s);
+      102: Result.Ops.DecodeConditionalSubOp(s);
+
+      249: Result.Params := s.ReadParams();
+
+      else
+        raise 'ObjectDefinition: unknown opcode ' + ToStr(opcode) + ' in object ' +
+              ToStr(id) + ' at offset ' + ToStr(s.Position - 1);
+    end;
+  end;
+
+  if s.Remaining() <> 0 then
+    raise 'ObjectDefinition: object ' + ToStr(id) + ' left ' + ToStr(s.Remaining()) +
+          ' byte(s) unread after its terminator at offset ' + ToStr(s.Position - 1);
+
+  // post - ObjectLoader.java:454-473
+  if Result.WallOrDoor = -1 then
+  begin
+    Result.WallOrDoor := 0;
+    if (Length(Result.ObjectModels) > 0) and
+       ((Length(Result.ObjectTypes) = 0) or (Result.ObjectTypes[0] = 10)) then
+      Result.WallOrDoor := 1;
+    if hasOp then
+      Result.WallOrDoor := 1;
+  end;
+
+  if Result.SupportsItems = -1 then
+    if Result.InteractType <> 0 then
+      Result.SupportsItems := 1
+    else
+      Result.SupportsItems := 0;
+end;

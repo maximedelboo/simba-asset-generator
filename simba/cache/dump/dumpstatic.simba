@@ -1,0 +1,267 @@
+(*
+# Dump Static
+The whitelist entries no cache can produce, staged into the output tree by
+copying them.
+
+Dependency-free in the same sense as the rest of `utils/cache/` - no
+`WaspLib/main.simba`, so no `String` helper methods. Use the Lape built-ins
+(`LowerCase`, `SameText`, `Trim`) and `raise` a `'DumpStatic: ...'`-prefixed
+string on failure.
+
+## These are not a gap, they are a measurement
+
+Sixteen of the twenty-four whitelist paths were never produced by a cache
+dumper, and eleven of those were never produced by *anything* automated -
+`fonts/fonts.zip`, the four `images/*` files, `images/skills.zip`,
+`finders/house_layout.zip`, `jsons/consumables.{json,zip}`, `jsons/monsters`,
+`jsons/monsters.zip` and `jsons/weapons.json` are curated data with no
+`Simba*Dumper` behind them at all.
+
+Three more were established as unreproducible rather than merely unimplemented
+(`docs/phase3-research-sprites.md`):
+
+| file | finding |
+|---|---|
+| `finders/prayer.zip` | 71% of its colours occur in **no frame** of the 11681-sprite index - screen captures, hand-cleaned |
+| `finders/overheads.zip` | localises to sprite archive 440 by colour, but no nearest-neighbour downscale exceeds **0.224** similarity |
+| `finders/spells.zip` | 73.4% bit-exact cache sprites, but its name -> sprite-id mapping exists in **no source file**, and **9 sprite ids are claimed by 2-5 entries**, so some committed rows are wrong |
+
+## `jsons/gear.json` is the sixteenth, and it is cache-derived after all
+
+It is staged here rather than generated, but not because it cannot be: the
+committed file was **reproduced byte for byte (96043 / 96043) from the committed
+`item-definitions.zip` alone**, so it is a pure function of the ITEM archive and
+belongs in a future dumper, not in this list.
+
+The producer is `SimbaGearDumper.java`, not `WaspLib/tools/update_gear.simba`,
+and three independent things say so:
+
+- the committed file has **12** top-level slot keys; `update_gear.simba` writes
+  **13**, always, with `spec_weapons` between `ring` and `2h` and no code path
+  that omits it;
+- `update_gear.simba` filters out every name beginning `noted ` or ending
+  ` 0`/` 25`/` 50`/` 75`/` 100` before it asks the wiki anything, and the
+  committed file contains **141** such names (`ahrim's hood 0`, ...);
+- `update-dumps.yml:328` runs `net.runelite.cache.SimbaGearDumper` and
+  `:796` maps its artifact straight onto `jsons/gear.json`. No CI job has ever
+  run `update_gear.simba`, and its output path (`WaspLib/jsons/gear.json`) has
+  never existed in WaspLib's history.
+
+So porting it is a small, well-specified job - a `LinkedHashMap` of 12 slots
+keyed off `wearPos1/2/3`, deduplicated, sorted, hand-written with a `", "`
+separator - and until that lands the file is copied.
+
+## The parity property this buys
+
+A copied file has, by construction, the committed CRC32. So these sixteen
+entries in a generated `hashes.json` should equal the ones in
+`wasp-assets/hashes.json` - the only entries in the whole manifest of which that
+is true, since every generated zip is written by {ref}`TZipWriter`, whose
+deflate is not the JDK's. That makes the copy step self-checking end to end:
+`dev/tests/420_static.simba` asserts against the committed manifest, not against
+its own recomputation.
+
+### ...for fifteen of the sixteen
+
+**`jsons/monsters` is the exception, on every non-Windows host, and it is a
+`.gitattributes` artefact rather than a defect.** `wasp-assets/.gitattributes`
+normalises with `* text=auto` followed by `*.* text eol=lf`; the second rule
+pins every file **with a dot in its name** to LF everywhere. `jsons/monsters` is
+the only whitelisted file without one - the repo has exactly two extensionless
+tracked files, it and `LICENSE` - so only `text=auto` applies and its
+working-tree form follows the checkout platform.
+
+Measured: the checked-out file here is 38869 bytes of LF, CRC32 `81455CA5`;
+the committed manifest says `E4AC5B2E`, which is exactly the CRC32 of the same
+content with CRLF (41119 bytes, 2250 lines). The manifest was written on
+`windows-latest`.
+
+Nothing is done about it. `hashes.json` must be the true CRC32 of the file we
+actually shipped, and copying the bytes we were given is what makes that true.
+
+## Source in the standalone generator
+
+The standalone `asset-generator` vendors these inputs under `static/` and
+passes that directory explicitly to `DumpStaticAssets`. A generator run is
+therefore self-contained and never needs to read or alter `wasp-assets/`.
+*)
+{$DEFINE WL_CACHE_DUMP_STATIC_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+
+const
+(*
+## GENERATED_ASSETS
+```pascal
+GENERATED_ASSETS: TStringArray
+```
+The whitelist paths a dumper in this directory claims. Everything else in the
+whitelist is static, which is how {ref}`StaticAssetPaths` derives its list
+instead of transcribing one.
+
+| path | dumper |
+|---|---|
+| `jsons/item-definitions.zip` | `dumpitemdefs.simba` |
+| `map/objects.zip` | `dumpobjects.simba` |
+| `map/mapdata.zip` | `map/mapdata.simba` |
+| `map/npcs.zip` | `dumpnpcs.simba` + `dumpnpcspawns.simba` (third-party spawn source) |
+| `finders/items/items.zip`, `finders/items/data/{hash,id,item}.txt` | `dumpitems.simba` |
+
+All five rows are live dumpers rather than static copies. This list still lives
+separately from the registry so the static step can never overwrite a generated
+artifact. `map/npcs.zip` remains the one network-backed generated path: its
+coordinates come from `mejrs/data_osrs` and do not exist in the cache. A failed
+fetch is non-fatal and leaves it absent from the manifest, which is the honest
+state for that one run.
+*)
+  GENERATED_ASSETS: TStringArray = [
+    'finders/items/data/hash.txt',
+    'finders/items/data/id.txt',
+    'finders/items/data/item.txt',
+    'finders/items/items.zip',
+    'jsons/item-definitions.zip',
+    'map/mapdata.zip',
+    'map/npcs.zip',
+    'map/objects.zip'
+  ];
+
+(*
+## StaticAssetPaths
+```pascal
+function StaticAssetPaths(hashable, generated: TStringArray): TStringArray;
+```
+`hashable` minus `generated`, preserving `hashable`'s order. With
+`AssetHashablePaths(ASSET_WHITELIST)` and {ref}`GENERATED_ASSETS` that is the 16
+static paths.
+
+Derived rather than written out, so that registering a new dumper shrinks the
+copy set by itself. The alternative - a second hand-maintained list - fails
+silently in the worst possible direction: a path left in both sets would have
+its freshly generated content overwritten by a stale copy on the next run.
+
+`hashable` is expected to have been through `AssetHashablePaths` already, which
+is what drops the `hashes.json` self-reference; this function only removes
+`generated`. Both sides are trimmed and compared with `SameText`, the ASCII
+`equalsIgnoreCase`, because the caller may well be handing over
+`FileReadLines(whitelist.txt)`.
+
+Example:
+```pascal
+WriteLn(StaticAssetPaths(['a.zip', 'b.zip'], ['b.zip']));  // ['a.zip']
+```
+*)
+function StaticAssetPaths(hashable, generated: TStringArray): TStringArray;
+var
+  i, k: Integer;
+  entry: String;
+  skip: Boolean;
+begin
+  for i := 0 to High(hashable) do
+  begin
+    entry := Trim(hashable[i]);
+    if entry = '' then Continue;
+
+    skip := False;
+    for k := 0 to High(generated) do
+      if SameText(entry, Trim(generated[k])) then
+      begin
+        skip := True;
+        Break;
+      end;
+
+    if not skip then
+      Result += entry;
+  end;
+end;
+
+(*
+## _StaticParentOf
+```pascal
+function _StaticParentOf(rel: String): String;
+```
+Everything in `rel` before its last `/`, or `''` when there is none.
+
+`'finders/items/data/hash.txt'` -> `'finders/items/data'`; `'hashes.json'` ->
+`''`. The caller feeds the result to {ref}`TAssetDump.Ensure`, which is
+recursive, so the three-level case needs no special handling.
+
+Written against `/` and not `PATH_SEP` deliberately: whitelist entries are
+always spelled with forward slashes, and this runs before the separator is
+rewritten.
+*)
+function _StaticParentOf(rel: String): String;
+var
+  i: Integer;
+begin
+  for i := Length(rel) downto 1 do
+    if rel[i] = '/' then
+      Exit(Copy(rel, 1, i - 1));
+  Result := '';
+end;
+
+(*
+## DumpStaticAssets
+```pascal
+function DumpStaticAssets(srcDir: String; var dump: TAssetDump; paths: TStringArray): Integer;
+```
+Copies every `paths` entry from `srcDir` into `dump`'s tree, creating the
+directories on the way, and returns how many were copied - which is always
+`Length(paths)`, because a missing source raises rather than being skipped.
+
+That is the opposite of {ref}`WriteHashesJSON`'s rule, and deliberately so. A
+whitelist file our dumpers do not produce yet is a known, temporary hole and is
+worth omitting quietly; a *static* file missing from the source directory means
+the source directory is wrong, and quietly staging fifteen of sixteen would
+surface hours later as one unexplained manifest entry.
+
+Each copy is verified by CRC32 before it counts. `FileCopy` reports success from
+the API call, not from the bytes on disk, and a truncated static asset is
+exactly the failure this whole step is supposed to be incapable of.
+
+Re-running over a populated tree is fine: `FileCopy` overwrites, unlike
+`TImage.Save`.
+
+Example:
+```pascal
+dump.Setup('/tmp/assets');
+DumpStaticAssets('/path/to/wasp-assets',
+                 dump,
+                 StaticAssetPaths(AssetHashablePaths(ASSET_WHITELIST),
+                                  GENERATED_ASSETS));
+```
+*)
+function DumpStaticAssets(srcDir: String; var dump: TAssetDump; paths: TStringArray): Integer;
+var
+  base, rel, parent, src, dst: String;
+  i: Integer;
+begin
+  if Trim(srcDir) = '' then
+    raise 'DumpStatic: no static asset directory - pass --static=<dir> ' +
+          'pointing at a wasp-assets checkout';
+
+  base := PathIncludeTrailingSep(_DumpNormSep(srcDir));
+
+  for i := 0 to High(paths) do
+  begin
+    rel := Trim(paths[i]);
+    if rel = '' then Continue;
+
+    src := base + _DumpNormSep(rel);
+    if not FileExists(src) then
+      raise 'DumpStatic: no "' + rel + '" under "' + base + '" - this file is ' +
+            'not derivable from the cache and has to be supplied';
+
+    parent := _StaticParentOf(rel);
+    if parent <> '' then
+      dump.Ensure(parent);
+
+    dst := dump.Path(rel);
+    if not FileCopy(src, dst) then
+      raise 'DumpStatic: could not copy "' + src + '" to "' + dst + '"';
+
+    // FileCopy answers for the call, not for the bytes.
+    if HashFile(EHashAlgo.CRC32, dst) <> HashFile(EHashAlgo.CRC32, src) then
+      raise 'DumpStatic: "' + rel + '" did not survive the copy intact';
+
+    Inc(Result);
+  end;
+end;

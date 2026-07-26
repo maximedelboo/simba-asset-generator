@@ -1,0 +1,185 @@
+(*
+# Cache Manager
+Owns revision-pinned cache directories beneath a caller-selected root. It never
+writes into a live RuneLite/Jagex cache: local client caches are only accepted
+as read-only inputs to the asset dumper.
+
+The OpenRS2 disk zip is downloaded only when a complete cache is absent. A
+ready.txt marker is written last, after extraction and validation, so an
+interrupted download or unzip is never selected as the active cache.
+*)
+{$DEFINE WL_CACHE_MANAGER_INCLUDED}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE store.simba}{$ENDIF}
+
+const
+  OPENRS2_CACHE_URL: String = 'https://archive.openrs2.org/caches/runescape/';
+  OPENRS2_CACHES_URL: String = 'https://archive.openrs2.org/caches.json';
+
+type
+  TCacheManager = record
+    Root: String;
+  end;
+
+function _CacheRevisionOK(revision: String): Boolean;
+var
+  i: Integer;
+begin
+  if revision = '' then Exit(False);
+  for i := 1 to Length(revision) do
+    if (revision[i] < '0') or (revision[i] > '9') then Exit(False);
+  Result := True;
+end;
+
+function _OpenRS2CompactJSON(s: String): String;
+var
+  i: Integer;
+begin
+  for i := 1 to Length(s) do
+    if not (s[i] in [#9, #10, #13, ' ']) then
+      Result += s[i];
+end;
+
+function _OpenRS2ObjectID(s: String): Integer;
+var
+  i, start: Integer;
+begin
+  i := Pos('"id":', s);
+  if i = 0 then Exit(-1);
+  start := i + Length('"id":');
+  i := start;
+  while (i <= Length(s)) and (s[i] >= '0') and (s[i] <= '9') do Inc(i);
+  if i = start then Exit(-1);
+  Result := StrToInt(Copy(s, start, i - start));
+end;
+
+function TCacheManager.Create(root: String): TCacheManager; static;
+begin
+  Result.Root := PathIncludeTrailingSep(PathNormalize(root));
+  if not DirExists(Result.Root) and not DirCreate(Result.Root) then
+    raise 'CacheManager: could not create ' + Result.Root;
+end;
+
+function TCacheManager.RevisionDir(revision: String): String;
+begin
+  if not _CacheRevisionOK(revision) then
+    raise 'CacheManager: revision must be decimal digits, got "' + revision + '"';
+  Result := Self.Root + revision + PATH_SEP;
+end;
+
+function TCacheManager.IsReady(revision: String): Boolean;
+var
+  dir: String;
+begin
+  dir := Self.RevisionDir(revision);
+  Result := FileExists(dir + 'ready.txt') and
+            FileExists(dir + 'main_file_cache.dat2');
+end;
+
+procedure TCacheManager.SetActive(revision: String);
+begin
+  if not Self.IsReady(revision) then
+    raise 'CacheManager: cannot activate incomplete cache ' + revision;
+  if not FileWrite(Self.Root + 'active.txt', revision) then
+    raise 'CacheManager: could not write active revision';
+end;
+
+function TCacheManager.ActiveDir(): String;
+var
+  revision: String;
+begin
+  if not FileExists(Self.Root + 'active.txt') then Exit('');
+  revision := Trim(FileRead(Self.Root + 'active.txt'));
+  if not _CacheRevisionOK(revision) then Exit('');
+  if Self.IsReady(revision) then Result := Self.RevisionDir(revision);
+end;
+
+function TCacheManager.LatestOpenRS2Revision(): String;
+var
+  data, objectJSON, compact: String;
+  i, start, depth, candidate, best: Integer;
+begin
+  data := HTTPClient.Get(OPENRS2_CACHES_URL);
+  depth := 0;
+  for i := 1 to Length(data) do
+  begin
+    if data[i] = '{' then
+    begin
+      if depth = 0 then start := i;
+      Inc(depth);
+    end
+    else if data[i] = '}' then
+    begin
+      Dec(depth);
+      if depth < 0 then raise 'CacheManager: malformed OpenRS2 response';
+      if depth = 0 then
+      begin
+        objectJSON := Copy(data, start, i - start + 1);
+        compact := _OpenRS2CompactJSON(objectJSON);
+        if (Pos('"scope":"runescape"', compact) > 0) and
+           (Pos('"game":"oldschool"', compact) > 0) and
+           (Pos('"environment":"live"', compact) > 0) and
+           (Pos('"language":"en"', compact) > 0) and
+           (Pos('"Jagex"', compact) > 0) and
+           (Pos('"disk_store_valid":true', compact) > 0) then
+        begin
+          candidate := _OpenRS2ObjectID(compact);
+          if candidate > best then best := candidate;
+        end;
+      end;
+    end;
+  end;
+  if best <= 0 then raise 'CacheManager: no valid Old School OpenRS2 cache found';
+  Result := ToStr(best);
+end;
+
+function TCacheManager.InstallDiskZip(revision, zipPath: String): String;
+var
+  dir: String;
+begin
+  if not FileExists(zipPath) or (FileSize(zipPath) = 0) then
+    raise 'CacheManager: missing or empty disk zip ' + zipPath;
+
+  dir := Self.RevisionDir(revision);
+  // This directory is derived from a strictly numeric revision under Root; it
+  // is safe to discard an incomplete prior attempt before re-extracting.
+  DirDelete(dir, False);
+  if not DirCreate(dir) then
+    raise 'CacheManager: could not create ' + dir;
+  if not ZipExtract(zipPath, dir) then
+  begin
+    DirDelete(dir, False);
+    raise 'CacheManager: could not extract ' + zipPath;
+  end;
+  if not FileExists(dir + 'main_file_cache.dat2') then
+  begin
+    DirDelete(dir, False);
+    raise 'CacheManager: disk zip has no main_file_cache.dat2';
+  end;
+  if not FileWrite(dir + 'ready.txt', revision) then
+    raise 'CacheManager: could not mark cache ready';
+
+  Self.SetActive(revision);
+  Result := dir;
+end;
+
+function TCacheManager.EnsureOpenRS2(revision: String): String;
+var
+  zipPath, url: String;
+begin
+  if Self.IsReady(revision) then
+  begin
+    Self.SetActive(revision);
+    Exit(Self.RevisionDir(revision));
+  end;
+
+  zipPath := Self.Root + revision + '.disk.zip';
+  url := OPENRS2_CACHE_URL + revision + '/disk.zip';
+  FileDelete(zipPath);
+  WriteLn('CacheManager: downloading ', url);
+  HTTPClient.GetFile(url, zipPath);
+  if not FileExists(zipPath) or (FileSize(zipPath) = 0) then
+    raise 'CacheManager: download failed for ' + url;
+
+  Result := Self.InstallDiskZip(revision, zipPath);
+  FileDelete(zipPath);
+end;

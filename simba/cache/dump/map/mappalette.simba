@@ -1,0 +1,281 @@
+(*
+# MapPalette
+The 65536-entry HSL->RGB table `SimbaMapImageDumper` paints the ground with,
+plus the three lightness helpers that index into it.
+
+```pascal
+var pal: TIntegerArray;
+pal := MapPalette();
+WriteLn(pal[MapMethod1792(MapPackHsl(hue, sat, light), 96)]);
+```
+
+## This is deliberately NOT the palette in jagexcolor.simba
+`utils/cache/jagexcolor.simba` implements the client's own builder - quantise to
+0..255 first, *then* gamma-correct, with an `rgb = 0 -> 1` guard - and it was
+validated against the client's reference table at all five brightnesses with
+**0 mismatches out of 65536**. It is the right palette for item sprites, where
+the fork's rerouted builder scores 0/346 against the committed hashes and the
+correct one scores 345/346.
+
+`SimbaMapImageDumper` does not use it. Its field is
+
+```java
+private static int[] colorPalette = JagexColor.createPalette(JagexColor.BRIGHTNESS_MAX);   // :64
+```
+
+and `createPalette(double)` is a one-line reroute:
+
+```java
+public static int[] createPalette(double brightness) { return createPaletteHSV(brightness, 0, 65536); }
+```
+(`models/JagexColor.java:253-255`)
+
+`createPaletteHSV` (`:367-440`) applies `Math.pow` **before** quantising
+(`:428-433`) and has no `rgb = 0 -> 1` guard. The two tables are genuinely
+different, and `map/zips/map.zip` was produced with *this* one. Substituting the
+validated palette here discolours every terrain pixel in the file.
+
+**So do not "fix" this unit by calling `JagexHSLtoRGB`.** It is a faithful copy
+of a builder that is wrong in general and right for this one artefact. The gate
+is `dev/tests/442_mapimage.simba`, which will fail on the first chunk if the
+tables are swapped.
+
+## Why the expressions are transcribed with their original grouping
+IEEE double multiplication is commutative but **not** associative, and the Java
+writes the same algebraic quantity three different ways - `local40 * 6.0 * (d)`
+for green, `(d) * 6.0 * local113` for blue, `(d) * (t) * 6.0` for the third
+green arm. `(d*6)*t` and `(d*t)*6` can differ in the last bit, and one last bit
+is enough to move `(int)(v * 256.0)` across an integer boundary. Every
+expression below therefore keeps the source's operand order and is fully
+parenthesised, rather than being tidied into one canonical form.
+
+## Brightness
+`JagexColor.BRIGHTNESS_MAX` is patched to `.5` in this fork - a genuine parity
+patch, kept. At that exponent `Math.pow(v, 0.5)` is the square root, which
+fdlibm's `pow` special-cases and any correctly-rounded `pow` reproduces, so
+{ref}`MapPaletteHSV` uses `Sqrt` there. Every other brightness goes through
+`Power`; nothing in the map pipeline asks for one.
+*)
+{$DEFINE WL_CACHE_DUMP_MAPPALETTE_INCLUDED}
+
+const
+  // JagexColor.BRIGHTNESS_MAX, as this fork patches it. See the unit docstring.
+  MAP_BRIGHTNESS: Double = 0.5;
+
+  // The lightness argument every map-side palette lookup passes (`:492`, `:528`,
+  // `:538`). Named because it is a magic 96 in four places in the Java.
+  MAP_LIGHTNESS: Integer = 96;
+
+var
+  // Built on first use by MapPalette(). 65536 entries of 24-bit RGB.
+  _MapPalette: TIntegerArray;
+
+(*
+## MapPaletteHSV
+```pascal
+function MapPaletteHSV(brightness: Double): TIntegerArray;
+```
+`JagexColor.createPaletteHSV(brightness, 0, 65536)` (`models/JagexColor.java:367-440`).
+
+Index layout is `hue = (i shr 10) and $3F`, `sat = (i shr 7) and 7`,
+`lightness = i and $7F`, each mapped to a double with a half-step offset
+(`:371-373`). The body is the classic `q`/`p` HSL form - not the chroma form
+`jagexcolor.simba` uses - and the output packs as
+`B + (R shl 16) + (G shl 8)` (`:435`).
+
+Saturation is `(i shr 7 and 7) / 8 + 0.0625`, which is never 0, so the
+`if (local51 != 0.0)` guard at `:381` is always taken and the grey short-circuit
+below it is dead. It is kept anyway so the port reads against the source.
+
+No entry can overflow a byte: lightness tops out at `127/128` and saturation at
+`0.9375`, giving a maximum channel of about `0.9995`, so `Trunc(v * 256.0)`
+stays at or below 255 without the `and 255` mask the *other* builder needs.
+*)
+function MapPaletteHSV(brightness: Double): TIntegerArray;
+var
+  i, r, g, b: Integer;
+  hue, sat, light, q, p, hueR, hueB, cr, cg, cb: Double;
+begin
+  SetLength(Result, 65536);
+
+  for i := 0 to 65535 do
+  begin
+    hue := ((i shr 10) and $3F) / 64.0 + 0.0078125;
+    sat := ((i shr 7) and $7) / 8.0 + 0.0625;
+    light := (i and $7F) / 128.0;
+
+    cr := light;
+    cg := light;
+    cb := light;
+
+    if sat <> 0.0 then
+    begin
+      if light < 0.5 then
+        q := (sat + 1.0) * light
+      else
+        q := light + sat - sat * light;
+
+      p := light * 2.0 - q;
+
+      hueR := hue + 0.3333333333333333;
+      if hueR > 1.0 then hueR := hueR - 1.0;
+
+      hueB := hue - 0.3333333333333333;
+      if hueB < 0.0 then hueB := hueB + 1.0;
+
+      // Green, from the hue itself (`:400-408`).
+      if hue * 6.0 < 1.0 then
+        cg := p + ((hue * 6.0) * (q - p))
+      else if hue * 2.0 < 1.0 then
+        cg := q
+      else if hue * 3.0 < 2.0 then
+        cg := (((q - p) * (-hue + 0.6666666666666666)) * 6.0) + p
+      else
+        cg := p;
+
+      // Red, from hue + 1/3 (`:409-417`). Note the grouping differs from
+      // green's: `(h*6)*(q-p)` here against `((q-p)*t)*6` above.
+      if hueR * 6.0 < 1.0 then
+        cr := ((hueR * 6.0) * (q - p)) + p
+      else if hueR * 2.0 < 1.0 then
+        cr := q
+      else if hueR * 3.0 < 2.0 then
+        cr := p + (((q - p) * 6.0) * (0.6666666666666666 - hueR))
+      else
+        cr := p;
+
+      // Blue, from hue - 1/3 (`:418-426`).
+      if hueB * 6.0 < 1.0 then
+        cb := p + (((q - p) * 6.0) * hueB)
+      else if hueB * 2.0 < 1.0 then
+        cb := q
+      else if hueB * 3.0 < 2.0 then
+        cb := (((0.6666666666666666 - hueB) * (-p + q)) * 6.0) + p
+      else
+        cb := p;
+    end;
+
+    // :428-430. pow BEFORE the quantise - this is the whole difference from
+    // the client's builder, and it is what produced map.zip.
+    if brightness = 0.5 then
+    begin
+      cr := Sqrt(cr);
+      cg := Sqrt(cg);
+      cb := Sqrt(cb);
+    end
+    else
+    begin
+      cr := Power(cr, brightness);
+      cg := Power(cg, brightness);
+      cb := Power(cb, brightness);
+    end;
+
+    r := Trunc(cr * 256.0);
+    g := Trunc(cg * 256.0);
+    b := Trunc(cb * 256.0);
+
+    // :434. And no `if rgb = 0 then rgb := 1` afterwards.
+    Result[i] := b + (r shl 16) + (g shl 8);
+  end;
+end;
+
+(*
+## MapPalette
+```pascal
+function MapPalette(): TIntegerArray;
+```
+The table `SimbaMapImageDumper` holds in its static `colorPalette` field
+(`:64`): {ref}`MapPaletteHSV` at {ref}`MAP_BRIGHTNESS`. Built once and shared;
+the array is returned by reference, so do not write into it.
+*)
+function MapPalette(): TIntegerArray;
+begin
+  if Length(_MapPalette) <> 65536 then
+    _MapPalette := MapPaletteHSV(MAP_BRIGHTNESS);
+  Result := _MapPalette;
+end;
+
+(*
+## MapPackHsl
+```pascal
+function MapPackHsl(hue, saturation, lightness: Integer): Integer;
+```
+`SimbaMapImageDumper.packHsl` (`:823-832`): quantises an (h, s, l) triple into
+the palette's index space, desaturating in four steps as the tile gets brighter.
+
+**`hue` is routinely negative.** `UnderlayDefinition.calculateHsl` keeps the sign
+of `(g - b) / (max - min)` all the way into the packed hue, so the blend's
+average hue can be below zero and so can the result. That is fine: the two
+consumers below mask with `$FF80`, which lands any negative back inside 0..65534.
+
+Every division is Java's truncating `/`; Lape's `div` truncates the same way, so
+a negative `hue div 4` rounds toward zero in both.
+*)
+function MapPackHsl(hue, saturation, lightness: Integer): Integer;
+begin
+  if lightness > 179 then saturation := saturation div 2;
+  if lightness > 192 then saturation := saturation div 2;
+  if lightness > 217 then saturation := saturation div 2;
+  if lightness > 243 then saturation := saturation div 2;
+
+  Result := ((saturation div 32) shl 7) + ((hue div 4) shl 10) + (lightness div 2);
+end;
+
+(*
+## MapMethod1792
+```pascal
+function MapMethod1792(hsl, lightness: Integer): Integer;
+```
+`SimbaMapImageDumper.method1792` (`:834-843`): rescales the low 7 bits of a
+packed HSL - its lightness - by `lightness / 128`, clamps that to 2..126 and
+puts it back. This is what the **underlay** goes through (`:492`).
+
+`hsl and 65408` is `and $FF80`, which is why a negative `hsl` cannot escape the
+palette: the mask clears the sign and everything above bit 15.
+
+`hsl = -1` returns 12345678, which would index far outside the palette. It is
+the Java's own sentinel handling and is unreachable from the map's call site,
+where -1 already means "no underlay" and is tested for first (`:490`).
+*)
+function MapMethod1792(hsl, lightness: Integer): Integer;
+begin
+  if hsl = -1 then Exit(12345678);
+
+  lightness := ((hsl and 127) * lightness) div 128;
+  if lightness < 2 then lightness := 2
+  else if lightness > 126 then lightness := 126;
+
+  Result := (hsl and 65408) + lightness;
+end;
+
+(*
+## MapAdjustHSLListness0
+```pascal
+function MapAdjustHSLListness0(hsl, lightness: Integer): Integer;
+```
+`SimbaMapImageDumper.adjustHSLListness0` (`:845-862`): {ref}`MapMethod1792`
+with two extra sentinels - `-2` for "transparent" and `-1` for "lightness only".
+This is what an **overlay** goes through (`:528`, `:538`).
+
+The `-2` arm is dead at the map's call sites: an overlay whose `rgbColor` is
+`$FF00FF` sets `hsl := -2` and is filtered by `if (hsl <> -2)` before this is
+called (`:526`), so the 54 transparent tiles in the verified corpus leave
+`overlayRgb` at 0 rather than reaching here.
+*)
+function MapAdjustHSLListness0(hsl, lightness: Integer): Integer;
+begin
+  if hsl = -2 then Exit(12345678);
+
+  if hsl = -1 then
+  begin
+    if lightness < 2 then lightness := 2
+    else if lightness > 126 then lightness := 126;
+    Exit(lightness);
+  end;
+
+  lightness := ((hsl and 127) * lightness) div 128;
+  if lightness < 2 then lightness := 2
+  else if lightness > 126 then lightness := 126;
+
+  Result := (hsl and 65408) + lightness;
+end;

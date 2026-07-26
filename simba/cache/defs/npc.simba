@@ -1,0 +1,415 @@
+(*
+# NpcDefinition
+Decoder for the NPC definitions in index 2 (CONFIGS), archive 9 (`EConfigType.NPC`).
+A straight port of `NpcLoader.java:52-431`, with `NpcDefinition.java` for the
+defaults.
+
+Only four of these fields reach the asset tree today - `SimbaNPCDumper` +
+`NpcExporter.simbaExport` write `{name, level, category, minimapdot, actions,
+size, colors}` per id - but the whole definition is decoded because the format is
+a single stream: skipping a field means reading every field after it at the wrong
+offset. Everything the client stores is therefore kept, not just what the current
+dumper emits.
+
+## Two opcodes the reference loader does not know
+The live cache is newer than `runelite-cache`, whose `NpcLoader` warns and
+continues on an opcode it does not recognise. Four NPCs (4733 "Thurgo" among
+them) carry **opcode 147**, which that loader drops on the floor. Upstream
+RuneLite (1.12.18-SNAPSHOT, 2026-02-11) has it - `def.zbuf = false` - along with
+**opcode 130**, `def.idleAnimRestart = true`. Both are zero-byte flags, so the
+reference loader stays aligned despite not knowing them, and both are decoded
+here. Opcode 130 does not occur in the NPC archive of the cache this was written
+against; it is implemented anyway, from the same upstream source.
+
+Note that upstream and the `runelite-cache` fork in this workspace have diverged
+in both directions: upstream has 130/147, the fork has 61/62 (32-bit model ids),
+251/252/253 (the `TEntityOps` opcodes) and the type-2 int64 parameter. This port
+is the union, which is what the cache actually contains.
+
+## Coverage
+Nine implemented opcodes are absent from all 15712 definitions in the cache this
+was written against - **1, 60** (16-bit model / chathead ids, superseded by
+61/62, which every npc uses), **116, 126, 129, 130, 251, 252, 253**. They are
+implemented from the Java and pinned with synthetic definitions in
+`dev/tests/250_npc.simba` rather than by real data. Two more are all but absent:
+opcode 41 has exactly one user (npc 2702) and opcode 102 has 77, none of which
+sets more than one head-icon bit - so the unset-bit branch of 102 is synthetic
+too. Since 126 never appears, `FootprintSize` is in practice always the post
+step's computed value.
+
+## Revision assumptions
+The Java loader carries two revision switches and this port hardcodes both to
+their defaults, which is what `SimbaNPCDumper` uses (it never calls
+`configureForRevision`):
+
+- `rev210HeadIcons = true` (cache revision >= 1493, `REV_210_NPC_ARCHIVE_REV`).
+  Opcode 102 is the bitfield form. The older form - a single u16 sprite index
+  paired with the loader's `defaultHeadIconArchive` - is not implemented; a
+  pre-1493 cache would decode it as a bitfield and desynchronise.
+- `rev233 = true`. Opcode 111 therefore means `RenderPriority := 2`. Before 220
+  the same opcode meant `IsFollower := True` plus `LowPriorityFollowerOps := True`;
+  neither byte-consuming, so this only changes the values, never the alignment.
+
+## Divergences from the Java
+- An **unrecognised opcode raises**. `NpcLoader.decodeValues` logs a warning and
+  returns, which leaves the stream parked mid-field and turns one unknown byte
+  into a silently corrupt definition (and, because the loop runs to opcode 0, an
+  arbitrary number of corrupt ones after it). Failing loudly is the only way a
+  new opcode in a future cache revision gets noticed.
+- **The stream must be exactly consumed.** After the terminating `0` the cursor
+  has to sit at end-of-data; the Java never looks. A mis-sized opcode is
+  otherwise invisible on the many definitions where the damaged field still
+  decodes to something plausible, and not one of the 15712 NPCs in the archive
+  leaves a trailing byte, so this is an always-on parity check rather than a
+  heuristic. Same guard as `item.simba` and `object.simba`.
+
+## Types
+`Recolor*` and `Retexture*` hold **signed** 16-bit values: Java's arrays are
+`short[]` and the loader casts the u16 it read, so 0x8000..0xFFFF come back
+negative. That sign is preserved here rather than normalised, so the values match
+`ModelDefinition.faceColors` (also `short`) that a recolour pass compares them
+against. `HeadIconSpriteIndex` is a `short[]` in Java too, but its source
+(`ReadUShortSmartMinusOne`) only spans -1..32766, so no value ever wraps.
+
+Records with dynamic-array fields alias those arrays when copied (see
+`TEntityOps`), so use one `TNpcDefinition` per definition and never copy one and
+mutate the copy. `Load` calls `Default` itself, so every load gets fresh arrays.
+*)
+{$DEFINE WL_CACHE_DEF_NPC_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_ENTITYOPS_INCLUDED}{$INCLUDE_ONCE entityops.simba}{$ENDIF}
+
+const
+  // NpcDefinition.stats is a fixed 6-slot array filled by opcodes 74..79.
+  NPC_STAT_COUNT: Integer = 6;
+
+type
+  TNpcDefinition = record
+    Id: Integer;
+    Name: String;
+    Size: Integer;
+    Models, ChatheadModels: TIntegerArray;
+
+    StandingAnimation, WalkingAnimation: Integer;
+    IdleRotateLeftAnimation, IdleRotateRightAnimation: Integer;
+    Rotate180Animation, RotateLeftAnimation, RotateRightAnimation: Integer;
+    RunAnimation, RunRotate180Animation: Integer;
+    RunRotateLeftAnimation, RunRotateRightAnimation: Integer;
+    CrawlAnimation, CrawlRotate180Animation: Integer;
+    CrawlRotateLeftAnimation, CrawlRotateRightAnimation: Integer;
+
+    RecolorToFind, RecolorToReplace: TIntegerArray;
+    RetextureToFind, RetextureToReplace: TIntegerArray;
+
+    Ops: TEntityOps;
+    Params: TCacheParams;
+
+    Category: Integer;
+    CombatLevel: Integer;
+    Stats: TIntegerArray;
+
+    WidthScale, HeightScale, Height: Integer;
+    RenderPriority, Ambient, Contrast, RotationSpeed: Integer;
+    FootprintSize, OverlapTintHSL: Integer;
+
+    HeadIconArchiveIds, HeadIconSpriteIndex: TIntegerArray;
+    Configs: TIntegerArray;
+    VarbitId, VarpIndex: Integer;
+
+    IsMinimapVisible, IsInteractable, RotationFlag: Boolean;
+    IsFollower, LowPriorityFollowerOps: Boolean;
+    CanHideForOverlap, Unknown1, IdleAnimRestart: Boolean;
+    // Note the inverted sense: opcode 147 clears this, it does not set it.
+    Zbuf: Boolean;
+  end;
+
+(*
+## TNpcDefinition.Default
+```pascal
+function TNpcDefinition.Default(id: Integer): TNpcDefinition; static;
+```
+Every field at the value `NpcDefinition.java` gives it before any opcode runs.
+The non-obvious ones: `Name` is the literal string `'null'` (not empty),
+`RotationSpeed` is 32, `OverlapTintHSL` is 39188, `Category` is 0 (not -1 - it is
+a plain `int` field with no initialiser in the Java) and `FootprintSize` starts at
+-1 as the sentinel `Load`'s post step tests for.
+*)
+function TNpcDefinition.Default(id: Integer): TNpcDefinition; static;
+var
+  i: Integer;
+begin
+  Result.Id := id;
+  Result.Name := 'null';
+  Result.Size := 1;
+
+  Result.StandingAnimation := -1;
+  Result.WalkingAnimation := -1;
+  Result.IdleRotateLeftAnimation := -1;
+  Result.IdleRotateRightAnimation := -1;
+  Result.Rotate180Animation := -1;
+  Result.RotateLeftAnimation := -1;
+  Result.RotateRightAnimation := -1;
+  Result.RunAnimation := -1;
+  Result.RunRotate180Animation := -1;
+  Result.RunRotateLeftAnimation := -1;
+  Result.RunRotateRightAnimation := -1;
+  Result.CrawlAnimation := -1;
+  Result.CrawlRotate180Animation := -1;
+  Result.CrawlRotateLeftAnimation := -1;
+  Result.CrawlRotateRightAnimation := -1;
+
+  Result.Ops := TEntityOps.Create();
+
+  Result.CombatLevel := -1;
+  Result.WidthScale := 128;
+  Result.HeightScale := 128;
+  Result.RotationSpeed := 32;
+  Result.VarbitId := -1;
+  Result.VarpIndex := -1;
+  Result.Height := -1;
+  Result.FootprintSize := -1;
+  Result.OverlapTintHSL := 39188;
+
+  Result.IsMinimapVisible := True;
+  Result.IsInteractable := True;
+  Result.RotationFlag := True;
+  Result.Zbuf := True;
+
+  SetLength(Result.Stats, NPC_STAT_COUNT);
+  for i := 0 to NPC_STAT_COUNT - 1 do
+    Result.Stats[i] := 1;
+end;
+
+(*
+## TNpcDefinition.Load
+```pascal
+function TNpcDefinition.Load(id: Integer; data: TByteArray): TNpcDefinition; static;
+```
+Decodes one NPC definition. `data` is a single file out of
+`TCacheStore.ReadFiles(2, Ord(EConfigType.NPC), [])`, and `id` is the matching
+entry of the reference table's `FileIds` - not the array position, though for the
+NPC archive the two happen to coincide today.
+
+Reads opcodes until the 0 terminator, then applies the post step from
+`NpcLoader.post`: an unset `FootprintSize` becomes `0.4 * Size * 128` truncated.
+The Java does that in **float**, this in double, and the two agree for every
+`Size` a u8 can hold - 0.4 rounds up in both, so the product sits a fraction of
+an ulp above the exact 51.2 * `Size` and truncates the same way. The exact form
+is `(Size * 256) div 5`; `dev/tests/250_npc.simba` pins the identity over 0..255.
+
+Raises on an opcode the loader does not know, and again if the definition does
+not end exactly on its terminator - both name the npc id and the byte offset.
+*)
+function TNpcDefinition.Load(id: Integer; data: TByteArray): TNpcDefinition; static;
+var
+  s: TByteStream;
+  opcode, n, i, bitfield, bits, extra: Integer;
+begin
+  Result := TNpcDefinition.Default(id);
+  s := TByteStream.Create(data);
+
+  while True do
+  begin
+    opcode := s.ReadUByte();
+    if opcode = 0 then Break;
+
+    case opcode of
+      1: begin
+           n := s.ReadUByte();
+           SetLength(Result.Models, n);
+           for i := 0 to n - 1 do
+             Result.Models[i] := s.ReadUShort();
+         end;
+
+      2: Result.Name := s.ReadJagexString();
+
+      12: Result.Size := s.ReadUByte();
+      13: Result.StandingAnimation := s.ReadUShort();
+      14: Result.WalkingAnimation := s.ReadUShort();
+      15: Result.IdleRotateLeftAnimation := s.ReadUShort();
+      16: Result.IdleRotateRightAnimation := s.ReadUShort();
+
+      17: begin
+            Result.WalkingAnimation := s.ReadUShort();
+            Result.Rotate180Animation := s.ReadUShort();
+            Result.RotateLeftAnimation := s.ReadUShort();
+            Result.RotateRightAnimation := s.ReadUShort();
+          end;
+
+      18: Result.Category := s.ReadUShort();
+
+      30..34: Result.Ops.DecodeOp(s, opcode - 30);
+
+      // Java stores these as short[], so a u16 over 32767 comes back negative.
+      40: begin
+            n := s.ReadUByte();
+            SetLength(Result.RecolorToFind, n);
+            SetLength(Result.RecolorToReplace, n);
+            for i := 0 to n - 1 do
+            begin
+              Result.RecolorToFind[i] := s.ReadShort();
+              Result.RecolorToReplace[i] := s.ReadShort();
+            end;
+          end;
+
+      41: begin
+            n := s.ReadUByte();
+            SetLength(Result.RetextureToFind, n);
+            SetLength(Result.RetextureToReplace, n);
+            for i := 0 to n - 1 do
+            begin
+              Result.RetextureToFind[i] := s.ReadShort();
+              Result.RetextureToReplace[i] := s.ReadShort();
+            end;
+          end;
+
+      60: begin
+            n := s.ReadUByte();
+            SetLength(Result.ChatheadModels, n);
+            for i := 0 to n - 1 do
+              Result.ChatheadModels[i] := s.ReadUShort();
+          end;
+
+      // 61/62 are 1/60 with 32-bit model ids.
+      61: begin
+            n := s.ReadUByte();
+            SetLength(Result.Models, n);
+            for i := 0 to n - 1 do
+              Result.Models[i] := s.ReadInt();
+          end;
+
+      62: begin
+            n := s.ReadUByte();
+            SetLength(Result.ChatheadModels, n);
+            for i := 0 to n - 1 do
+              Result.ChatheadModels[i] := s.ReadInt();
+          end;
+
+      74..79: Result.Stats[opcode - 74] := s.ReadUShort();
+
+      93: Result.IsMinimapVisible := False;
+      95: Result.CombatLevel := s.ReadUShort();
+      97: Result.WidthScale := s.ReadUShort();
+      98: Result.HeightScale := s.ReadUShort();
+      99: Result.RenderPriority := 1;
+
+      100: Result.Ambient := s.ReadByte();
+      // Stored RAW, matching the cache byte, RuneLite's NpcLoader, and the
+      // committed npcs.zip - same convention as TItemDefinition.Contrast.
+      //
+      // A renderer MUST scale it by 5 first. Decompiled client:
+      // LostCityRS/OS1 NpcType.java:241 `this.contrast = buf.g1b() * 5`,
+      // consumed at :317 as `light(ambient + 64, contrast + 850, -30, -50, -30)`
+      // - note NPCs use +850 and light vector (-30,-50,-30), where items use
+      // +768 and (-50,-10,-50). See docs/phase2-render-spec.md.
+      101: Result.Contrast := s.ReadByte();
+
+      // Head icons (prayer/skull overlays), one slot per set bit of a u8
+      // bitfield. `bits` is the bitfield's bit *length*, so the trailing zero
+      // bits below the highest set one still get a slot - filled with -1/-1 and
+      // consuming nothing.
+      102: begin
+             bitfield := s.ReadUByte();
+             bits := 0;
+             i := bitfield;
+             while i <> 0 do
+             begin
+               Inc(bits);
+               i := i shr 1;
+             end;
+
+             SetLength(Result.HeadIconArchiveIds, bits);
+             SetLength(Result.HeadIconSpriteIndex, bits);
+             for i := 0 to bits - 1 do
+               if (bitfield and (1 shl i)) = 0 then
+               begin
+                 Result.HeadIconArchiveIds[i] := -1;
+                 Result.HeadIconSpriteIndex[i] := -1;
+               end
+               else
+               begin
+                 Result.HeadIconArchiveIds[i] := s.ReadBigSmart2();
+                 Result.HeadIconSpriteIndex[i] := s.ReadUShortSmartMinusOne();
+               end;
+           end;
+
+      103: Result.RotationSpeed := s.ReadUShort();
+
+      // 106 and 118 differ only in the last Configs slot: -1 versus the extra
+      // u16 that 118 reads up front. Both size the array n + 2 and fill n + 1.
+      106, 118: begin
+                  Result.VarbitId := s.ReadUShort();
+                  if Result.VarbitId = 65535 then Result.VarbitId := -1;
+
+                  Result.VarpIndex := s.ReadUShort();
+                  if Result.VarpIndex = 65535 then Result.VarpIndex := -1;
+
+                  extra := -1;
+                  if opcode = 118 then
+                  begin
+                    extra := s.ReadUShort();
+                    if extra = 65535 then extra := -1;
+                  end;
+
+                  n := s.ReadUByte();
+                  SetLength(Result.Configs, n + 2);
+                  for i := 0 to n do
+                  begin
+                    Result.Configs[i] := s.ReadUShort();
+                    if Result.Configs[i] = 65535 then Result.Configs[i] := -1;
+                  end;
+                  Result.Configs[n + 1] := extra;
+                end;
+
+      107: Result.IsInteractable := False;
+      109: Result.RotationFlag := False;
+      // rev233; before 220 this was IsFollower + LowPriorityFollowerOps.
+      111: Result.RenderPriority := 2;
+
+      114: Result.RunAnimation := s.ReadUShort();
+      115: begin
+             Result.RunAnimation := s.ReadUShort();
+             Result.RunRotate180Animation := s.ReadUShort();
+             Result.RunRotateLeftAnimation := s.ReadUShort();
+             Result.RunRotateRightAnimation := s.ReadUShort();
+           end;
+
+      116: Result.CrawlAnimation := s.ReadUShort();
+      117: begin
+             Result.CrawlAnimation := s.ReadUShort();
+             Result.CrawlRotate180Animation := s.ReadUShort();
+             Result.CrawlRotateLeftAnimation := s.ReadUShort();
+             Result.CrawlRotateRightAnimation := s.ReadUShort();
+           end;
+
+      122: Result.IsFollower := True;
+      123: Result.LowPriorityFollowerOps := True;
+      124: Result.Height := s.ReadUShort();
+      126: Result.FootprintSize := s.ReadUShort();
+      129: Result.Unknown1 := True;
+      // 130 and 147 are upstream-only, see the unit docstring.
+      130: Result.IdleAnimRestart := True;
+      145: Result.CanHideForOverlap := True;
+      146: Result.OverlapTintHSL := s.ReadUShort();
+      147: Result.Zbuf := False;
+
+      249: Result.Params := s.ReadParams();
+
+      251: Result.Ops.DecodeSubOp(s);
+      252: Result.Ops.DecodeConditionalOp(s);
+      253: Result.Ops.DecodeConditionalSubOp(s);
+
+      else
+        raise 'NpcDefinition: unknown opcode ' + ToStr(opcode) + ' for npc ' +
+              ToStr(id) + ' at offset ' + ToStr(s.Position - 1);
+    end;
+  end;
+
+  if s.Remaining() <> 0 then
+    raise 'NpcDefinition: npc ' + ToStr(id) + ' left ' + ToStr(s.Remaining()) +
+          ' byte(s) unread after its terminator at offset ' + ToStr(s.Position - 1);
+
+  // post - NpcLoader.java:73-79.
+  if Result.FootprintSize = -1 then
+    Result.FootprintSize := Trunc(0.4 * (Result.Size * 128));
+end;

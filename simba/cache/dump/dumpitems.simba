@@ -1,0 +1,284 @@
+(*
+# Dump Item Finder
+Builds the cache-derived half of `finders/items`: the rendered PNG members,
+their Finder hashes and the `items.bin`/`items.zip` transport bundle.  The
+source of truth for the 36x32 pixels is RenderItemSpriteFromSource; this unit
+only performs the asset-side post-processing used by update_items.simba.
+*)
+{$DEFINE WL_CACHE_DUMP_ITEMS_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ZIPWRITER_INCLUDED}{$INCLUDE_ONCE zipwriter.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_RENDER_ITEMSPRITE_INCLUDED}{$INCLUDE_ONCE render/itemsprite.simba}{$ENDIF}
+
+const
+  ITEM_DUMP_WIDTH: Integer = 36;
+  ITEM_DUMP_HEIGHT: Integer = 32;
+  ITEM_DUMP_SHADOW: Integer = $302020;
+
+type
+  TItemDumpRow = record
+    Id: Integer;
+    Name, RawHash, Hash, BorderHash: String;
+    Image, Mask: TImage;
+    PNG: TByteArray;
+  end;
+
+  TItemDumpRows = array of TItemDumpRow;
+
+function CompareItemDumpRow(constref a, b: TItemDumpRow): Integer;
+begin
+  Result := a.Id - b.Id;
+end;
+
+function ItemDumpImage(pixels: TIntegerArray): TImage;
+var
+  data: PColorBGRA;
+  i, rgb: Integer;
+begin
+  if Length(pixels) <> ITEM_DUMP_WIDTH * ITEM_DUMP_HEIGHT then
+    raise 'DumpItems: expected a 36x32 sprite';
+  Result := new TImage(ITEM_DUMP_WIDTH, ITEM_DUMP_HEIGHT);
+  data := Result.Data;
+  for i := 0 to High(pixels) do
+  begin
+    rgb := pixels[i] and $FFFFFF;
+    data[i]^.R := (rgb shr 16) and $FF;
+    data[i]^.G := (rgb shr 8) and $FF;
+    data[i]^.B := rgb and $FF;
+    // RGB zero is the renderer's transparent canvas. Preserve it in the
+    // inspectable corpus; post-processing makes its own copy opaque for the
+    // runtime Finder hashes.
+    if rgb = 0 then data[i]^.A := $00 else data[i]^.A := $FF;
+  end;
+end;
+
+procedure _ItemPNGPutU32BE(var data: TByteArray; var pos: Integer; value: Int64);
+begin
+  data[pos] := (value shr 24) and $FF; Inc(pos);
+  data[pos] := (value shr 16) and $FF; Inc(pos);
+  data[pos] := (value shr 8) and $FF; Inc(pos);
+  data[pos] := value and $FF; Inc(pos);
+end;
+
+procedure _ItemPNGChunk(var output: TByteArray; var pos: Integer; tag: String;
+                        payload: TByteArray);
+var
+  crcData: TByteArray;
+  crc: String;
+  i: Integer;
+begin
+  if Length(tag) <> 4 then raise 'DumpItems: PNG chunk tag must be four bytes';
+  _ItemPNGPutU32BE(output, pos, Length(payload));
+  for i := 1 to 4 do begin output[pos] := Ord(tag[i]); Inc(pos); end;
+  if Length(payload) > 0 then
+  begin
+    Move(payload[0], output[pos], Length(payload));
+    pos += Length(payload);
+  end;
+  SetLength(crcData, 4 + Length(payload));
+  for i := 1 to 4 do crcData[i - 1] := Ord(tag[i]);
+  if Length(payload) > 0 then Move(payload[0], crcData[4], Length(payload));
+  crc := ZipCRC32(crcData);
+  for i := 0 to 3 do
+  begin
+    output[pos] := StrToInt('$' + Copy(crc, i * 2 + 1, 2));
+    Inc(pos);
+  end;
+end;
+
+function ItemDumpPNGRaw(img: TImage): TByteArray;
+var
+  data: PColorBGRA;
+  pos, x, y, i: Integer;
+begin
+  SetLength(Result, img.Height * (1 + img.Width * 4));
+  data := img.Data;
+  pos := 0;
+  for y := 0 to img.Height - 1 do
+  begin
+    Result[pos] := 0; Inc(pos); // PNG filter: None.
+    for x := 0 to img.Width - 1 do
+    begin
+      i := y * img.Width + x;
+      Result[pos] := data[i]^.R; Inc(pos);
+      Result[pos] := data[i]^.G; Inc(pos);
+      Result[pos] := data[i]^.B; Inc(pos);
+      Result[pos] := data[i]^.A; Inc(pos);
+    end;
+  end;
+end;
+
+function ItemDumpPNG(img: TImage): TByteArray;
+var
+  raw, zlib, ihdr: TByteArray;
+  pos: Integer;
+begin
+  raw := ItemDumpPNGRaw(img);
+  zlib := CompressBytes(ECompressAlgo.ZLIB, raw);
+  SetLength(ihdr, 13);
+  pos := 0;
+  _ItemPNGPutU32BE(ihdr, pos, img.Width);
+  _ItemPNGPutU32BE(ihdr, pos, img.Height);
+  ihdr[pos] := 8; Inc(pos);
+  ihdr[pos] := 6; Inc(pos); // RGBA
+  ihdr[pos] := 0; Inc(pos);
+  ihdr[pos] := 0; Inc(pos);
+  ihdr[pos] := 0;
+  SetLength(Result, 8 + 12 + Length(ihdr) + 12 + Length(zlib) + 12);
+  Result[0] := $89; Result[1] := $50; Result[2] := $4E; Result[3] := $47;
+  Result[4] := $0D; Result[5] := $0A; Result[6] := $1A; Result[7] := $0A;
+  pos := 8;
+  _ItemPNGChunk(Result, pos, 'IHDR', ihdr);
+  _ItemPNGChunk(Result, pos, 'IDAT', zlib);
+  _ItemPNGChunk(Result, pos, 'IEND', []);
+end;
+
+procedure ItemDumpPostProcess(img: TImage; out itemHash, borderHash: String; out mask: TImage);
+var
+  border: TImage;
+  tpa: TPointArray;
+begin
+  img.FillWithAlpha($FF);
+  // Simba TColor is BGR: RGB $302020 is BGR $202030.
+  img.ReplaceColor($202030, $0);
+  tpa := img.FindColor($010000, 0, [0, 9, 35, 31]);
+  img.DrawColor := $0;
+  img.DrawBoxFilled([0, 0, 35, 8]);
+
+  border := new TImage(36, 32);
+  border.DrawColor := $FFFFFF;
+  border.DrawTPA(tpa);
+  borderHash := HashData(EHashAlgo.CRC32, border.Data, 4608);
+  itemHash := HashData(EHashAlgo.CRC32, img.Data, 4608);
+
+  mask := new TImage(36, 32);
+  mask.DrawColor := $FFFFFF;
+  mask.DrawTPA(img.FindColor($0, 0, [0, 9, 35, 31]).Invert());
+end;
+
+function ItemDumpName(var source: TItemSpriteSource; id: Integer): String;
+var
+  raw, base: TItemDefinition;
+begin
+  raw := ItemSpriteSourceRaw(source, id);
+  if raw.NotedTemplate <> -1 then
+  begin
+    base := ItemSpriteSourceLinked(source, raw.NotedId);
+    Exit('noted ' + LowerCase(base.Name));
+  end;
+  if SameText(raw.Name, 'null') or (raw.Name = '') then Exit('');
+  Result := LowerCase(raw.Name);
+end;
+
+procedure ItemDumpAppend(var rows: TItemDumpRows; var source: TItemSpriteSource;
+                         id: Integer; name: String);
+var
+  row: TItemDumpRow;
+  processed: TImage;
+  i: Integer;
+begin
+  if name = '' then Exit;
+  RenderItemSpriteFromSource(source, id, 1, 1, ITEM_DUMP_SHADOW, False);
+  row.Id := id;
+  row.Name := name;
+  row.Image := ItemDumpImage(graphicsPixels);
+  row.PNG := ItemDumpPNG(row.Image);
+  row.RawHash := HashData(EHashAlgo.CRC32, row.Image.Data, 4608);
+  for i := 0 to High(rows) do
+    if (rows[i].Name = row.Name) and (rows[i].RawHash = row.RawHash) then Exit;
+  // items.bin stores the original icon; update_items mutates a separately
+  // loaded image only for its hash/mask calculation.
+  processed := ItemDumpImage(graphicsPixels);
+  ItemDumpPostProcess(processed, row.Hash, row.BorderHash, row.Mask);
+  rows += row;
+end;
+
+procedure DumpItemFinder(var store: TCacheStore; var dump: TAssetDump);
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids, positions: TIntegerArray;
+  source: TItemSpriteSource;
+  raw: TItemDefinition;
+  rows: TItemDumpRows;
+  uniqueRows: TItemDumpRows;
+  id, i, maxId: Integer;
+  name, hashes, names, idText: String;
+  seenBorders: TStringArray;
+  row: TItemDumpRow;
+  writer: TResourceWriter;
+  zip, imagesZip: TZipWriter;
+  bin: TByteArray;
+  j: Integer;
+  seen: Boolean;
+begin
+  BuildCircularAngle();
+  BuildPalette(JAGEX_BRIGHTNESS_MAX);
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.ITEM), []);
+  ids := table.Archives[table.IndexOfArchive(Ord(EConfigType.ITEM))].FileIds;
+  maxId := 0;
+  for i := 0 to High(ids) do if ids[i] > maxId then maxId := ids[i];
+  SetLength(positions, maxId + 1);
+  for i := 0 to maxId do positions[i] := -1;
+  for i := 0 to High(ids) do positions[ids[i]] := i;
+  ItemSpriteSourceSetup(source, store, files, positions);
+
+  // Scan sparse ids, not file positions: this is the numeric row order contract.
+  for id := 0 to maxId do
+  begin
+    if positions[id] < 0 then Continue;
+    raw := ItemSpriteSourceRaw(source, id);
+    name := ItemDumpName(source, id);
+    if name = '' then Continue;
+    // SimbaItemSpritesDumper emits stack variants before their base item, under
+    // the base name. This order decides the retained id for duplicates.
+    for j := 0 to High(raw.CountObj) do
+      if raw.CountObj[j] > 0 then ItemDumpAppend(rows, source, raw.CountObj[j], name);
+    ItemDumpAppend(rows, source, id, name);
+  end;
+
+  dump.Ensure('finders/items/data');
+  rows.Sort(@CompareItemDumpRow);
+  // Count-object links can reach one child through multiple parents. A resource
+  // bundle cannot carry two useful entries with the same `<id>.png` name; keep
+  // the first numeric-row representative, matching extraction's first row.
+  for i := 0 to High(rows) do
+    if (Length(uniqueRows) = 0) or (uniqueRows[High(uniqueRows)].Id <> rows[i].Id) then
+      uniqueRows += rows[i];
+  rows := uniqueRows;
+  writer := new TResourceWriter();
+  imagesZip.Init();
+  for i := 0 to High(rows) do
+  begin
+    // Store an explicit RGBA PNG before the runtime bundle's encoder
+    // normalises alpha. This stays entirely inside Simba's public API.
+    imagesZip.AddBytes(ToStr(rows[i].Id) + '.png', rows[i].PNG);
+    writer.AddImage(ToStr(rows[i].Id) + '.png', rows[i].Image);
+    idText += ToStr(rows[i].Id) + LINE_SEP;
+    names += rows[i].Name + LINE_SEP;
+    hashes += rows[i].Hash + LINE_SEP;
+  end;
+  // The resource contract is all item PNGs first, then the first mask for
+  // each border hash. Runtime lookups are by name, but this order is part of
+  // the established bundle format and keeps builds deterministic.
+  for i := 0 to High(rows) do
+  begin
+    seen := False;
+    for j := 0 to High(seenBorders) do
+      if seenBorders[j] = rows[i].BorderHash then seen := True;
+    if not seen then
+    begin
+      writer.AddImage(rows[i].BorderHash + '.bmp', rows[i].Mask);
+      seenBorders += rows[i].BorderHash;
+    end;
+  end;
+  writer.Save(dump.Path('finders/items/items.bin'));
+  imagesZip.Save(dump.Path('finders/items/items-imgs.zip'));
+  dump.SaveText('finders/items/data/id.txt', idText);
+  dump.SaveText('finders/items/data/item.txt', names);
+  dump.SaveText('finders/items/data/hash.txt', hashes);
+  bin := FileReadBytes(dump.Path('finders/items/items.bin'));
+  zip.Init(); zip.AddBytes('items.bin', bin); zip.Save(dump.Path('finders/items/items.zip'));
+end;

@@ -1,0 +1,628 @@
+(*
+# Dump Assets
+The orchestrator: the list of files an asset tree is allowed to contain, the
+`hashes.json` manifest written over it, and the registry that decides which
+dumpers run.
+
+Dependency-free in the same sense as the rest of `utils/cache/` - no
+`WaspLib/main.simba`, so no `GetDebugLn` and no `String` helper methods. Use
+the Lape built-ins (`LowerCase`, `SameText`, `Trim`) and `raise` a
+`'DumpAssets: ...'`-prefixed string on failure.
+
+## `hashes.json` is a version key, not a parity target
+
+Do not try to make this file match the one committed to `wasp-assets`. It
+cannot: the zips underneath it are written by {ref}`TZipWriter`, whose deflate
+is not the JDK's, so their CRC32s differ by construction. What matters is that
+every value is the **true** CRC32 of the file we actually shipped, because
+three separate consumers read it that way:
+
+- `TWLAssets.Update` (`utils/assets.simba:138`) compares
+  `HashFile(CRC32, path)` against the entry and re-downloads on mismatch;
+- `maploader.simba:292` and `mapjson.simba:43,49` name their cache directories
+  after the string;
+- `itemfinder.simba:155` does the same.
+
+A wrong-but-stable value would be silently accepted by all three. A value for a
+file that is not there would not: `HashFile` of a missing file returns `''`,
+which never equals the entry, so `TWLAssets.Update` would queue that path for
+download on every single run, forever.
+
+## Two deliberate divergences from `wasp-assets/tools/hash-files.simba`
+
+That script is the contract, and it is 26 lines: read the whitelist, skip the
+`hashes.json` line, `HashFile(CRC32, ...)` the rest, save with
+`[NO_WHITESPACE, SINGLE_LINE_OBJ]`. {ref}`WriteHashesJSON` reproduces it with
+two changes, both of which exist because this generator runs against a tree
+that is *not yet complete*:
+
+1. **A whitelist entry with no file on disk is omitted, with a warning.** The
+   Java pipeline always produced all 24; Phase 3 does not, and per the note
+   above an entry for a missing file is worse than no entry at all.
+2. **The number of files present is reported and returned**, so a partial dump
+   announces itself instead of looking like a successful full one.
+*)
+{$DEFINE WL_CACHE_DUMP_ASSETS_INCLUDED}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+// Every dumper the registry can name. This unit is the one place that knows
+// the full set, which is what lets `dev/tests/490_endtoend.simba` and
+// `WaspLib/tools/dump_assets.simba` agree on it without transcribing it twice.
+// Item rendering is registered below through dumpitems.simba.
+{$IFNDEF WL_CACHE_DUMP_STATIC_INCLUDED}{$INCLUDE_ONCE dumpstatic.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ITEMDEFS_INCLUDED}{$INCLUDE_ONCE dumpitemdefs.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ITEMS_INCLUDED}{$INCLUDE_ONCE dumpitems.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_OBJECTS_INCLUDED}{$INCLUDE_ONCE dumpobjects.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_NPCS_INCLUDED}{$INCLUDE_ONCE dumpnpcs.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_NPCSPAWNS_INCLUDED}{$INCLUDE_ONCE dumpnpcspawns.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_MAPDATA_INCLUDED}{$INCLUDE_ONCE map/mapdata.simba}{$ENDIF}
+
+const
+(*
+## ASSET_WHITELIST
+```pascal
+ASSET_WHITELIST: TStringArray
+```
+Every file `hashes.json` may list, copied verbatim from
+`wasp-assets/tools/whitelist.txt` including its `hashes.json` line and its
+order - {ref}`WriteHashesJSON` drops the self-reference itself, exactly as
+`hash-files.simba` does, so the two lists stay diffable line for line.
+
+Paths are spelled with `/` because that is what ends up in the manifest, and
+what `TWLAssets.Update` appends to the assets URL. They are resolved against
+`PATH_SEP` on the way to the filesystem.
+
+`jsons/monsters` is a real, extensionless file (38869 bytes in the committed
+tree), not a directory - do not "fix" it to `jsons/monsters.json`.
+
+The `1400` whitelist is deliberately absent: it belongs to the dead Simba 1400
+generation and is never a target.
+*)
+  ASSET_WHITELIST: TStringArray = [
+    'hashes.json',
+    'finders/house_layout.zip',
+    'finders/items/data/hash.txt',
+    'finders/items/data/id.txt',
+    'finders/items/data/item.txt',
+    'finders/items/items.zip',
+    'finders/overheads.zip',
+    'finders/prayer.zip',
+    'finders/spells.zip',
+    'fonts/fonts.zip',
+    'images/equipment.png',
+    'images/gametab.png',
+    'images/mm_fixed_mask.png',
+    'images/mm_resizable_mask.png',
+    'images/skills.zip',
+    'jsons/consumables.json',
+    'jsons/consumables.zip',
+    'jsons/gear.json',
+    'jsons/item-definitions.zip',
+    'jsons/monsters',
+    'jsons/monsters.zip',
+    'jsons/weapons.json',
+    'map/mapdata.zip',
+    'map/objects.zip',
+    'map/npcs.zip'
+  ];
+
+(*
+## AssetHashablePaths
+```pascal
+function AssetHashablePaths(whitelist: TStringArray): TStringArray;
+```
+The subset of `whitelist` that {ref}`WriteHashesJSON` may hash: trimmed, blanks
+dropped, and the `hashes.json` self-reference removed. For
+{ref}`ASSET_WHITELIST` that is 24 of the 25 entries.
+
+Split out rather than inlined into the loop so the self-reference rule can be
+tested on its own. It cannot be observed through the written manifest: the
+manifest is deleted before the loop starts, so `FileExists` is already `False`
+by the time the loop reaches it, and dropping the rule would silently degrade
+into "omitted because it does not exist yet" - a right answer for a wrong
+reason.
+
+Blank entries exist because the natural caller is
+`FileReadLines(whitelist.txt)`, and a file ending in a newline yields a trailing
+empty line.
+
+The match is case-insensitive: `SameText` is the ASCII `equalsIgnoreCase` and
+is the right granularity here, since the name is a fixed ASCII literal.
+*)
+function AssetHashablePaths(whitelist: TStringArray): TStringArray;
+var
+  i: Integer;
+  entry: String;
+begin
+  for i := 0 to High(whitelist) do
+  begin
+    entry := Trim(whitelist[i]);
+    if entry = '' then Continue;
+    // The manifest cannot contain its own hash: it would have to be written
+    // before it could be read. hash-files.simba skips the line the same way.
+    if SameText(entry, 'hashes.json') then Continue;
+    Result += entry;
+  end;
+end;
+
+(*
+## WriteHashesJSON
+```pascal
+function WriteHashesJSON(root: String; whitelist: TStringArray): Integer;
+```
+Writes `root/hashes.json`: one `"<whitelist path>": "<CRC32>"` pair per
+{ref}`AssetHashablePaths` entry that exists on disk. Returns how many were
+hashed, and reports that against how many were eligible.
+
+`root` may be spelled with or without a trailing separator, and with `/` on any
+host. Missing files produce a warning on stdout and no entry.
+
+Saved with `[NO_WHITESPACE, SINGLE_LINE_OBJ]`, the two options
+`hash-files.simba` uses, so the output is one line with no spaces:
+`{"jsons/weapons.json":"55BC801D",...}`. An empty manifest is `{}`.
+
+The `FileDelete` mirrors `hash-files.simba` and bounds the damage if the write
+itself fails - a missing manifest is a loud failure, a stale one is a silent
+wrong answer. It is **not** needed for correctness of the happy path: measured
+on this build, `TJSONParser.Save` truncates an existing file rather than
+appending to it, so a longer previous manifest leaves no tail behind.
+
+Example:
+```pascal
+WriteHashesJSON('/tmp/assets/', ASSET_WHITELIST);
+// DumpAssets: 3 of 24 whitelist files present
+```
+*)
+function WriteHashesJSON(root: String; whitelist: TStringArray): Integer;
+var
+  json: TJSONParser;
+  base, path, hash: String;
+  hashable: TStringArray;
+  i: Integer;
+begin
+  if root = '' then
+    raise 'DumpAssets: empty root path';
+
+  base := _DumpNormSep(root);
+  if base[Length(base)] <> PATH_SEP[1] then
+    base += PATH_SEP;
+
+  FileDelete(base + 'hashes.json');
+
+  json := new TJSONParser();
+  hashable := AssetHashablePaths(whitelist);
+
+  for i := 0 to High(hashable) do
+  begin
+    path := base + _DumpNormSep(hashable[i]);
+    if not FileExists(path) then
+    begin
+      WriteLn('DumpAssets: WARNING not generated, omitted from hashes.json: ',
+              hashable[i]);
+      Continue;
+    end;
+
+    hash := HashFile(EHashAlgo.CRC32, path);
+    if hash = '' then
+      raise 'DumpAssets: could not hash "' + path + '"';
+
+    // The key keeps its forward slashes even where PATH_SEP is a backslash:
+    // consumers append it to a URL.
+    json.AddString(hashable[i], hash);
+    Inc(Result);
+  end;
+
+  WriteLn('DumpAssets: ', Result, ' of ', Length(hashable),
+          ' whitelist files present');
+
+  json.Save(base + 'hashes.json',
+            [EJSONFormatOption.NO_WHITESPACE, EJSONFormatOption.SINGLE_LINE_OBJ]);
+end;
+
+type
+(*
+## TAssetDumpContext
+```pascal
+TAssetDumpContext = record
+  Dump: TAssetDump;
+  Store: TCacheStore;
+  StaticDir: String;
+end;
+```
+Everything a dumper is handed: where to write, what to read from, and where the
+files no cache can produce are kept.
+
+One `TCacheStore` is shared across the whole run on purpose - it memoises
+reference tables and archive counts per instance, and a `TCacheStore` copied by
+value starts that cache cold, so each dumper opening its own would re-read
+every reference table it touches.
+
+`StaticDir` is only read by {ref}`DumpAssetsStatic`; it is a `wasp-assets`-shaped
+directory and {ref}`TAssetDumpRun.Setup` clears it, so a caller that wants the
+static step must assign it **after** `Setup`. Empty is a hard error at copy
+time rather than a silent skip - see {ref}`DumpStaticAssets`.
+*)
+  TAssetDumpContext = record
+    Dump: TAssetDump;
+    Store: TCacheStore;
+    StaticDir: String;
+  end;
+
+(*
+## TAssetDumperProc
+```pascal
+TAssetDumperProc = procedure(var ctx: TAssetDumpContext);
+```
+The shape every registered dumper has. `ctx` is `var` so the shared store's
+caches survive the call.
+*)
+  TAssetDumperProc = procedure(var ctx: TAssetDumpContext);
+
+(*
+## TAssetDumpRun
+```pascal
+TAssetDumpRun = record
+  Context: TAssetDumpContext;
+  Names: TStringArray;
+  Dumpers: array of TAssetDumperProc;
+  Whitelist: TStringArray;
+  Only: String;
+end;
+```
+One end-to-end generation: open a cache, run some dumpers over an output tree,
+write the manifest.
+
+`Names` and `Dumpers` are parallel and ordered - dumpers run in registration
+order, which is the only ordering guarantee later tasks may rely on. `Only`, if
+set, restricts the run to the single dumper of that name.
+*)
+  TAssetDumpRun = record
+    Context: TAssetDumpContext;
+    Names: TStringArray;
+    Dumpers: array of TAssetDumperProc;
+    Whitelist: TStringArray;
+    Only: String;
+  end;
+
+(*
+## TAssetDumpRun.Setup
+```pascal
+procedure TAssetDumpRun.Setup(cacheDir, outDir: String);
+```
+Opens the cache at `cacheDir`, points the output at `outDir` (created if
+missing), and arms the run with {ref}`ASSET_WHITELIST` and an empty registry.
+
+Required before every use: a record local is not zero-filled per call and
+`SetLength` preserves the overlapping prefix, so a stale registry would
+otherwise leak into the next run.
+*)
+procedure TAssetDumpRun.Setup(cacheDir, outDir: String);
+begin
+  if cacheDir = '' then
+    raise 'DumpAssets: no cache directory';
+
+  Self.Names := [];
+  Self.Dumpers := [];
+  Self.Only := '';
+  Self.Whitelist := Copy(ASSET_WHITELIST);
+  // Cleared, not defaulted: a record local is not zero-filled per call, so a
+  // second run in one process would otherwise inherit the first one's source
+  // directory. The caller assigns it after this returns.
+  Self.Context.StaticDir := '';
+
+  Self.Context.Dump.Setup(outDir);
+  Self.Context.Store := TCacheStore.Create(cacheDir);
+end;
+
+(*
+## TAssetDumpRun.IndexOf
+```pascal
+function TAssetDumpRun.IndexOf(name: String): Integer;
+```
+Registration index of the dumper called `name`, or `-1`. Case-insensitive, so
+`--only=Items` finds `items`.
+*)
+function TAssetDumpRun.IndexOf(name: String): Integer;
+var
+  i: Integer;
+begin
+  for i := 0 to High(Self.Names) do
+    if SameText(Self.Names[i], name) then
+      Exit(i);
+  Result := -1;
+end;
+
+(*
+## TAssetDumpRun.Register
+```pascal
+procedure TAssetDumpRun.Register(name: String; dumper: TAssetDumperProc);
+```
+Appends `dumper` to the run under `name`, which is what `--only` matches and
+what the per-dumper progress line prints.
+
+Duplicate names raise: two dumpers answering to one name would make `--only`
+silently run whichever was registered first.
+*)
+procedure TAssetDumpRun.Register(name: String; dumper: TAssetDumperProc);
+begin
+  if Trim(name) = '' then
+    raise 'DumpAssets: a dumper needs a name';
+  if Self.IndexOf(name) > -1 then
+    raise 'DumpAssets: duplicate dumper name "' + name + '"';
+
+  Self.Names += Trim(name);
+  // `@dumper`, not `dumper`: auto-invoke is on in this unit, so a bare
+  // procedural value in an expression is *called* rather than read, and
+  // `Self.Dumpers += dumper` fails to compile with "No default value for
+  // parameter 1". `@` on a procedural variable yields the pointer it holds,
+  // not the address of the local slot.
+  Self.Dumpers += @dumper;
+end;
+
+(*
+## TAssetDumpRun.Execute
+```pascal
+function TAssetDumpRun.Execute(): Integer;
+```
+Runs the registered dumpers in registration order and returns how many ran.
+
+With `Only` set, only that one runs; naming a dumper that is not registered
+raises rather than quietly producing an empty tree, which is the whole point of
+having the filter checked up front.
+
+An empty registry is not an error - it is the state Phase 3 starts in, and the
+manifest still needs writing over whatever the tree already holds.
+
+Each dumper's wall clock is printed as it finishes. The run is minutes long and
+one dumper accounts for most of it, so a total alone would say nothing about
+where the time went.
+*)
+function TAssetDumpRun.Execute(): Integer;
+var
+  i: Integer;
+  t: Double;
+begin
+  if Self.Only <> '' then
+  begin
+    i := Self.IndexOf(Self.Only);
+    if i < 0 then
+      raise 'DumpAssets: no dumper called "' + Self.Only + '" (registered: ' +
+            ToStr(Self.Names) + ')';
+
+    WriteLn('DumpAssets: running ', Self.Names[i]);
+    t := PerformanceTime();
+    Self.Dumpers[i](Self.Context);
+    WriteLn('DumpAssets: ', Self.Names[i], ' took ',
+            Round(PerformanceTime() - t), ' ms');
+    Exit(1);
+  end;
+
+  for i := 0 to High(Self.Dumpers) do
+  begin
+    WriteLn('DumpAssets: running ', Self.Names[i]);
+    t := PerformanceTime();
+    Self.Dumpers[i](Self.Context);
+    WriteLn('DumpAssets: ', Self.Names[i], ' took ',
+            Round(PerformanceTime() - t), ' ms');
+    Inc(Result);
+  end;
+end;
+
+(*
+## TAssetDumpRun.WriteManifest
+```pascal
+function TAssetDumpRun.WriteManifest(): Integer;
+```
+Writes `hashes.json` over the output tree and returns how many whitelist files
+were found. Thin wrapper over {ref}`WriteHashesJSON`.
+
+This runs after **every** invocation, including a `--only` one: the manifest
+covers the whole tree, so regenerating a single asset without rewriting it
+would leave that asset's recorded hash stale.
+*)
+function TAssetDumpRun.WriteManifest(): Integer;
+begin
+  Result := WriteHashesJSON(Self.Context.Dump.Root, Self.Whitelist);
+end;
+
+(**
+Re-hashes every declared asset in `root` and raises if the manifest is stale,
+contains an unexpected key, or (when `requireFull`) omits a whitelist file.
+Returns the number of verified entries. This is the native release gate used by
+the platform-neutral cache pipeline; it deliberately needs no WaspLib runtime
+environment or shell command.
+*)
+function VerifyAssetManifest(root: String; requireFull: Boolean): Integer;
+var
+  json: TJSONParser;
+  hashable: TStringArray;
+  base, path, want, got: String;
+  total, seen, i: Integer;
+begin
+  base := PathIncludeTrailingSep(root);
+  if not FileExists(base + 'hashes.json') then
+    raise 'DumpAssets: no hashes.json at ' + base;
+
+  json := new TJSONParser();
+  json.Load(base + 'hashes.json');
+  total := json.Count;
+  hashable := AssetHashablePaths(ASSET_WHITELIST);
+  for i := 0 to High(hashable) do
+  begin
+    if not json.Has(hashable[i]) then Continue;
+    Inc(seen);
+    want := json.Item[hashable[i]].AsString;
+    path := base + _DumpNormSep(hashable[i]);
+    if not FileExists(path) then
+      raise 'DumpAssets: manifest entry has no file: ' + hashable[i];
+    got := HashFile(EHashAlgo.CRC32, path);
+    if got <> want then
+      raise 'DumpAssets: stale manifest entry ' + hashable[i] +
+            ' (manifest ' + want + ', file ' + got + ')';
+    Inc(Result);
+  end;
+
+  if seen <> total then
+    raise 'DumpAssets: manifest has ' + ToStr(total - seen) +
+          ' non-whitelist entry/entries';
+  if requireFull and (total <> Length(hashable)) then
+    raise 'DumpAssets: incomplete manifest (' + ToStr(total) + '/' +
+          ToStr(Length(hashable)) + ' whitelist files)';
+end;
+
+(*
+## The registry
+Six one-line adapters and the procedure that registers them. Each adapter
+exists only to give a dumper the {ref}`TAssetDumperProc` shape and to name the
+whitelist path it writes to - the whitelist path is spelled **here**, in the
+orchestrator, so that the manifest's view of what a dumper produces and the
+dumper's own output path cannot drift apart.
+
+`Ensure` before each one because none of the dumpers create their own parent
+directory: `TZipWriter.Save` opens the file and nothing more.
+*)
+
+(*
+## DumpAssetsStatic
+```pascal
+procedure DumpAssetsStatic(var ctx: TAssetDumpContext);
+```
+Stages the 16 whitelist paths no cache can produce, out of `ctx.StaticDir`.
+See {ref}`DumpStaticAssets`.
+*)
+procedure DumpAssetsStatic(var ctx: TAssetDumpContext);
+begin
+  DumpStaticAssets(ctx.StaticDir, ctx.Dump,
+                   StaticAssetPaths(AssetHashablePaths(ASSET_WHITELIST),
+                                    GENERATED_ASSETS));
+end;
+
+(*
+## DumpAssetsItems
+```pascal
+procedure DumpAssetsItems(var ctx: TAssetDumpContext);
+```
+Writes `jsons/item-definitions.zip`. See {ref}`DumpItemDefinitions`.
+*)
+procedure DumpAssetsItems(var ctx: TAssetDumpContext);
+begin
+  ctx.Dump.Ensure('jsons');
+  DumpItemDefinitions(ctx.Store, ctx.Dump.Path('jsons/item-definitions.zip'));
+end;
+
+procedure DumpAssetsItemFinder(var ctx: TAssetDumpContext);
+begin
+  ctx.Dump.Ensure('finders/items/data');
+  DumpItemFinder(ctx.Store, ctx.Dump);
+end;
+
+(*
+## DumpAssetsObjects
+```pascal
+procedure DumpAssetsObjects(var ctx: TAssetDumpContext);
+```
+Writes `map/objects.zip`. See {ref}`DumpObjects`.
+*)
+procedure DumpAssetsObjects(var ctx: TAssetDumpContext);
+begin
+  ctx.Dump.Ensure('map');
+  DumpObjects(ctx.Store, ctx.Dump.Path('map/objects.zip'));
+end;
+
+(*
+## DumpAssetsNPCs
+```pascal
+procedure DumpAssetsNPCs(var ctx: TAssetDumpContext);
+```
+Writes both the cache-derived helper (`map/zips/npcs_helper.zip`) and the
+runtime asset (`map/npcs.zip`).  The latter additionally needs NPC spawn
+coordinates from `mejrs/data_osrs`, because those coordinates do not exist in
+the OSRS cache.
+
+The HTTP step is intentionally non-fatal.  A failed request logs the URL and
+warning, removes a potentially stale `map/npcs.zip`, and leaves all other
+assets available; `WriteHashesJSON` then truthfully omits that one path.
+*)
+procedure DumpAssetsNPCs(var ctx: TAssetDumpContext);
+var
+  helperZip, npcZip, source: String;
+begin
+  ctx.Dump.Ensure('map/zips');
+  ctx.Dump.Ensure('map');
+  helperZip := ctx.Dump.Path('map/zips/npcs_helper.zip');
+  npcZip := ctx.Dump.Path('map/npcs.zip');
+
+  DumpNPCHelper(ctx.Store, helperZip);
+  // Existing output trees are intentionally reused.  Do not let one failed
+  // fetch make an old, unverified NPC archive look freshly generated.
+  FileDelete(npcZip);
+  if FetchNPCSpawnData(NPC_SPAWN_URL, source) then
+    try
+      DumpNPCSpawns(helperZip, npcZip, source);
+    except
+      FileDelete(npcZip);
+      WriteLn('DumpNPCSpawns: WARNING merge failed: ', GetExceptionMessage(),
+              '; skipping map/npcs.zip');
+    end;
+end;
+
+(*
+## DumpAssetsMapData
+```pascal
+procedure DumpAssetsMapData(var ctx: TAssetDumpContext);
+```
+Writes `map/mapdata.zip` and leaves its bounded `.bin` shards in `map/bins/`.
+See {ref}`DumpMapData`.
+
+By far the most expensive dumper - minutes, and gigabytes of resident memory,
+because `TResourceWriter` holds an uncompressed copy of every entry until
+`Save` returns. Its per-family timings are printed rather than discarded, since
+that is the only thing that makes a slow run diagnosable from the console.
+*)
+procedure DumpAssetsMapData(var ctx: TAssetDumpContext);
+var
+  ms: TIntegerArray;
+begin
+  ctx.Dump.Ensure('map');
+  ms := DumpMapData(ctx.Store,
+                    ctx.Dump.Path('map/mapdata.zip'),
+                    ctx.Dump.Path('map/bins'));
+  WriteLn('DumpAssets:   map shards ', ms[0], ' ms, collision shards ', ms[1],
+          ' ms, heightmap shards ', ms[2], ' ms');
+end;
+
+(*
+## RegisterAssetDumpers
+```pascal
+procedure RegisterAssetDumpers(var run: TAssetDumpRun);
+```
+Arms `run` with every finished dumper, in dependency order. The name each takes
+is what `--only` matches.
+
+| name | writes |
+|---|---|
+| `static` | the 16 copied whitelist paths |
+| `items` | `jsons/item-definitions.zip` |
+| `itemfinder` | `finders/items/{items.zip,items.bin,items-imgs.zip,data/*.txt}` |
+| `objects` | `map/objects.zip` |
+| `npcs` | `map/zips/npcs_helper.zip` + `map/npcs.zip` |
+| `mapdata` | `map/mapdata.zip` + `map/bins/*.bin` |
+
+The order is a real ordering and not an alphabetisation: `static` first because
+it needs no cache at all, so a wrong `--cache` still fails before minutes are
+spent; `mapdata` last because it is the one that costs minutes and gigabytes,
+and a run that dies in it should leave everything cheap already on disk.
+
+`itemfinder` is registered separately from `items`: the former emits the
+runtime Finder bundle while the latter emits definition JSON. Both are
+cache-derived and both are covered by the manifest.
+*)
+procedure RegisterAssetDumpers(var run: TAssetDumpRun);
+begin
+  run.Register('static',  @DumpAssetsStatic);
+  run.Register('items',   @DumpAssetsItems);
+  run.Register('itemfinder', @DumpAssetsItemFinder);
+  run.Register('objects', @DumpAssetsObjects);
+  run.Register('npcs',    @DumpAssetsNPCs);
+  run.Register('mapdata', @DumpAssetsMapData);
+end;

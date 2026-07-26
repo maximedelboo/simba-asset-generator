@@ -1,0 +1,196 @@
+(*
+# JagexColor
+The client's packed-HSL colour format and the HSL -> RGB transform that turns it
+into pixels. Ported from `net.runelite.cache.models.JagexColor`.
+
+Model faces, object colour overrides and NPC recolours are all stored as packed
+HSL shorts, so anything that renders or reports a colour goes through here.
+
+## Packing
+A colour is 16 bits: 6 bits hue, 3 bits saturation, 7 bits luminance.
+
+| field | bits | shift | range |
+|---|---|---|---|
+| hue | 6 | 10 | 0..63 |
+| saturation | 3 | 7 | 0..7 |
+| luminance | 7 | 0 | 0..127 |
+
+Java's `packHSL` returns a **signed short**, so every hue >= 32 comes back
+negative there (hue 63 packs to -1024, not 64512). This port keeps the value
+unsigned in 0..65535 instead, because Lape has no 16-bit signed arithmetic to
+fall into and a negative colour id is useless downstream. The unpackers are
+unaffected either way: they mask after shifting, so the sign bits Java carries
+are discarded before they can be observed.
+
+## Brightness
+`JAGEX_BRIGHTNESS_MAX = 0.5` is **deliberate and must not be "corrected"**.
+Stock RuneLite uses `.8` here; the `runelite-cache` fork this is ported from
+patches the constant to `.5` precisely so that dumped assets match what the
+client actually renders, and the committed item-sprite hashes in `wasp-assets`
+were produced with it. Changing it changes every hash.
+
+The four levels are the client's own brightness settings, MAX being the
+brightest picture (the lowest gamma exponent).
+
+## Not ported
+`JagexColor.java` also carries `packHSLFull`/`HSLtoRGBFull`/`HSLtoRGBFull2`
+(a 24-bit 8/8/8 HSL variant) and three `createPalette*` builders. Nothing in the
+dump pipeline calls them - the renderers use `HSLtoRGB` per face - so they are
+left out rather than ported untested.
+*)
+{$DEFINE WL_CACHE_JAGEXCOLOR_INCLUDED}
+
+const
+  // The client's four brightness settings. See the note above: MAX is 0.5 here
+  // on purpose, matching the runelite-cache fork rather than stock RuneLite.
+  JAGEX_BRIGHTNESS_MAX: Double  = 0.5;
+  JAGEX_BRIGHTNESS_HIGH: Double = 0.7;
+  JAGEX_BRIGHTNESS_LOW: Double  = 0.8;
+  JAGEX_BRIGHTNESS_MIN: Double  = 0.9;
+
+  // Half a step of each field's quantum: the unpacked hue/saturation land in the
+  // middle of their bucket instead of on its lower edge.
+  JAGEX_HUE_OFFSET: Double = 0.5 / 64.0;
+  JAGEX_SAT_OFFSET: Double = 0.5 / 8.0;
+
+(*
+## JagexPackHSL
+```pascal
+function JagexPackHSL(hue, saturation, luminance: Integer): Integer;
+```
+Packs the three fields into one 16-bit colour, masking each to its width. The
+result is 0..65535; Java returns the same bit pattern as a signed short.
+*)
+function JagexPackHSL(hue, saturation, luminance: Integer): Integer;
+begin
+  Result := ((hue and 63) shl 10) or ((saturation and 7) shl 7) or (luminance and 127);
+end;
+
+(*
+## JagexUnpackHue
+```pascal
+function JagexUnpackHue(hsl: Integer): Integer;
+```
+*)
+function JagexUnpackHue(hsl: Integer): Integer;
+begin
+  Result := (hsl shr 10) and 63;
+end;
+
+(*
+## JagexUnpackSaturation
+```pascal
+function JagexUnpackSaturation(hsl: Integer): Integer;
+```
+*)
+function JagexUnpackSaturation(hsl: Integer): Integer;
+begin
+  Result := (hsl shr 7) and 7;
+end;
+
+(*
+## JagexUnpackLuminance
+```pascal
+function JagexUnpackLuminance(hsl: Integer): Integer;
+```
+*)
+function JagexUnpackLuminance(hsl: Integer): Integer;
+begin
+  Result := hsl and 127;
+end;
+
+(*
+## JagexAdjustForBrightness
+```pascal
+function JagexAdjustForBrightness(rgb: Integer; brightness: Double): Integer;
+```
+Gamma-corrects a packed 0xRRGGBB colour: each channel is raised to `brightness`
+over the 0..1 range and truncated back to a byte. A lower exponent brightens.
+
+Two faithful oddities from the Java, both harmless for the 0..$FFFFFF inputs the
+client ever produces but worth knowing before feeding it anything else:
+the red channel is extracted as `rgb >> 16` with **no** `and 255`, so bits above
+24 leak into it; and each channel is truncated, never rounded or clamped, so an
+input above $FFFFFF can carry a red channel out of byte range straight into the
+result.
+*)
+function JagexAdjustForBrightness(rgb: Integer; brightness: Double): Integer;
+var
+  r, g, b: Double;
+begin
+  // Not masked - matches the Java exactly.
+  r := (rgb shr 16) / 256.0;
+  g := ((rgb shr 8) and 255) / 256.0;
+  b := (rgb and 255) / 256.0;
+
+  r := Power(r, brightness);
+  g := Power(g, brightness);
+  b := Power(b, brightness);
+
+  Result := Trunc(b * 256.0) + (Trunc(g * 256.0) shl 8) + (Trunc(r * 256.0) shl 16);
+end;
+
+(*
+## JagexRGBtoBGR
+```pascal
+function JagexRGBtoBGR(rgb: Integer): Integer;
+```
+Swaps the red and blue channels: 0xRRGGBB -> 0xBBGGRR. The green channel and
+anything above 24 bits are dropped, as in the Java.
+*)
+function JagexRGBtoBGR(rgb: Integer): Integer;
+begin
+  Result := ((rgb and $FF) shl 16) or (((rgb shr 8) and $FF) shl 8) or ((rgb shr 16) and $FF);
+end;
+
+(*
+## JagexHSLtoRGB
+```pascal
+function JagexHSLtoRGB(hsl: Integer; brightness: Double): Integer;
+```
+Turns a packed HSL colour into a packed 0xRRGGBB colour at the given brightness
+(pass one of the `JAGEX_BRIGHTNESS_*` constants).
+
+A standard HSL -> RGB transform apart from two client-isms: the half-quantum
+`JAGEX_HUE_OFFSET`/`JAGEX_SAT_OFFSET` added while unpacking, and the gamma pass
+at the end. **The result is never 0** - the client reserves black as its
+transparent key, so a colour that would come out 0 is bumped to 1.
+
+Precision note: the sector selector and the `x` term both need Java's
+double-precision `%`. `Modulo` on `Double` operands is the Simba equivalent, and
+it agrees with Java's `%` here because `hue * 6` is always positive - the two
+disagree only on negative operands, where Java truncates towards zero and
+`Modulo` floors (`Modulo(-1.5, 2.0)` is 0.5 in Simba, -1.5 in Java).
+*)
+function JagexHSLtoRGB(hsl: Integer; brightness: Double): Integer;
+var
+  hue, saturation, luminance, chroma, x, lightness, r, g, b: Double;
+begin
+  hue := JagexUnpackHue(hsl) / 64.0 + JAGEX_HUE_OFFSET;
+  saturation := JagexUnpackSaturation(hsl) / 8.0 + JAGEX_SAT_OFFSET;
+  luminance := JagexUnpackLuminance(hsl) / 128.0;
+
+  chroma := (1.0 - Abs((2.0 * luminance) - 1.0)) * saturation;
+  x := chroma * (1 - Abs(Modulo(hue * 6.0, 2.0) - 1.0));
+  lightness := luminance - (chroma / 2);
+
+  r := lightness;
+  g := lightness;
+  b := lightness;
+
+  // hue is (h/64 + 1/128), so hue * 6 spans 0.047..5.953: only sectors 0..5.
+  case Trunc(hue * 6.0) of
+    0: begin r += chroma; g += x; end;
+    1: begin g += chroma; r += x; end;
+    2: begin g += chroma; b += x; end;
+    3: begin b += chroma; g += x; end;
+    4: begin b += chroma; r += x; end;
+    else begin r += chroma; b += x; end;
+  end;
+
+  Result := (Trunc(r * 256.0) shl 16) or (Trunc(g * 256.0) shl 8) or Trunc(b * 256.0);
+  Result := JagexAdjustForBrightness(Result, brightness);
+
+  // 0 is the client's transparency key, so it is never a real colour.
+  if Result = 0 then Result := 1;
+end;

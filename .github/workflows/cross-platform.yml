@@ -1,0 +1,149 @@
+name: Generate assets on every platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            simba_target: linux64
+          - name: macOS
+            os: macos-13
+            simba_target: macintel
+          - name: Windows
+            os: windows-latest
+            simba_target: win64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Simba include directory (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: mkdir -p Includes
+
+      - name: Prepare Simba include directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force Includes | Out-Null
+
+      - name: Restore the pinned OpenRS2 cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: cache/2625
+          key: openrs2-oldschool-2625-${{ runner.os }}
+
+      - name: Download and unpack cache (Unix)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --output disk.zip \
+            https://archive.openrs2.org/caches/runescape/2625/disk.zip
+          mkdir -p cache/2625
+          unzip -q disk.zip -d cache/2625
+          rm disk.zip
+
+      - name: Download and unpack cache (Windows)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://archive.openrs2.org/caches/runescape/2625/disk.zip -OutFile disk.zip
+          New-Item -ItemType Directory -Force cache/2625 | Out-Null
+          Expand-Archive disk.zip cache/2625 -Force
+          Remove-Item disk.zip -Force
+
+      - name: Download Simba (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          url=$(curl --fail --silent --show-error https://raw.githubusercontent.com/Villavu/Simba-Build-Archive/main/latest.linux64)
+          curl --fail --location --output simba.zip "$url"
+          unzip -q simba.zip
+          chmod +x Simba-Linux64
+
+      - name: Download Simba (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          url=$(curl --fail --silent --show-error https://raw.githubusercontent.com/Villavu/Simba-Build-Archive/main/latest.macintel)
+          curl --fail --location --output simba.zip "$url"
+          unzip -q simba.zip
+          hdiutil attach Simba-Mac.dmg -nobrowse -mountpoint /tmp/simba-mount
+          cp -R /tmp/simba-mount/Simba.app .
+          hdiutil detach /tmp/simba-mount
+          chmod +x Simba.app/Contents/MacOS/Simba
+
+      - name: Download Simba (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = (Invoke-WebRequest https://raw.githubusercontent.com/Villavu/Simba-Build-Archive/main/latest.win64).Content.Trim()
+          Invoke-WebRequest $url -OutFile simba.zip
+          Expand-Archive simba.zip . -Force
+
+      - name: Generate full asset tree (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          ./Simba-Linux64 --extractopenssl --run tests/latest_openrs2.simba
+          cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
+          test -n "$cache_file"
+          ./Simba-Linux64 --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+
+      - name: Generate full asset tree (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ./Simba.app/Contents/MacOS/Simba --extractopenssl --run tests/latest_openrs2.simba
+          cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
+          test -n "$cache_file"
+          ./Simba.app/Contents/MacOS/Simba --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+
+      - name: Generate full asset tree (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./Simba-Win64.exe --extractopenssl --run tests/latest_openrs2.simba
+          $cacheFile = Get-ChildItem cache/2625 -Filter main_file_cache.dat2 -File -Recurse | Select-Object -First 1
+          if (!$cacheFile) { throw 'main_file_cache.dat2 was not unpacked' }
+          ./Simba-Win64.exe --extractopenssl --cache="$($cacheFile.Directory.FullName)" --run generator.simba
+
+      - name: Verify the generated manifest (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test -f out/hashes.json
+          test "$(jq 'length' out/hashes.json)" = 24
+          test -f out/finders/items/items-imgs.zip
+          test -f out/map/mapdata.zip
+
+      - name: Verify the generated manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path out/hashes.json) -or !(Test-Path out/finders/items/items-imgs.zip) -or !(Test-Path out/map/mapdata.zip)) { throw 'expected generated assets are missing' }
+          if ((Get-Content out/hashes.json -Raw | ConvertFrom-Json).psobject.Properties.Count -ne 24) { throw 'manifest does not contain 24 assets' }
+
+      - name: Upload generation proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-generation-proof
+          path: |
+            out/hashes.json
+            out/finders/items/data/*.txt
+          if-no-files-found: error

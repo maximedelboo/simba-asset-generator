@@ -1,0 +1,328 @@
+(*
+# Region
+A 64x64 map square with 4 planes: its terrain tiles and the object placements on
+it. Ported from `definitions/loaders/MapLoader.java`,
+`definitions/loaders/LocationsLoader.java` and `region/RegionLoader.java`.
+
+## Addressing, and why no XTEA keys are needed
+A live client cache stores index 5 **unnamed**, which is `RegionLoader`'s `else`
+branch: a region is simply archive `(regionX shl 8) or regionY`, file
+`REGION_TERRAIN_FILE` is the terrain and `REGION_LOCATIONS_FILE` the locations,
+and **nothing is encrypted**. All 2871 archives index 5 declares decompress with
+an empty key array, and the 2870 of them that are regions decode to a full
+4x64x64 tile grid - see `dev/tests/290_region.simba`, which sweeps every one.
+(The 2871st is not a region at all; see below.)
+
+That removes the blocker the project was designed around. The caveat is that it
+is a property of *this* layout, not of the cache format: the named layout, where
+archives are found by the Djb2 hash of `m<x>_<y>` / `l<x>_<y>` and the locations
+archive *is* XTEA-encrypted, is what OpenRS2 `disk.zip` dumps ship. It is
+deliberately not implemented here - `TRegion.Load` raises on a named index 5
+rather than reading the wrong bytes out of one. `keys` is on the signature so
+that path can be added without changing callers.
+
+## Differences from the Java, for whoever ports the map dumpers next
+1. `TLocation.X`/`Y` are **region-local** (0..63), like `LocationsLoader`
+   produces. `Region.loadLocations` in the Java re-wraps them as world
+   coordinates by adding the region base; do that with `BaseX`/`BaseY` if you
+   need it, do not assume it has happened.
+2. `TMapTile.OverlayId`/`UnderlayId` are the **raw** values `MapDefinition.Tile`
+   holds. `Region.getOverlayId`/`getUnderlayId` mask them with `$7FFF` before
+   handing them out, because `overlayId` is read signed; apply that mask
+   yourself.
+3. Java's `Tile.height` is a nullable `Integer` and `Region.loadTerrain` treats
+   null (no attribute-1 opcode for that tile) completely differently from an
+   explicit 0: null falls back to `HeightCalc`, 0 does not. A Simba `Integer`
+   cannot be null, so `HasHeight` carries that distinction. A height map that
+   ignores it is wrong for every tile that has no explicit height.
+4. `UnderlayId` is not truncated to 16 bits the way the Java's `(short)` cast
+   would. Real data never gets near the wrap point (the cache ships 233
+   underlays, so the attribute stays around 82..314), and the raw value is
+   strictly more information.
+5. `OverlayId`/`UnderlayId` are the tile's *encoded* ids, one higher than the
+   definition ids: the map dumper looks up `findUnderlay(underlayId - 1)`, and 0
+   means "none".
+
+## Two archives in index 5 that are not ordinary regions
+Both were found by sweeping the whole index; both are also how the Java behaves,
+once you read what its constants are for.
+
+- **Archive 25287** is in the reference table but is not a region at all: 37
+  files of 3 bytes each, not one of them big enough to be terrain. RuneLite's
+  `RegionLoader.MAX_REGION` is *exactly* 25287 and is used as an exclusive loop
+  bound, so the Java never touches it either. `REGION_MAX_ID` is that bound;
+  `TRegion.Load` returns `HasTerrain = False` above it.
+- **Region 16457** (x 64, y 73) has 9564 bytes left over after its four planes
+  decode, where every other region leaves exactly one. Its locations file, by
+  contrast, is consumed to the byte, and its tile values stay inside the
+  underlay/overlay id ranges the config archives declare - so the terrain read
+  is not drifting, the file simply carries a tail this format does not describe.
+  `MapLoader` reads its 4x64x64 tiles and ignores whatever follows, so this port
+  does the same and records the leftover in `TerrainTrailing` rather than
+  refusing the region. Check that field if you want the invariant enforced.
+*)
+{$DEFINE WL_CACHE_REGION_INCLUDED}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE store.simba}{$ENDIF}
+
+const
+  // net.runelite.cache.region.Region.X / .Y / .Z
+  REGION_X: Integer = 64;
+  REGION_Y: Integer = 64;
+  REGION_Z: Integer = 4;
+
+  // Positions inside an unnamed index 5 region archive.
+  REGION_TERRAIN_FILE: Integer = 0;
+  REGION_LOCATIONS_FILE: Integer = 1;
+
+  // net.runelite.cache.region.RegionLoader.MAX_REGION, an exclusive bound:
+  // real regions are 0..25286. See the unit docstring for archive 25287.
+  REGION_MAX_ID: Integer = 25287;
+
+type
+  // One terrain tile. Mirrors net.runelite.cache.definitions.MapDefinition.Tile,
+  // plus HasHeight - see difference 3 in the unit docstring.
+  TMapTile = record
+    AttrOpcode, OverlayId, OverlayPath, OverlayRotation: Integer;
+    Settings, UnderlayId, Height: Integer;
+    HasHeight: Boolean;
+  end;
+
+  // One object placement. `LocType` because `Type` is a reserved word in Lape
+  // and cannot be an identifier at all - not as a field, not as a variable.
+  TLocation = record
+    Id, LocType, Orientation, X, Y, Plane: Integer;
+  end;
+
+  TRegion = record
+    Id, RegionX, RegionY, BaseX, BaseY: Integer;
+    HasTerrain: Boolean;
+    // Bytes left in the terrain file after the last tile: 1 on every region in
+    // the cache except 16457. A larger value means either that tail or a
+    // desynchronised read, and only the id tells them apart.
+    TerrainTrailing: Integer;
+    Tiles: array of TMapTile;     // flat, indexed by TRegion.TileIndex(z, x, y)
+    Locations: array of TLocation;
+  end;
+
+(*
+## RegionIdOf
+```pascal
+function RegionIdOf(x, y: Integer): Integer;
+function RegionXOf(id: Integer): Integer;
+function RegionYOf(id: Integer): Integer;
+```
+Region coordinates to and from the region id, which in an unnamed index 5 is also
+the archive id.
+*)
+function RegionIdOf(x, y: Integer): Integer;
+begin
+  Result := (x shl 8) or y;
+end;
+
+function RegionXOf(id: Integer): Integer;
+begin
+  Result := (id shr 8) and $FF;
+end;
+
+function RegionYOf(id: Integer): Integer;
+begin
+  Result := id and $FF;
+end;
+
+(*
+## TRegion.TileIndex
+```pascal
+function TRegion.TileIndex(z, x, y: Integer): Integer; static;
+```
+Position of tile `(z, x, y)` in the flat `Tiles` array. The stride order is the
+terrain stream's own nesting order - z outermost, y innermost - so a decoder can
+walk `Tiles` linearly instead of computing this per tile.
+
+Range-checked on purpose: `TileIndex(0, 64, 0)` is arithmetically 4096, which is
+a perfectly valid index *for plane 1*, so an out-of-range coordinate would read
+a real tile from the wrong place rather than raise.
+*)
+function TRegion.TileIndex(z, x, y: Integer): Integer; static;
+begin
+  if (z < 0) or (z >= REGION_Z) or (x < 0) or (x >= REGION_X) or (y < 0) or (y >= REGION_Y) then
+    raise 'Region: tile (' + ToStr(z) + ',' + ToStr(x) + ',' + ToStr(y) + ') is out of range';
+  Result := (z * REGION_X * REGION_Y) + (x * REGION_Y) + y;
+end;
+
+(*
+## TRegion.TileSetting
+```pascal
+function TRegion.TileSetting(z, x, y: Integer): Integer;
+```
+The tile's settings byte (`Region.getTileSetting`). Bit 0 marks a bridge tile and
+bit 1 a tile the map renderer hides, so map and object dumpers test it per tile.
+*)
+function TRegion.TileSetting(z, x, y: Integer): Integer;
+begin
+  Result := Self.Tiles[TRegion.TileIndex(z, x, y)].Settings;
+end;
+
+// MapLoader.loadTerrain. Kept private-by-convention: TRegion.Load is the entry
+// point, and this leaves Self.Tiles allocated and HasTerrain set.
+procedure TRegion.DecodeTerrain(data: TByteArray);
+var
+  s: TByteStream;
+  z, x, y, i, attribute: Integer;
+begin
+  SetLength(Self.Tiles, REGION_Z * REGION_X * REGION_Y);
+  s := TByteStream.Create(data);
+
+  i := 0;
+  for z := 0 to REGION_Z - 1 do
+    for x := 0 to REGION_X - 1 do
+      for y := 0 to REGION_Y - 1 do
+      begin
+        // i is TileIndex(z, x, y) by construction: this loop nest is exactly the
+        // order that function strides in. Incrementing beats 16384 checked calls
+        // per region, and the test pins the two against each other.
+        while True do
+        begin
+          attribute := s.ReadUShort();
+          if attribute = 0 then
+            Break
+          else if attribute = 1 then
+          begin
+            Self.Tiles[i].Height := s.ReadUByte();
+            Self.Tiles[i].HasHeight := True;
+            Break;
+          end
+          else if attribute <= 49 then
+          begin
+            Self.Tiles[i].AttrOpcode := attribute;
+            Self.Tiles[i].OverlayId := s.ReadShort();
+            Self.Tiles[i].OverlayPath := (attribute - 2) div 4;
+            Self.Tiles[i].OverlayRotation := (attribute - 2) and 3;
+          end
+          else if attribute <= 81 then
+            Self.Tiles[i].Settings := attribute - 49
+          else
+            Self.Tiles[i].UnderlayId := attribute - 81;
+        end;
+        Inc(i);
+      end;
+
+  // Not raised on, deliberately: 2869 of the cache's 2870 regions leave exactly
+  // one byte here, but region 16457 leaves 9564 and the Java reads it anyway
+  // (MapLoader stops after 4x64x64 tiles and never looks at the rest). Refusing
+  // it would lose a region the existing pipeline dumps. An *under*-run is the
+  // failure that actually indicates a desynchronised read, and TByteStream
+  // already raises on that.
+  Self.TerrainTrailing := s.Remaining();
+  Self.HasTerrain := True;
+end;
+
+// LocationsLoader.loadLocations.
+procedure TRegion.DecodeLocations(data: TByteArray);
+var
+  s: TByteStream;
+  id, idOffset, position, positionOffset, attributes, count, capacity: Integer;
+begin
+  s := TByteStream.Create(data);
+
+  // Grow by doubling rather than appending: a busy region holds ~5k locations,
+  // and `Locations += loc` reallocates on every append, which is quadratic.
+  capacity := 256;
+  SetLength(Self.Locations, capacity);
+  count := 0;
+
+  id := -1;
+  while True do
+  begin
+    idOffset := s.ReadUIntSmartShortCompat();
+    if idOffset = 0 then Break;
+    id += idOffset;
+
+    position := 0;
+    while True do
+    begin
+      positionOffset := s.ReadUShortSmart();
+      if positionOffset = 0 then Break;
+      position += positionOffset - 1;
+      attributes := s.ReadUByte();
+
+      if count = capacity then
+      begin
+        capacity *= 2;
+        SetLength(Self.Locations, capacity);
+      end;
+
+      Self.Locations[count].Id := id;
+      Self.Locations[count].LocType := attributes shr 2;
+      Self.Locations[count].Orientation := attributes and 3;
+      Self.Locations[count].X := (position shr 6) and $3F;
+      Self.Locations[count].Y := position and $3F;
+      Self.Locations[count].Plane := (position shr 12) and $3;
+      Inc(count);
+    end;
+  end;
+
+  SetLength(Self.Locations, count);
+
+  // The terminating 0 id-offset is the last byte of the file on every region
+  // measured; leftovers mean the position/id decode drifted.
+  if s.Remaining() <> 0 then
+    raise 'Region: locations decode left ' + ToStr(s.Remaining()) +
+          ' bytes, expected 0, in region ' + ToStr(Self.Id);
+end;
+
+(*
+## TRegion.Load
+```pascal
+function TRegion.Load(var store: TCacheStore; id: Integer; keys: TIntegerArray): TRegion; static;
+```
+Loads region `id` - its terrain and its object placements.
+
+`store` is `var` so the reference table it parses on the first call is cached on
+the caller's record; loading every region through a by-value copy would re-parse
+index 5's table 2871 times.
+
+`keys` is accepted for the encrypted, named layout and is **unused** for a live
+client cache, where it should be `[]`. Passing keys does nothing today; it does
+not silently decrypt anything.
+
+An absent archive returns a region with `HasTerrain = False` rather than raising,
+because index 5's id space is sparse - the reference table lists 2871 archives
+across an id range of 25000+, and so does an id at or above `REGION_MAX_ID`. A
+*present* archive that will not decode does raise: that is a bug, not a gap.
+*)
+function TRegion.Load(var store: TCacheStore; id: Integer; keys: TIntegerArray): TRegion; static;
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+begin
+  Result.Id := id;
+  Result.RegionX := RegionXOf(id);
+  Result.RegionY := RegionYOf(id);
+  Result.BaseX := Result.RegionX shl 6;
+  Result.BaseY := Result.RegionY shl 6;
+  Result.HasTerrain := False;
+
+  table := store.GetRefTable(Ord(EIndexType.MAPS));
+  if table.Named then
+    raise 'Region: index 5 is named (an OpenRS2-style dump); only the unnamed ' +
+          'live-cache layout is implemented';
+
+  // Archive 25287 sits in the reference table but holds 37 three-byte files, not
+  // terrain; RuneLite's MAX_REGION loop bound is exactly this id.
+  if (id < 0) or (id >= REGION_MAX_ID) then Exit;
+  if table.IndexOfArchive(id) = -1 then Exit;
+
+  files := store.ReadFiles(Ord(EIndexType.MAPS), id, keys);
+
+  // Region archives hold 5 files (one holds 37). Only 0 and 1 are read: the
+  // rest are a newer addition this port does not decode.
+  if Length(files) <= REGION_TERRAIN_FILE then Exit;
+  if Length(files[REGION_TERRAIN_FILE]) = 0 then Exit;
+
+  Result.DecodeTerrain(files[REGION_TERRAIN_FILE]);
+
+  if Length(files) > REGION_LOCATIONS_FILE then
+    if Length(files[REGION_LOCATIONS_FILE]) > 0 then
+      Result.DecodeLocations(files[REGION_LOCATIONS_FILE]);
+end;

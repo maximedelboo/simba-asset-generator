@@ -1,0 +1,854 @@
+[
+  {
+    "name": "shrimps",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 3
+  },
+  {
+    "name": "cooked chicken",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 3
+  },
+  {
+    "name": "cooked meat",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 3
+  },
+  {
+    "name": "sardine",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 4
+  },
+  {
+    "name": "cake(1..3)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 4
+  },
+  {
+    "name": "edible seaweed",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 4
+  },
+  {
+    "name": "bread",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 5
+  },
+  {
+    "name": "herring",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 5
+  },
+  {
+    "name": "chocolate cake(1..3)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 5
+  },
+  {
+    "name": "guthix rest(1..4)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": [5, 5],
+    "multipliers": [0.0, 0.0]
+  },
+  {
+    "name": "mackerel",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 6
+  },
+  {
+    "name": "choc-ice",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 6
+  },
+  {
+    "name": "meat pie(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 6
+  },
+  {
+    "name": "trout",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 7
+  },
+  {
+    "name": "cod",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 7
+  },
+  {
+    "name": "plain pizza(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 7
+  },
+  {
+    "name": "apple pie(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 7
+  },
+  {
+    "name": "pike",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "roast beast meat",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "meat pizza(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "admiral pie(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "cooked wild kebbit",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "sunlight moth mix (1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "sunlight moth",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 8
+  },
+  {
+    "name": "pineapple punch",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 9
+  },
+  {
+    "name": "salmon",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 9
+  },
+  {
+    "name": "anchovy pizza(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 9
+  },
+  {
+    "name": "tuna",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 10
+  },
+  {
+    "name": "dragonfruit pie(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 10
+  },
+  {
+    "name": "jug of wine",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "rainbow fish",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "cooked larupia",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "stew",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "banana stew",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "pineapple pizza(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "summer pie(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": [11, 10],
+    "multipliers": [0.0, 0.0]
+  },
+  {
+    "name": "wild pie(1..2)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 11
+  },
+  {
+    "name": "lobster",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 12
+  },
+  {
+    "name": "cooked barb-tailed kebbit",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 12
+  },
+  {
+    "name": "bass",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 13
+  },
+  {
+    "name": "swordfish",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 14
+  },
+  {
+    "name": "potato with butter",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 14
+  },
+  {
+    "name": "cooked graahk",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 14
+  },
+  {
+    "name": "tangled toad's legs",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "combo_food": true,
+    "base_amounts": 15
+  },
+  {
+    "name": "chocolate bomb",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "combo_food": true,
+    "base_amounts": 15
+  },
+  {
+    "name": "potato with cheese",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 16
+  },
+  {
+    "name": "egg potato",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 16
+  },
+  {
+    "name": "monkfish",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 16
+  },
+  {
+    "name": "cooked kyatt",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 17
+  },
+  {
+    "name": "cooked karambwan",
+    "category": 0,
+    "cooldown_ms": 1200,
+    "combo_food": true,
+    "base_amounts": 18
+  },
+  {
+    "name": "cooked pyre fox",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 19
+  },
+  {
+    "name": "curry",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 19
+  },
+  {
+    "name": "ugthanki kebab",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 19
+  },
+  {
+    "name": "mushroom potato",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 20
+  },
+  {
+    "name": "shark",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 20
+  },
+  {
+    "name": "sea turtle",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 21
+  },
+  {
+    "name": "cooked sunlight antelope",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 21
+  },
+  {
+    "name": "manta ray",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 22
+  },
+  {
+    "name": "tuna potato",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 22
+  },
+  {
+    "name": "dark crab",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 22
+  },
+  {
+    "name": "cooked dashing kebbit",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 23
+  },
+  {
+    "name": "cooked moonlight antelope",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 26
+  },
+  {
+    "name": "anglerfish",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 0,
+    "level_requirements": [
+      {
+        "min_level": 93,
+        "base_amount": 13,
+        "multiplier": 0.1
+      },
+      {
+        "min_level": 75,
+        "base_amount": 8,
+        "multiplier": 0.1
+      },
+      {
+        "min_level": 50,
+        "base_amount": 6,
+        "multiplier": 0.1
+      },
+      {
+        "min_level": 25,
+        "base_amount": 4,
+        "multiplier": 0.1
+      },
+      {
+        "min_level": 10,
+        "base_amount": 2,
+        "multiplier": 0.1
+      }
+    ]
+  },
+  {
+    "name": "saradomin brew(1..4)",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 2,
+    "multipliers": 0.15
+  },
+  {
+    "name": "cooked bream",
+    "category": 0,
+    "cooldown_ms": 1800,
+    "base_amounts": 0,
+    "multipliers": 0.33
+  },
+  {
+    "name": "white tree fruit",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 5
+  },
+  {
+    "name": "winter sq'irkjuice",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 10
+  },
+  {
+    "name": "spring sq'irkjuice",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 20
+  },
+  {
+    "name": "autumn sq'irkjuice",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 30
+  },
+  {
+    "name": "summer sq'irkjuice",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 40
+  },
+  {
+    "name": "bandages",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 30
+  },
+  {
+    "name": "papaya fruit",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 5
+  },
+  {
+    "name": "energy potion(1..4)",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 10
+  },
+  {
+    "name": "purple sweets",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 10
+  },
+  {
+    "name": "super energy(1..4)",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 20
+  },
+  {
+    "name": "stamina potion(1..4)",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "duration_ms": 120000,
+    "base_amounts": 20
+  },
+  {
+    "name": "strange fruit",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 30
+  },
+  {
+    "name": "mint cake",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 50
+  },
+  {
+    "name": "gout tuber",
+    "category": 2,
+    "cooldown_ms": 1800,
+    "base_amounts": 50
+  },
+  {
+    "name": "jangerberries",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 1
+  },
+  {
+    "name": "moonlight moth",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 22
+  },
+  {
+    "name": "moonlight moth mix (1..2)",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 22
+  },
+  {
+    "name": "zamorak brew(1..4)",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 0,
+    "multipliers": 0.1
+  },
+  {
+    "name": "sanfew serum(1..4)",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 4,
+    "multipliers": 0.3
+  },
+  {
+    "name": "super restore(1..4)",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 8,
+    "multipliers": 0.25
+  },
+  {
+    "name": "prayer potion(1..4)",
+    "category": 1,
+    "cooldown_ms": 1800,
+    "base_amounts": 7,
+    "multipliers": 0.25
+  },
+  {
+    "name": "antifire potion(1..4)",
+    "category": 4,
+    "cooldown_ms": 1800,
+    "duration_ms": 360000
+  },
+  {
+    "name": "super antifire potion(1..4)",
+    "category": 4,
+    "cooldown_ms": 1800,
+    "duration_ms": 180000
+  },
+  {
+    "name": "extended antifire(1..4)",
+    "category": 4,
+    "cooldown_ms": 1800,
+    "duration_ms": 720000
+  },
+  {
+    "name": "extended super antifire(1..4)",
+    "category": 4,
+    "cooldown_ms": 1800,
+    "duration_ms": 360000
+  },
+  {
+    "name": "anti-venom+(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "anti-venom(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "antidote++(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "antidote+(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "superantipoison(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "antipoison(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "extended anti-venom+(1..4)",
+    "category": 3,
+    "cooldown_ms": 1800
+  },
+  {
+    "name": "super combat potion(1..4)",
+    "category": 6,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "super combat potion(1..4)",
+    "category": 5,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "super combat potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine super combat potion(1..4)",
+    "category": 6,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine super combat potion(1..4)",
+    "category": 5,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine super combat potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "bastion potion(1..4)",
+    "category": 8,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 4,
+    "multipliers": 0.1
+  },
+  {
+    "name": "bastion potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine bastion potion(1..4)",
+    "category": 8,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 4,
+    "multipliers": 0.1
+  },
+  {
+    "name": "divine bastion potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "battlemage potion(1..4)",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 4,
+    "multipliers": 0.0
+  },
+  {
+    "name": "battlemage potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine battlemage potion(1..4)",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 4,
+    "multipliers": 0.0
+  },
+  {
+    "name": "divine battlemage potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "strength potion(1..4)",
+    "category": 5,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 3,
+    "multipliers": 0.1
+  },
+  {
+    "name": "super strength(1..4)",
+    "category": 5,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine super strength potion(1..4)",
+    "category": 5,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "attack potion(1..4)",
+    "category": 6,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 3,
+    "multipliers": 0.1
+  },
+  {
+    "name": "super attack(1..4)",
+    "category": 6,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine super attack potion(1..4)",
+    "category": 6,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "defence potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 3,
+    "multipliers": 0.1
+  },
+  {
+    "name": "super defence(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "divine super defence potion(1..4)",
+    "category": 7,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 5,
+    "multipliers": 0.15
+  },
+  {
+    "name": "ranging potion(1..4)",
+    "category": 8,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 4,
+    "multipliers": 0.1
+  },
+  {
+    "name": "divine ranging potion(1..4)",
+    "category": 8,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 4,
+    "multipliers": 0.1
+  },
+  {
+    "name": "magic potion(1..4)",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 4
+  },
+  {
+    "name": "divine magic potion(1..4)",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 4
+  },
+  {
+    "name": "saturated heart",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 6,
+    "multipliers": 0.1
+  },
+  {
+    "name": "imbued heart",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 303000,
+    "base_amounts": 1,
+    "multipliers": 0.1
+  },
+  {
+    "name": "forgotten brew(1..4)",
+    "category": 9,
+    "cooldown_ms": 1800,
+    "duration_ms": 480000,
+    "base_amounts": 3,
+    "multipliers": 0.08
+  }
+]

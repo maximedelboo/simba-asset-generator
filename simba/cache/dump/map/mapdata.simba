@@ -1,0 +1,621 @@
+(*
+# MapData
+The packer that turns the three map renderers into `map/mapdata.zip` - the only
+map artefact WaspLib ships to clients and the one
+`main/position/map/maploader.simba` reads. It replaces
+`wasp-assets/tools/update_map.simba` and the `unzip -> AddImages` shell step in
+front of it.
+
+```pascal
+var
+  store: TCacheStore;
+  ms: TIntegerArray;
+begin
+  store := TCacheStore.Create(cacheDir);
+  ms := DumpMapData(store, assets + 'map/mapdata.zip', assets + 'map/bins');
+end;
+```
+
+## The container
+`mapdata.zip` holds bounded resource bundles, named
+`map-0000.bin` … `heightmap-0011.bin` for cache 2639. Each shard contains at
+most 256 consecutive regions and all four planes for those regions. The loader
+opens the small reader list for the requested map kind and finds chunks by name.
+
+Historical three-member archives (`map.bin`, `collision.bin`, `heightmap.bin`)
+remain readable by `TMapLoader`; new dumps write shards so generation can run
+on an 8-GB machine.
+
+`map-noicons.zip` has no bundle and is deliberately not produced: `map.bin` comes
+from the with-icons variant and nothing consumes the other one.
+
+## Each member is a `TResourceWriter` bundle
+`SRES`, a version, a count, then one `SREN` entry per chunk holding the 256x256
+image and its name - `<plane>-<regionX>-<regionY>.png`. `TResourceWriter` and
+`TResourceReader` are Simba builtins, so the format needs no porting; what needs
+porting is the *order*, see below. WaspLib reads a chunk straight back out with
+`Find(name)` + `LoadImage(index)` (`maploader.simba:365`).
+
+The pngs are only a filesystem detail of the Java pipeline.
+`TResourceWriter.AddImage` takes a `TImage`, so a rendered chunk goes into the
+bundle with no encode/decode round trip. That is not a shortcut with a caveat: a
+freshly built `TImage` carries `A = 255`, exactly what Simba's png loader
+produces, and a bundle built either way hashes the same - asserted in
+`dev/tests/443_mapdata.simba`.
+
+## The one portability trap
+**`TResourceWriter.AddImages` does not sort.** It walks the directory and takes
+whatever order the filesystem hands back, which on APFS is the creation order:
+probed here, `[1-50-50.png, 0-25-57.png, 0-50-50.png]`. The committed bundles
+are in sorted order purely because `process-maps` runs on `windows-latest` and
+NTFS returns directory entries alphabetically. A macOS or Linux rebuild that
+does not sort explicitly cannot reach the committed CRC32s, for a reason that
+has nothing to do with rendering.
+
+And the sort has to be **byte-lexicographic**, which is what
+{ref}`DumpEntryOrder` is for. Simba's own `TStringArray.Sort()` sorts
+*naturally* - it reads embedded digit runs as numbers and puts `0-9-9.png`
+before `0-15-9.png`. That is a different order, it is plausible, and it silently
+produces a wrong bundle. The `<` operator on Strings compares bytes and is the
+right primitive.
+
+## Parity
+The historical three bundles were byte-for-byte comparable to the old archive.
+The new bounded shards intentionally are not: shard boundaries change the
+`TResourceWriter` container even when every chunk is unchanged. The meaningful
+gate opens every entry and compares the decoded pixels with the historical
+bundle. Cache 2639 passes all **35,196** chunks (11,732 in each family).
+
+`mapdata.zip` itself is likewise not a byte-parity target. The historical
+container was written by `ZipFiles`, which stamps members with their source
+mtime; this port uses {ref}`TZipWriter`, which pins timestamps and deflates
+differently. `hashes.json` is regenerated anyway and WaspLib only uses the
+value as a version key (`maploader.simba:292`), so a new hash is harmless.
+
+## Memory
+The old one-family bundle retained 11,732 256x256x4 images (3.1 GB) and the
+writer copied them again, producing a measured double-digit-GiB peak. A shard
+now retains at most 1,024 images (256 regions × 4 planes) before saving and
+releasing it. A full cache-2639 build sampled Simba at at most 542 MB RSS;
+the release pipeline enforces a 1.5-GB RSS ceiling. That observation and ceiling
+are regression signals, not platform-independent hard caps.
+All four planes of each region still render consecutively, so the map renderer
+keeps its warm blended-plane buffers; only a small shard boundary is introduced.
+*)
+{$DEFINE WL_CACHE_DUMP_MAPDATA_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE ../dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_HEIGHTMAP_INCLUDED}{$INCLUDE_ONCE heightmap.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_COLLISION_INCLUDED}{$INCLUDE_ONCE collision.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_MAPIMAGE_INCLUDED}{$INCLUDE_ONCE mapimage.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ZIPWRITER_INCLUDED}{$INCLUDE_ONCE ../zipwriter.simba}{$ENDIF}
+
+const
+  (*
+  ## MAPDATA_BINS
+  ```pascal
+  MAPDATA_BINS: TStringArray = ['map.bin', 'collision.bin', 'heightmap.bin'];
+
+  ```
+  The members of `map/mapdata.zip`, in the order the committed container holds
+  them. Read out of its central directory rather than taken from either list in
+  the tree, because the two disagree - see the unit note above.
+  *)
+  MAPDATA_BINS: TStringArray = ['map.bin', 'collision.bin', 'heightmap.bin'];
+
+  // A complete family keeps 11,732 decoded images live. Split by consecutive
+  // region ids so a writer only owns 1,024 images at a time (256 regions x 4
+  // planes). Names are padded, so natural and byte sorting agree.
+  MAPDATA_REGIONS_PER_SHARD: Integer = 256;
+  MAPDATA_SHARD_PREFIXES: TStringArray = ['map', 'collision', 'heightmap'];
+
+
+type
+  (*
+  ## TMapBundle
+  ```pascal
+  TMapBundle = record
+    Names: TStringArray;
+    Images: array of TImage;
+  end;
+  ```
+  One bounded `.bin` shard's chunks, collected in whatever order the renderer
+  produced them and written out in entry order by {ref}`TMapBundle.Save`.
+
+  Chunks go in as `TImage`s, not files. The array is the principal allocation of
+  the dumper, so build one shard at a time and {ref}`TMapBundle.Init` it as soon
+  as it is written.
+  *)
+  TMapBundle = record
+    Names: TStringArray;
+    Images: array of TImage;
+  end;
+
+(*
+## TMapBundle.Init
+```pascal
+procedure TMapBundle.Init();
+```
+Empties the bundle, and releases its images.
+
+Required before the first use and before every reuse: a `TMapBundle` local is
+not zero-filled per call, and `SetLength` preserves the overlapping prefix, so a
+stale chunk would otherwise leak into the next family.
+*)
+procedure TMapBundle.Init();
+begin
+  Self.Names := [];
+  Self.Images := [];
+end;
+
+(*
+## TMapBundle.Add
+```pascal
+procedure TMapBundle.Add(name: String; img: TImage);
+```
+Appends `img` under the zip/bundle entry name `name`, e.g. `0-50-50.png`. Add
+order does not matter; {ref}`TMapBundle.Save` sorts.
+
+The image is referenced, not copied, so a caller must hand over a fresh `TImage`
+per chunk rather than reuse one buffer. Every renderer in this tree returns a
+new one from `Render`.
+*)
+procedure TMapBundle.Add(name: String; img: TImage);
+begin
+  if name = '' then
+    raise 'MapData: a bundle entry name cannot be empty';
+  if img = nil then
+    raise 'MapData: no image for bundle entry "' + name + '"';
+
+  Self.Names += name;
+  Self.Images += img;
+end;
+
+(*
+## TMapBundle.Count
+```pascal
+function TMapBundle.Count(): Integer;
+```
+How many chunks the bundle holds. A full family is 11732 - 2933 regions x 4
+planes.
+*)
+function TMapBundle.Count(): Integer;
+begin
+  Result := Length(Self.Names);
+end;
+
+function MapDataShardName(prefix: String; shard: Integer): String;
+var
+  n: String;
+begin
+  if shard < 0 then raise 'MapData: negative shard number';
+  n := '0000' + ToStr(shard);
+  Result := prefix + '-' + Copy(n, Length(n) - 3, 4) + '.bin';
+end;
+
+(*
+## TMapBundle.SortedNames
+```pascal
+function TMapBundle.SortedNames(): TStringArray;
+```
+The entry names in the order {ref}`TMapBundle.Save` will write them. Exists so
+the order can be inspected without writing 100 MB to disk first.
+*)
+function TMapBundle.SortedNames(): TStringArray;
+var
+  order: TIntegerArray;
+  i: Integer;
+begin
+  order := DumpEntryOrder(Self.Names);
+  SetLength(Result, Length(order));
+  for i := 0 to High(order) do
+    Result[i] := Self.Names[order[i]];
+end;
+
+(*
+## TMapBundle.Save
+```pascal
+procedure TMapBundle.Save(path: String);
+```
+Writes the bundle to `path` as a `TResourceWriter` container, in
+{ref}`DumpEntryOrder`.
+
+`AddImages` is deliberately not used - it would re-read pngs from a directory
+and take the filesystem's order, which is the trap this unit exists to avoid.
+The parent directory is created if it is missing, and an existing file is
+removed first rather than written over.
+
+Raises on an empty bundle: a `.bin` with no chunks is always a driver that
+silently rendered nothing, never a legitimate output.
+*)
+procedure TMapBundle.Save(path: String);
+var
+  writer: TResourceWriter;
+  order: TIntegerArray;
+  dir: String;
+  i: Integer;
+begin
+  if Length(Self.Names) = 0 then
+    raise 'MapData: refusing to write an empty bundle to ' + path;
+  if Length(Self.Images) <> Length(Self.Names) then
+    raise 'MapData: bundle has ' + ToStr(Length(Self.Names)) + ' names and ' +
+          ToStr(Length(Self.Images)) + ' images';
+
+  dir := PathExtractDir(path);
+  if (dir <> '') and not DirExists(dir) and not DirCreate(dir) then
+    raise 'MapData: could not create ' + dir;
+
+  order := DumpEntryOrder(Self.Names);
+
+  writer := new TResourceWriter();
+  for i := 0 to High(order) do
+    writer.AddImage(Self.Names[order[i]], Self.Images[order[i]]);
+
+  FileDelete(path);
+  writer.Save(path);
+end;
+
+(*
+## MapDataRegionIds
+```pascal
+function MapDataRegionIds(var store: TCacheStore): TIntegerArray;
+```
+Every region id index 5 declares, ascending. 2933 of them in cache 2639.
+
+Archive 25287 is in the reference table and is not a region -
+`RegionLoader.MAX_REGION` is exactly that id, exclusive - so it is dropped here
+the same way the other map dumpers drop it.
+
+Ascending id is `(x shl 8) or y`, i.e. column by column from the west, which is
+the traversal the map renderer's 3x3 neighbourhood cache is warmest under. The
+bundle re-orders on the way out, so this order is a performance choice and
+nothing else.
+*)
+function MapDataRegionIds(var store: TCacheStore): TIntegerArray;
+var
+  table: TCacheRefTable;
+  present: TBooleanArray;
+  i, id: Integer;
+begin
+  table := store.GetRefTable(Ord(EIndexType.MAPS));
+
+  present := [];
+  SetLength(present, REGION_MAX_ID);
+  for i := 0 to High(table.Archives) do
+  begin
+    id := table.Archives[i].Id;
+    if (id >= 0) and (id < REGION_MAX_ID) then present[id] := True;
+  end;
+
+  for id := 0 to REGION_MAX_ID - 1 do
+    if present[id] then Result += id;
+end;
+
+(*
+## MapDataHeightmapBundle
+```pascal
+function MapDataHeightmapBundle(var store: TCacheStore): TMapBundle;
+```
+The legacy whole-family heightmap bundle: {ref}`THeightMap` over every region
+of index 5, all four planes. New dumps use {ref}`MapDataHeightmapShard`.
+
+A region whose archive holds no terrain file contributes nothing, which is what
+keeps the count at 11732 rather than 4 x the number of declared regions. No
+region in cache 2625 actually takes that branch.
+*)
+function MapDataHeightmapBundle(var store: TCacheStore): TMapBundle;
+var
+  ids: TIntegerArray;
+  region: TRegion;
+  hm: THeightMap;
+  i, z: Integer;
+begin
+  Result.Init();
+  ids := MapDataRegionIds(store);
+
+  for i := 0 to High(ids) do
+  begin
+    region := TRegion.Load(store, ids[i], []);
+    if not region.HasTerrain then Continue;
+
+    hm := THeightMap.Create(region);
+    for z := 0 to REGION_Z - 1 do
+      Result.Add(hm.ChunkName(z), hm.Render(z));
+  end;
+end;
+
+(*
+## MapDataCollisionBundle
+```pascal
+function MapDataCollisionBundle(var store: TCacheStore): TMapBundle;
+```
+The legacy whole-family collision bundle: {ref}`TCollisionMap` over every
+region of index 5, all four planes. New dumps use {ref}`MapDataCollisionShard`.
+
+The whole-map canvas bounds and the OBJECT definitions are built once and shared
+across regions - `TCollisionWorld.FromStore` walks the reference table and
+`TCollisionObjects.Create` reads the whole OBJECT archive, and neither depends
+on which region is being drawn.
+*)
+function MapDataCollisionBundle(var store: TCacheStore): TMapBundle;
+var
+  world: TCollisionWorld;
+  objs: TCollisionObjects;
+  ids: TIntegerArray;
+  region: TRegion;
+  cm: TCollisionMap;
+  i, z: Integer;
+begin
+  Result.Init();
+  world := TCollisionWorld.FromStore(store);
+  objs := TCollisionObjects.Create(store);
+  ids := MapDataRegionIds(store);
+
+  for i := 0 to High(ids) do
+  begin
+    region := TRegion.Load(store, ids[i], []);
+    if not region.HasTerrain then Continue;
+
+    cm := TCollisionMap.Create(region, world);
+    for z := 0 to REGION_Z - 1 do
+      Result.Add(cm.ChunkName(z), cm.Render(z, objs));
+  end;
+end;
+
+(*
+## MapDataImageBundle
+```pascal
+function MapDataImageBundle(var store: TCacheStore): TMapBundle;
+```
+The legacy whole-family map bundle: {ref}`TMapImage` over every region of index
+5, all four planes. New dumps use {ref}`MapDataImageShard`; the with-icons
+variant is retained and `map-noicons` has no bundle.
+
+`RegionSlot` is called before rendering rather than letting `Render` do it,
+because its `Valid` flag is how this driver asks "does this region have terrain"
+without decoding it twice: the slot it warms is the one the render then reads.
+The four planes of a region are rendered consecutively so they share the blended
+plane buffers `Render` caches for whichever region it saw last.
+*)
+function MapDataImageBundle(var store: TCacheStore): TMapBundle;
+var
+  mi: TMapImage;
+  ids: TIntegerArray;
+  i, z, slot, regionX, regionY: Integer;
+begin
+  Result.Init();
+  mi := TMapImage.Create(store);
+  ids := MapDataRegionIds(store);
+
+  for i := 0 to High(ids) do
+  begin
+    slot := mi.RegionSlot(ids[i]);
+    if not mi.CacheRegions[slot].Valid then Continue;
+
+    regionX := RegionXOf(ids[i]);
+    regionY := RegionYOf(ids[i]);
+    for z := 0 to REGION_Z - 1 do
+      Result.Add(mi.ChunkName(regionX, regionY, z), mi.Render(regionX, regionY, z));
+  end;
+end;
+
+(**
+Builds one bounded shard rather than retaining every map chunk in the cache.
+The caller supplies a consecutive slice of `ids`; all four planes of a region
+are still rendered together, preserving TMapImage's warm per-region buffers.
+*)
+function MapDataImageShard(var mi: TMapImage; ids: TIntegerArray;
+                           first, last: Integer): TMapBundle;
+var
+  i, z, slot, regionX, regionY: Integer;
+begin
+  Result.Init();
+  for i := first to last - 1 do
+  begin
+    slot := mi.RegionSlot(ids[i]);
+    if not mi.CacheRegions[slot].Valid then Continue;
+
+    regionX := RegionXOf(ids[i]);
+    regionY := RegionYOf(ids[i]);
+    for z := 0 to REGION_Z - 1 do
+      Result.Add(mi.ChunkName(regionX, regionY, z), mi.Render(regionX, regionY, z));
+  end;
+end;
+
+function MapDataCollisionShard(var store: TCacheStore; ids: TIntegerArray;
+                               first, last: Integer; var world: TCollisionWorld;
+                               var objs: TCollisionObjects): TMapBundle;
+var
+  i, z: Integer;
+  region: TRegion;
+  cm: TCollisionMap;
+begin
+  Result.Init();
+  for i := first to last - 1 do
+  begin
+    region := TRegion.Load(store, ids[i], []);
+    if not region.HasTerrain then Continue;
+
+    cm := TCollisionMap.Create(region, world);
+    for z := 0 to REGION_Z - 1 do
+      Result.Add(cm.ChunkName(z), cm.Render(z, objs));
+  end;
+end;
+
+function MapDataHeightmapShard(var store: TCacheStore; ids: TIntegerArray;
+                               first, last: Integer): TMapBundle;
+var
+  i, z: Integer;
+  region: TRegion;
+  hm: THeightMap;
+begin
+  Result.Init();
+  for i := first to last - 1 do
+  begin
+    region := TRegion.Load(store, ids[i], []);
+    if not region.HasTerrain then Continue;
+
+    hm := THeightMap.Create(region);
+    for z := 0 to REGION_Z - 1 do
+      Result.Add(hm.ChunkName(z), hm.Render(z));
+  end;
+end;
+
+(*
+## ZipMapBins
+```pascal
+procedure ZipMapBins(binDir, zipPath: String);
+```
+Packs the supplied bounded bundle names out of `binDir` into `zipPath`, in that
+order, overwriting an existing file.
+
+{ref}`TZipWriter` rather than Simba's `ZipFiles`, because `ZipFiles` stamps each
+member with its source file's mtime and this build exposes no way to set one -
+the container would then hash differently on every rebuild from identical input,
+which is exactly what `hashes.json` is supposed to be able to detect.
+
+A missing or empty member raises instead of producing a short container: a
+half-built `mapdata.zip` fails at the far end, inside a user's map loader.
+*)
+procedure ZipMapFiles(binDir, zipPath: String; names: TStringArray);
+var
+  zip: TZipWriter;
+  data: TByteArray;
+  dir, path: String;
+  i: Integer;
+begin
+  if Length(names) = 0 then
+    raise 'MapData: refusing to zip no map bundles';
+  dir := PathIncludeTrailingSep(binDir);
+
+  zip.Init();
+  for i := 0 to High(names) do
+  begin
+    path := dir + names[i];
+    if not FileExists(path) then
+      raise 'MapData: no ' + path + ' to pack into ' + zipPath;
+
+    data := FileReadBytes(path);
+    if Length(data) = 0 then
+      raise 'MapData: ' + path + ' is empty';
+
+    zip.AddBytes(names[i], data);
+  end;
+
+  FileDelete(zipPath);
+  zip.Save(zipPath);
+end;
+
+procedure ZipMapBins(binDir, zipPath: String);
+begin
+  // Kept for the legacy three-bundle test and callers. New dumps call the
+  // general routine with bounded shard names instead.
+  ZipMapFiles(binDir, zipPath, MAPDATA_BINS);
+end;
+
+(*
+## DumpMapData
+```pascal
+function DumpMapData(var store: TCacheStore; zipPath, binDir: String): TIntegerArray;
+```
+Writes the whole map artefact for `store`: bounded map, collision and heightmap
+shards into `binDir`, then `zipPath` around them. Returns one millisecond value
+per family in `MAPDATA_SHARD_PREFIXES` order. This runs for minutes, and a
+caller that wants to say where the time went should not have to instrument the
+internals to find out.
+
+The bins are left behind. They are the expensive artefact and the only one worth
+re-zipping without a rebuild; the Java pipeline deleted them because CI had
+nothing to do with them afterwards, which is not a property of the data.
+
+Only one 256-region shard is resident at a time; it is written and dropped
+before the next shard is built. This removes the whole-family 3.1-GB image
+retention from the critical path.
+
+```pascal
+ms := DumpMapData(store, assets + 'map/mapdata.zip', assets + 'map/bins');
+WriteLn('map shards took ', ms[0], ' ms');
+```
+*)
+function DumpMapData(var store: TCacheStore; zipPath, binDir: String): TIntegerArray;
+var
+  bundle: TMapBundle;
+  dir, name: String;
+  names: TStringArray;
+  regionIds: TIntegerArray;
+  mi: TMapImage;
+  world: TCollisionWorld;
+  objs: TCollisionObjects;
+  t: Double;
+  shard, shardCount, first, last: Integer;
+begin
+  dir := PathIncludeTrailingSep(binDir);
+  if not DirExists(dir) and not DirCreate(dir) then
+    raise 'MapData: could not create ' + dir;
+
+  regionIds := MapDataRegionIds(store);
+  shardCount := (Length(regionIds) + MAPDATA_REGIONS_PER_SHARD - 1) div
+                MAPDATA_REGIONS_PER_SHARD;
+  if shardCount = 0 then
+    raise 'MapData: cache declares no map regions';
+  WriteLn('MapData: ', Length(regionIds), ' regions -> ', shardCount,
+          ' shards per family (', shardCount * Length(MAPDATA_SHARD_PREFIXES),
+          ' files total)');
+
+  t := PerformanceTime();
+  mi := TMapImage.Create(store);
+  WriteLn('MapData: [1/3] map images — warm renderer retained across shards');
+  for shard := 0 to shardCount - 1 do
+  begin
+    first := shard * MAPDATA_REGIONS_PER_SHARD;
+    last := Min(Length(regionIds), first + MAPDATA_REGIONS_PER_SHARD);
+    WriteLn('MapData:   map       shard ', shard + 1, '/', shardCount,
+            '  regions ', first + 1, '-', last);
+    bundle := MapDataImageShard(mi, regionIds, first, last);
+    name := MapDataShardName(MAPDATA_SHARD_PREFIXES[0], shard);
+    bundle.Save(dir + name);
+    names += name;
+    bundle.Init();
+  end;
+  Result += Round(PerformanceTime() - t);
+  WriteLn('MapData: [1/3] map images done in ', Result[0], ' ms');
+
+  t := PerformanceTime();
+  world := TCollisionWorld.FromStore(store);
+  objs := TCollisionObjects.Create(store);
+  WriteLn('MapData: [2/3] collision — world and object definitions loaded once');
+  for shard := 0 to shardCount - 1 do
+  begin
+    first := shard * MAPDATA_REGIONS_PER_SHARD;
+    last := Min(Length(regionIds), first + MAPDATA_REGIONS_PER_SHARD);
+    WriteLn('MapData:   collision shard ', shard + 1, '/', shardCount,
+            '  regions ', first + 1, '-', last);
+    bundle := MapDataCollisionShard(store, regionIds, first, last, world, objs);
+    name := MapDataShardName(MAPDATA_SHARD_PREFIXES[1], shard);
+    bundle.Save(dir + name);
+    names += name;
+    bundle.Init();
+  end;
+  Result += Round(PerformanceTime() - t);
+  WriteLn('MapData: [2/3] collision done in ', Result[1], ' ms');
+
+  t := PerformanceTime();
+  WriteLn('MapData: [3/3] heightmap');
+  for shard := 0 to shardCount - 1 do
+  begin
+    first := shard * MAPDATA_REGIONS_PER_SHARD;
+    last := Min(Length(regionIds), first + MAPDATA_REGIONS_PER_SHARD);
+    WriteLn('MapData:   heightmap shard ', shard + 1, '/', shardCount,
+            '  regions ', first + 1, '-', last);
+    bundle := MapDataHeightmapShard(store, regionIds, first, last);
+    name := MapDataShardName(MAPDATA_SHARD_PREFIXES[2], shard);
+    bundle.Save(dir + name);
+    names += name;
+    bundle.Init();
+  end;
+  Result += Round(PerformanceTime() - t);
+  WriteLn('MapData: [3/3] heightmap done in ', Result[2], ' ms');
+
+  WriteLn('MapData: packing ', Length(names), ' shards into mapdata.zip…');
+  ZipMapFiles(dir, zipPath, names);
+  WriteLn('MapData: mapdata.zip ready');
+end;

@@ -1,0 +1,470 @@
+(*
+# CacheDefs
+One handle on a cache directory that answers "give me definition `id`", so a
+dumper does not have to know which index a thing lives in, which archive inside
+it, or that file ids are not array positions.
+
+```pascal
+var defs: TCacheDefs;
+defs := TCacheDefs.Create(GetEnvVar('HOME') + '/.runelite/jagexcache/oldschool/LIVE');
+WriteLn(defs.Item(4151).Name);   // Abyssal whip
+```
+
+## What lives where
+| method | index | archive |
+|---|---|---|
+| `Item`/`Obj`/`Npc`/`Underlay`/`Overlay` | 2 CONFIGS | the `EConfigType` archive, split into files |
+| `Texture`/`Textures` | 9 TEXTURES | archive 0, split into files |
+| `Model` | 7 MODELS | one archive per model, one file |
+| `Sprites` | 8 SPRITES | one archive per sprite, many frames |
+| `Region` | 5 MAPS | one archive per region |
+
+## Caching
+The config archives and the texture archive are read, decompressed and split on
+the first lookup that needs them, then kept. That first read is not cheap - the
+ITEM archive is 2.6 MB of bzip2 - and a dumper asks for tens of thousands of
+definitions, so it has to be paid once. Each archive gets its own slot, so
+asking for an object does not evict the items.
+
+Only the *bytes* are cached, not the decoded records: every call decodes fresh,
+which costs microseconds and means a returned definition can never be a window
+into the cache. Textures are the one exception - they are decoded once because
+`Model.Colors` needs the whole table - and `Textures`/`Texture` therefore hand
+out copies, `FileIds` included. Mutate what you get back freely.
+
+`TCacheDefs` is a plain record and `Store` is a plain field, so the cache lives
+on whichever variable holds it: copy the record and the copy starts cold, same
+as `TCacheStore`. Pass it as `var` rather than by value.
+
+## Do not use this to walk a whole archive
+Every by-id lookup maps the id to a file position through `FilePositionOf`,
+which is a scan. Calling it 33372 times to read every item is quadratic. To
+iterate, walk the reference table and the file array together by position -
+`FileIds[i]` is the id of file `i`:
+
+```pascal
+table := defs.Store.GetRefTable(Ord(EIndexType.CONFIGS));
+a := table.IndexOfArchive(Ord(EConfigType.ITEM));
+files := defs.Store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.ITEM), []);
+for i := 0 to High(files) do
+  item := TItemDefinition.Load(table.Archives[a].FileIds[i], files[i]);
+```
+
+## Misses
+An id the cache does not hold gives back a default definition with `Id = -1`
+(`HasTerrain = False` for a region, an empty array for sprites) rather than
+raising: id spaces are sparse and a caller sweeping a range should not have to
+know where the holes are. A malformed *present* archive still raises from the
+loader underneath - that is a bug, not a gap.
+*)
+{$DEFINE WL_CACHE_DEFS_INCLUDED}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_REGION_INCLUDED}{$INCLUDE_ONCE region.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_ITEM_INCLUDED}{$INCLUDE_ONCE defs/item.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_OBJECT_INCLUDED}{$INCLUDE_ONCE defs/object.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_NPC_INCLUDED}{$INCLUDE_ONCE defs/npc.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_TERRAIN_INCLUDED}{$INCLUDE_ONCE defs/terrain.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_SPRITE_INCLUDED}{$INCLUDE_ONCE defs/sprite.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_MODEL_INCLUDED}{$INCLUDE_ONCE defs/model.simba}{$ENDIF}
+
+type
+  // One split archive. This wrapper exists only because the cache is a list of
+  // file arrays and `array of array of TByteArray` is a shape worth avoiding.
+  TCacheFileSet = record
+    Files: array of TByteArray;
+  end;
+
+  TCacheDefs = record
+    Store: TCacheStore;
+
+    // Per-config-archive file cache, two parallel arrays scanned linearly:
+    // there are 21 config archives at most and only a handful are ever asked
+    // for, so a scan beats a map. See TCacheDefs.CacheSlot.
+    CfgIds: TIntegerArray;
+    CfgFiles: array of TCacheFileSet;
+
+    TexLoaded: Boolean;
+    TexDefs: array of TTextureDefinition;
+  end;
+
+(*
+## TCacheDefs.Create
+```pascal
+function TCacheDefs.Create(directory: String): TCacheDefs; static;
+```
+Opens the cache in `directory` - the folder holding `main_file_cache.dat2`,
+e.g. `~/.runelite/jagexcache/oldschool/LIVE`. Raises if there is none.
+Reads nothing yet; the first lookup does that.
+*)
+function TCacheDefs.Create(directory: String): TCacheDefs; static;
+begin
+  Result.Store := TCacheStore.Create(directory);
+end;
+
+// Index of cfg's slot in CfgIds/CfgFiles, reading and splitting the archive on
+// the first call for it. Self is by reference, so the split survives the call.
+function TCacheDefs.CacheSlot(cfg: Integer): Integer;
+var
+  i: Integer;
+begin
+  for i := 0 to High(Self.CfgIds) do
+    if Self.CfgIds[i] = cfg then Exit(i);
+
+  SetLength(Self.CfgIds, Length(Self.CfgIds) + 1);
+  SetLength(Self.CfgFiles, Length(Self.CfgFiles) + 1);
+  Result := High(Self.CfgIds);
+  Self.CfgIds[Result] := cfg;
+  Self.CfgFiles[Result].Files := Self.Store.ReadFiles(Ord(EIndexType.CONFIGS), cfg, []);
+end;
+
+(*
+## TCacheDefs.ConfigFile
+```pascal
+function TCacheDefs.ConfigFile(cfg, id: Integer; var data: TByteArray): Boolean;
+```
+The one file holding definition `id` in config archive `cfg`, or False if the
+archive has no such id. `data` aliases the cached bytes rather than copying
+them - the loaders only read it.
+
+The id is resolved through the reference table *before* the archive is touched,
+so a miss on a cold `TCacheDefs` costs a table lookup instead of a 2.6 MB bzip2
+decompress.
+*)
+function TCacheDefs.ConfigFile(cfg, id: Integer; var data: TByteArray): Boolean;
+var
+  slot, pos: Integer;
+begin
+  data := [];
+  if id < 0 then Exit(False);
+
+  // Never `Files[id]`: file ids have gaps, so from the first one on, the id and
+  // the array position are different numbers. See FilePositionOf.
+  pos := FilePositionOf(Self.Store.GetRefTable(Ord(EIndexType.CONFIGS)), cfg, id);
+  if pos = -1 then Exit(False);
+
+  slot := Self.CacheSlot(cfg);
+  if pos > High(Self.CfgFiles[slot].Files) then Exit(False);
+
+  data := Self.CfgFiles[slot].Files[pos];
+  Result := True;
+end;
+
+// How many definitions config archive cfg holds. Answered from the reference
+// table, so it does not pull the archive itself in.
+function TCacheDefs.ConfigCount(cfg: Integer): Integer;
+var
+  table: TCacheRefTable;
+  a: Integer;
+begin
+  table := Self.Store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(cfg);
+  if a = -1 then Exit(0);
+  Result := Length(table.Archives[a].FileIds);
+end;
+
+(*
+## TCacheDefs.Item
+```pascal
+function TCacheDefs.Item(id: Integer): TItemDefinition;
+```
+Item definition `id`, or `TItemDefinition.Default(-1)` if the cache has no such
+item.
+*)
+function TCacheDefs.Item(id: Integer): TItemDefinition;
+var
+  data: TByteArray;
+begin
+  if not Self.ConfigFile(Ord(EConfigType.ITEM), id, data) then
+  begin
+    Result := TItemDefinition.Default(-1);
+    Exit;
+  end;
+  Result := TItemDefinition.Load(id, data);
+end;
+
+(*
+## TCacheDefs.Obj
+```pascal
+function TCacheDefs.Obj(id: Integer): TObjectDefinition;
+```
+Object definition `id`, or `TObjectDefinition.Default(-1)` if there is none.
+Named `Obj` because `Object` is a reserved word in Lape.
+*)
+function TCacheDefs.Obj(id: Integer): TObjectDefinition;
+var
+  data: TByteArray;
+begin
+  if not Self.ConfigFile(Ord(EConfigType.OBJECTS), id, data) then
+  begin
+    Result := TObjectDefinition.Default(-1);
+    Exit;
+  end;
+  Result := TObjectDefinition.Load(id, data);
+end;
+
+(*
+## TCacheDefs.Npc
+```pascal
+function TCacheDefs.Npc(id: Integer): TNpcDefinition;
+```
+NPC definition `id`, or `TNpcDefinition.Default(-1)` if there is none.
+*)
+function TCacheDefs.Npc(id: Integer): TNpcDefinition;
+var
+  data: TByteArray;
+begin
+  if not Self.ConfigFile(Ord(EConfigType.NPC), id, data) then
+  begin
+    Result := TNpcDefinition.Default(-1);
+    Exit;
+  end;
+  Result := TNpcDefinition.Load(id, data);
+end;
+
+(*
+## TCacheDefs.Underlay
+```pascal
+function TCacheDefs.Underlay(id: Integer): TUnderlayDefinition;
+```
+Underlay definition `id`, or a zeroed definition with `Id = -1`.
+
+Map tiles store an underlay as "id + 1", 0 meaning none - subtract one before
+calling, exactly as the Java map dumper's `findUnderlay(underlayId - 1)` does.
+*)
+function TCacheDefs.Underlay(id: Integer): TUnderlayDefinition;
+var
+  data: TByteArray;
+begin
+  if not Self.ConfigFile(Ord(EConfigType.UNDERLAY), id, data) then
+  begin
+    Result.Id := -1;  // the rest of Result is already zeroed
+    Exit;
+  end;
+  Result := TUnderlayDefinition.Load(id, data);
+end;
+
+(*
+## TCacheDefs.Overlay
+```pascal
+function TCacheDefs.Overlay(id: Integer): TOverlayDefinition;
+```
+Overlay definition `id`, or a zeroed definition with `Id = -1`. Tiles store
+overlay ids the same "id + 1" way underlays are stored.
+*)
+function TCacheDefs.Overlay(id: Integer): TOverlayDefinition;
+var
+  data: TByteArray;
+begin
+  if not Self.ConfigFile(Ord(EConfigType.OVERLAY), id, data) then
+  begin
+    Result.Id := -1;
+    Exit;
+  end;
+  Result := TOverlayDefinition.Load(id, data);
+end;
+
+// Decodes index 9 archive 0 once. The ids come from the reference table walked
+// by position alongside the files - one pass, no per-file lookup.
+procedure TCacheDefs.LoadTextures();
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids: TIntegerArray;
+  a, i: Integer;
+begin
+  if Self.TexLoaded then Exit;
+  Self.TexLoaded := True;
+  Self.TexDefs := [];
+
+  files := Self.Store.ReadFiles(Ord(EIndexType.TEXTURES), 0, []);
+  if Length(files) = 0 then Exit;
+
+  table := Self.Store.GetRefTable(Ord(EIndexType.TEXTURES));
+  a := table.IndexOfArchive(0);
+  if a = -1 then Exit;
+  ids := table.Archives[a].FileIds;
+
+  SetLength(Self.TexDefs, Length(files));
+  for i := 0 to High(files) do
+    Self.TexDefs[i] := TTextureDefinition.Load(ids[i], files[i]);
+end;
+
+(*
+## TCacheDefs.Textures
+```pascal
+function TCacheDefs.Textures(): array of TTextureDefinition;
+```
+Every texture definition, in file order - which is what `TModelDefinition.Colors`
+wants. **Position is not id**: the live cache has no texture 54, so position 54
+holds id 55 and everything after it is offset by one. Use `Texture(id)` to look
+one up.
+
+The array and its `FileIds` are copies; writing to them does not reach the cache.
+*)
+function TCacheDefs.Textures(): array of TTextureDefinition;
+var
+  i: Integer;
+begin
+  Self.LoadTextures();
+
+  // A record assignment copies the scalars but shares the dynamic arrays, so
+  // FileIds has to be copied explicitly or the caller holds a live handle on
+  // the cache. 208 textures - the copy does not show up in a profile.
+  SetLength(Result, Length(Self.TexDefs));
+  for i := 0 to High(Result) do
+  begin
+    Result[i] := Self.TexDefs[i];
+    Result[i].FileIds := Copy(Self.TexDefs[i].FileIds);
+  end;
+end;
+
+(*
+## TCacheDefs.Texture
+```pascal
+function TCacheDefs.Texture(id: Integer): TTextureDefinition;
+```
+The texture definition whose `Id` is `id`, or a zeroed definition with `Id = -1`
+if there is none (id 54 is such a hole in the live cache).
+
+This searches by id rather than indexing by position on purpose: 84 models take
+a wrong face colour when the table is indexed positionally, and nothing about
+the result looks wrong enough to notice.
+*)
+function TCacheDefs.Texture(id: Integer): TTextureDefinition;
+var
+  i: Integer;
+begin
+  Self.LoadTextures();
+
+  // Positional fast path first, then a scan; the guess is verified against the
+  // stored Id, so it can never answer for the wrong texture.
+  if (id >= 0) and (id <= High(Self.TexDefs)) and (Self.TexDefs[id].Id = id) then
+    i := id
+  else
+  begin
+    for i := 0 to High(Self.TexDefs) do
+      if Self.TexDefs[i].Id = id then Break;
+    // A loop that ran to the end leaves i past High; one that never ran leaves
+    // it at 0 with High at -1. Both are caught before TexDefs[i] is touched.
+    if (i > High(Self.TexDefs)) or (Self.TexDefs[i].Id <> id) then
+    begin
+      Result.Id := -1;
+      Exit;
+    end;
+  end;
+
+  Result := Self.TexDefs[i];
+  Result.FileIds := Copy(Self.TexDefs[i].FileIds);
+end;
+
+(*
+## TCacheDefs.Model
+```pascal
+function TCacheDefs.Model(id: Integer): TModelDefinition;
+```
+Model `id`. Index 7 holds one model per archive, so this is a read and a decode
+with no archive split and nothing worth caching - the caller decides which
+models are worth keeping.
+
+An id outside index 7 gives a cleared definition with `Id = -1`; a model that is
+present but does not decode raises.
+*)
+function TCacheDefs.Model(id: Integer): TModelDefinition;
+var
+  data: TByteArray;
+begin
+  if (id < 0) or (id >= Self.Store.ArchiveCount(Ord(EIndexType.MODELS))) then
+  begin
+    Result.Reset(-1);
+    Exit;
+  end;
+
+  data := Self.Store.Read(Ord(EIndexType.MODELS), id, []);
+  if Length(data) = 0 then
+  begin
+    Result.Reset(-1);
+    Exit;
+  end;
+
+  Result := TModelDefinition.Load(id, data);
+end;
+
+(*
+## TCacheDefs.Sprites
+```pascal
+function TCacheDefs.Sprites(archive: Integer): array of TSpriteDefinition;
+```
+Every frame of sprite archive `archive`. Sprites come in archives, not files:
+one archive is one sprite and holds one frame per animation step, so this
+returns an array where the other lookups return a record.
+
+An unallocated archive - index 8 has plenty - gives an empty array.
+*)
+function TCacheDefs.Sprites(archive: Integer): array of TSpriteDefinition;
+var
+  data: TByteArray;
+begin
+  if (archive < 0) or (archive >= Self.Store.ArchiveCount(Ord(EIndexType.SPRITES))) then
+    Exit([]);
+
+  data := Self.Store.Read(Ord(EIndexType.SPRITES), archive, []);
+  if Length(data) = 0 then Exit([]);
+
+  Result := TSpriteDefinition.LoadAll(archive, data);
+end;
+
+(*
+## TCacheDefs.Region
+```pascal
+function TCacheDefs.Region(x, y: Integer): TRegion;
+```
+The region at region coordinates `x, y` - i.e. world coordinates shifted right
+by 6. A region that is not in the cache comes back with `HasTerrain = False`.
+
+No XTEA keys are passed. A live client cache does not need them (see
+`dev/tests/290_region.simba`, which loads all 2870 regions with none); call
+`TRegion.Load` directly if you ever work off a dump that does.
+*)
+function TCacheDefs.Region(x, y: Integer): TRegion;
+begin
+  Result := TRegion.Load(Self.Store, RegionIdOf(x, y), []);
+end;
+
+(*
+## TCacheDefs.ItemCount
+```pascal
+function TCacheDefs.ItemCount(): Integer;
+```
+How many item definitions the cache holds. This is a *file count*, not
+`max id + 1`: the archive has gaps, so the highest item id is larger than this.
+*)
+function TCacheDefs.ItemCount(): Integer;
+begin
+  Result := Self.ConfigCount(Ord(EConfigType.ITEM));
+end;
+
+(*
+## TCacheDefs.ObjCount
+```pascal
+function TCacheDefs.ObjCount(): Integer;
+```
+How many object definitions the cache holds. A file count, see `ItemCount`.
+*)
+function TCacheDefs.ObjCount(): Integer;
+begin
+  Result := Self.ConfigCount(Ord(EConfigType.OBJECTS));
+end;
+
+(*
+## TCacheDefs.NpcCount
+```pascal
+function TCacheDefs.NpcCount(): Integer;
+```
+How many NPC definitions the cache holds. The NPC archive happens to have no
+gaps today, so this also equals `max id + 1` - do not rely on that.
+*)
+function TCacheDefs.NpcCount(): Integer;
+begin
+  Result := Self.ConfigCount(Ord(EConfigType.NPC));
+end;

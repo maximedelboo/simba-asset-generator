@@ -1,0 +1,260 @@
+(*
+# ByteStream
+Big-endian cursor over a byte array. The Jagex cache is big-endian throughout.
+Dependency-free on purpose: this unit compiles standalone so tests stay fast.
+*)
+{$DEFINE WL_CACHE_BYTESTREAM_INCLUDED}
+
+type
+  TByteStream = record
+    Data: TByteArray;
+    Position: Integer;
+  end;
+
+  // Parallel arrays instead of a map: Lape has no generic dictionary and the
+  // consumers only ever iterate or linear-search these (they are tiny).
+  // See TByteStream.ReadParams for the ordering contract.
+  TCacheParams = record
+    Ids: TIntegerArray;
+    IsString: TBooleanArray;
+    Ints: TInt64Array;
+    Strings: TStringArray;
+  end;
+
+function TByteStream.Create(const data: TByteArray): TByteStream; static;
+begin
+  Result.Data := data;
+  Result.Position := 0;
+end;
+
+function TByteStream.Length(): Integer;
+begin
+  Result := System.Length(Self.Data);
+end;
+
+function TByteStream.Remaining(): Integer;
+begin
+  Result := Self.Length() - Self.Position;
+end;
+
+function TByteStream.ReadUByte(): Integer;
+begin
+  if Self.Position >= Self.Length() then
+    raise 'ByteStream: read past end at ' + ToStr(Self.Position);
+  Result := Self.Data[Self.Position];
+  Inc(Self.Position);
+end;
+
+function TByteStream.PeekUByte(): Integer;
+begin
+  if Self.Position >= Self.Length() then
+    raise 'ByteStream: peek past end at ' + ToStr(Self.Position);
+  Result := Self.Data[Self.Position];
+end;
+
+function TByteStream.ReadUShort(): Integer;
+begin
+  Result := (Self.ReadUByte() shl 8) or Self.ReadUByte();
+end;
+
+function TByteStream.ReadUMedium(): Integer;
+begin
+  Result := (Self.ReadUByte() shl 16) or (Self.ReadUByte() shl 8) or Self.ReadUByte();
+end;
+
+function TByteStream.ReadInt(): Integer;
+var
+  v: UInt32;
+begin
+  v := (UInt32(Self.ReadUByte()) shl 24) or (UInt32(Self.ReadUByte()) shl 16) or
+       (UInt32(Self.ReadUByte()) shl 8) or UInt32(Self.ReadUByte());
+  Result := Integer(v);
+end;
+
+// Reference tables with protocol >= 7 use this for ids and counts.
+function TByteStream.ReadBigSmart(): Integer;
+begin
+  if Self.PeekUByte() < $80 then
+    Result := Self.ReadUShort()
+  else
+    Result := Self.ReadInt() and $7FFFFFFF;
+end;
+
+function TByteStream.ReadBytes(count: Integer): TByteArray;
+var
+  i: Integer;
+begin
+  if Self.Position + count > Self.Length() then
+    raise 'ByteStream: ReadBytes past end (' + ToStr(count) + ' at ' + ToStr(Self.Position) + ')';
+  SetLength(Result, count);
+  for i := 0 to count - 1 do
+    Result[i] := Self.Data[Self.Position + i];
+  Self.Position += count;
+end;
+
+procedure TByteStream.SetPosition(pos: Integer);
+begin
+  if (pos < 0) or (pos > Self.Length()) then
+    raise 'ByteStream: SetPosition out of range: ' + ToStr(pos);
+  Self.Position := pos;
+end;
+
+function TByteStream.ReadByte(): Integer;
+begin
+  Result := Self.ReadUByte();
+  if Result > 127 then Result -= 256;
+end;
+
+function TByteStream.ReadShort(): Integer;
+begin
+  Result := Self.ReadUShort();
+  if Result > 32767 then Result -= 65536;
+end;
+
+// Object/NPC model ids use this: high bit set means a 4-byte id,
+// otherwise a 2-byte id where 32767 encodes "none".
+function TByteStream.ReadBigSmart2(): Integer;
+begin
+  if Self.PeekUByte() >= $80 then
+    Exit(Self.ReadInt() and $7FFFFFFF);
+  Result := Self.ReadUShort();
+  if Result = 32767 then Result := -1;
+end;
+
+// Range 0..32767: a lead byte < $80 is the whole value (0..127), else two bytes.
+function TByteStream.ReadUShortSmart(): Integer;
+begin
+  if Self.PeekUByte() < 128 then
+    Result := Self.ReadUByte()
+  else
+    Result := Self.ReadUShort() - $8000;
+end;
+
+// Range -1..32766: ReadUShortSmart shifted down by one, so -1 means "absent".
+function TByteStream.ReadUShortSmartMinusOne(): Integer;
+begin
+  if Self.PeekUByte() < 128 then
+    Result := Self.ReadUByte() - 1
+  else
+    Result := Self.ReadUShort() - $8001;
+end;
+
+// Range -16384..16383, signed: a lead byte < $80 covers -64..63 (so the highest
+// one-byte value is $7F - 64 = 63), two bytes cover the rest.
+function TByteStream.ReadShortSmart(): Integer;
+begin
+  if Self.PeekUByte() < 128 then
+    Result := Self.ReadUByte() - 64
+  else
+    Result := Self.ReadUShort() - $C000;
+end;
+
+// Locations use this for the object-id delta: 32767 is a continuation marker.
+function TByteStream.ReadUIntSmartShortCompat(): Integer;
+var
+  v: Integer;
+begin
+  Result := 0;
+  v := Self.ReadUShortSmart();
+  while v = 32767 do
+  begin
+    Result += 32767;
+    v := Self.ReadUShortSmart();
+  end;
+  Result += v;
+end;
+
+// The cache stores cp1252-ish bytes. Java maps 128..159 through this table to
+// Unicode and writes the result as UTF-8, so we encode to UTF-8 here to keep
+// generated JSON byte-identical to the Java pipeline's. Bytes 160..255 are
+// Latin-1 code points and become two UTF-8 bytes.
+function TByteStream.ReadJagexString(): String;
+const
+  CP1252: TIntegerArray = [
+    $20AC, $0000, $201A, $0192, $201E, $2026, $2020, $2021,
+    $02C6, $2030, $0160, $2039, $0152, $0000, $017D, $0000,
+    $0000, $2018, $2019, $201C, $201D, $2022, $2013, $2014,
+    $02DC, $2122, $0161, $203A, $0153, $0000, $017E, $0178
+  ];
+var
+  b, cp: Integer;
+begin
+  Result := '';
+  while True do
+  begin
+    b := Self.ReadUByte();
+    if b = 0 then Break;
+
+    cp := b;
+    if (b >= 128) and (b < 160) then
+    begin
+      cp := CP1252[b - 128];
+      if cp = 0 then cp := Ord('?');
+    end;
+
+    if cp < $80 then
+      Result += Char(cp)
+    else if cp < $800 then
+      Result += Char($C0 or (cp shr 6)) + Char($80 or (cp and $3F))
+    else
+      Result += Char($E0 or (cp shr 12)) + Char($80 or ((cp shr 6) and $3F)) +
+                Char($80 or (cp and $3F));
+  end;
+end;
+
+(*
+## TByteStream.ReadParams
+```pascal
+function TByteStream.ReadParams(): TCacheParams;
+```
+Reads the opcode 249 parameter block carried by item, object and NPC
+definitions: a count byte, then per entry a type byte, a 24-bit param id and a
+value. Type 1 is a string, type 2 a signed 64-bit integer, anything else a
+32-bit integer.
+
+Entry `i` is `Ids[i]` plus exactly one value: `IsString[i]` selects which of
+`Strings[i]` and `Ints[i]` is meaningful. The other one is left at its zero
+value and must not be read.
+
+Ordering: these arrays are in cache order. Java's `readParams` builds a
+`HashMap<Integer,Object>` and `ItemExporter` hands that map straight to Gson, so
+the JSON the Java pipeline ships is in HashMap **bucket** order, not cache order
+- `29289.json` has key `295` between `7` and `8` because `295 and 15 = 7` lands
+it in bucket 7. Cache order is strictly more information, but any consumer
+generating JSON that has to hash-match the Java output must reproduce bucket
+order, not array order.
+
+Open question: a HashMap keeps only the *last* value for a duplicate param id,
+whereas these arrays keep every entry. Whether the cache ever emits duplicate
+ids within one definition is unverified.
+*)
+function TByteStream.ReadParams(): TCacheParams;
+var
+  i, count, kind, hi, lo: Integer;
+begin
+  count := Self.ReadUByte();
+  SetLength(Result.Ids, count);
+  SetLength(Result.IsString, count);
+  SetLength(Result.Ints, count);
+  SetLength(Result.Strings, count);
+
+  for i := 0 to count - 1 do
+  begin
+    kind := Self.ReadUByte();
+    Result.Ids[i] := Self.ReadUMedium();
+    case kind of
+      1: begin
+           Result.IsString[i] := True;
+           Result.Strings[i] := Self.ReadJagexString();
+         end;
+      // Big-endian signed 64-bit. Read the halves into locals first so the
+      // byte order does not depend on operand evaluation order.
+      2: begin
+           hi := Self.ReadInt();
+           lo := Self.ReadInt();
+           Result.Ints[i] := (Int64(hi) shl 32) or Int64(UInt32(lo));
+         end;
+      else Result.Ints[i] := Self.ReadInt();
+    end;
+  end;
+end;

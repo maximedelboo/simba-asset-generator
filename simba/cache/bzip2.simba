@@ -1,0 +1,431 @@
+(*
+# BZip2
+Pure-Simba bzip2 decoder. Simba's ECompressAlgo has no BZIP2, and the OSRS cache
+stores about 12% of its containers with it - including the idx255 reference tables
+and the ITEM definition archive, so nothing about the cache is readable without this.
+
+The cache stores headerless bzip2 block data; callers prepend `BZh1` before calling
+in. This decoder accepts a normal bzip2 stream.
+*)
+{$DEFINE WL_CACHE_BZIP2_INCLUDED}
+
+const
+  BZ_MAX_ALPHA_SIZE: Integer = 258;
+  BZ_MAX_CODE_LEN:   Integer = 23;
+  BZ_G_SIZE:         Integer = 50;
+  BZ_RUNA:           Integer = 0;
+  BZ_RUNB:           Integer = 1;
+
+type
+  TBZip2Decoder = record
+    Data: TByteArray;
+    BitPos: Int64;
+    BlockSize100k: Integer;
+
+    // per block
+    OrigPtr: Integer;
+    NInUse, AlphaSize, NGroups, NSelectors: Integer;
+    SeqToUnseq: TByteArray;
+    Selectors: TByteArray;
+    Lens: array of TIntegerArray;    // [group][symbol]
+    Limit, Base, Perm: array of TIntegerArray;
+    MinLens: TIntegerArray;
+
+    // decoded BWT string for the current block
+    LL8: TByteArray;
+    GroupNo, GroupPos, CurrGroup: Integer;
+  end;
+
+function TBZip2Decoder.ReadBits(count: Integer): UInt32;
+var
+  i: Integer;
+  byteIdx: Int64;
+begin
+  Result := 0;
+  for i := 1 to count do
+  begin
+    byteIdx := Self.BitPos shr 3;
+    if byteIdx >= Length(Self.Data) then
+      raise 'BZip2: read past end of stream at bit ' + ToStr(Self.BitPos);
+    Result := (Result shl 1) or ((Self.Data[byteIdx] shr (7 - (Self.BitPos and 7))) and 1);
+    Inc(Self.BitPos);
+  end;
+end;
+
+procedure TBZip2Decoder.ReadStreamHeader();
+var
+  b0, b1, b2, level: UInt32;
+begin
+  b0 := Self.ReadBits(8);
+  b1 := Self.ReadBits(8);
+  b2 := Self.ReadBits(8);
+  level := Self.ReadBits(8);
+
+  if (b0 <> Ord('B')) or (b1 <> Ord('Z')) or (b2 <> Ord('h')) then
+    raise 'BZip2: bad magic';
+  if (level < Ord('1')) or (level > Ord('9')) then
+    raise 'BZip2: bad level ' + ToStr(level);
+
+  Self.BlockSize100k := Integer(level) - Ord('0');
+end;
+
+// Builds the canonical Huffman decode tables for one group, bzlib style.
+procedure TBZip2Decoder.CreateDecodeTables(group, minLen, maxLen: Integer);
+var
+  i, j, pp, vec: Integer;
+begin
+  SetLength(Self.Limit[group], BZ_MAX_CODE_LEN + 1);
+  SetLength(Self.Base[group], BZ_MAX_CODE_LEN + 1);
+  SetLength(Self.Perm[group], BZ_MAX_ALPHA_SIZE);
+
+  pp := 0;
+  for i := minLen to maxLen do
+    for j := 0 to Self.AlphaSize - 1 do
+      if Self.Lens[group][j] = i then
+      begin
+        Self.Perm[group][pp] := j;
+        Inc(pp);
+      end;
+
+  for i := 0 to BZ_MAX_CODE_LEN do
+  begin
+    Self.Base[group][i] := 0;
+    Self.Limit[group][i] := 0;
+  end;
+
+  for i := 0 to Self.AlphaSize - 1 do
+    Self.Base[group][Self.Lens[group][i] + 1] += 1;
+  for i := 1 to BZ_MAX_CODE_LEN do
+    Self.Base[group][i] += Self.Base[group][i - 1];
+
+  vec := 0;
+  for i := minLen to maxLen do
+  begin
+    vec += Self.Base[group][i + 1] - Self.Base[group][i];
+    Self.Limit[group][i] := vec - 1;
+    vec := vec shl 1;
+  end;
+
+  for i := minLen + 1 to maxLen do
+    Self.Base[group][i] := ((Self.Limit[group][i - 1] + 1) shl 1) - Self.Base[group][i];
+end;
+
+// Returns False when the end-of-stream marker is hit instead of a block.
+function TBZip2Decoder.ReadBlockHeader(): Boolean;
+var
+  hi, lo: UInt32;
+  used16, bits: UInt32;
+  i, j, t, v, tmp, curr, minLen, maxLen: Integer;
+  pos: TIntegerArray;
+  mtfSelectors: TIntegerArray;
+begin
+  hi := Self.ReadBits(24);
+  lo := Self.ReadBits(24);
+
+  if (hi = $177245) and (lo = $385090) then
+  begin
+    Self.ReadBits(32);   // combined stream CRC
+    Exit(False);
+  end;
+  if (hi <> $314159) or (lo <> $265359) then
+    raise 'BZip2: bad block magic';
+
+  Self.ReadBits(32);     // block CRC, not verified: fixtures are the oracle
+  if Self.ReadBits(1) <> 0 then
+    raise 'BZip2: randomised blocks are not supported';
+  Self.OrigPtr := Integer(Self.ReadBits(24));
+
+  // symbol map
+  SetLength(Self.SeqToUnseq, 256);
+  Self.NInUse := 0;
+  used16 := Self.ReadBits(16);
+  for i := 0 to 15 do
+    if ((used16 shr (15 - i)) and 1) = 1 then
+    begin
+      bits := Self.ReadBits(16);
+      for j := 0 to 15 do
+        if ((bits shr (15 - j)) and 1) = 1 then
+        begin
+          Self.SeqToUnseq[Self.NInUse] := i * 16 + j;
+          Inc(Self.NInUse);
+        end;
+    end;
+  if Self.NInUse = 0 then
+    raise 'BZip2: empty symbol map';
+  Self.AlphaSize := Self.NInUse + 2;
+
+  Self.NGroups := Integer(Self.ReadBits(3));
+  Self.NSelectors := Integer(Self.ReadBits(15));
+
+  // selectors, MTF-coded in unary
+  SetLength(mtfSelectors, Self.NSelectors);
+  for i := 0 to Self.NSelectors - 1 do
+  begin
+    j := 0;
+    while Self.ReadBits(1) = 1 do
+    begin
+      Inc(j);
+      if j >= Self.NGroups then raise 'BZip2: selector out of range';
+    end;
+    mtfSelectors[i] := j;
+  end;
+
+  SetLength(pos, Self.NGroups);
+  for i := 0 to Self.NGroups - 1 do pos[i] := i;
+
+  SetLength(Self.Selectors, Self.NSelectors);
+  for i := 0 to Self.NSelectors - 1 do
+  begin
+    v := mtfSelectors[i];
+    tmp := pos[v];
+    while v > 0 do
+    begin
+      pos[v] := pos[v - 1];
+      Dec(v);
+    end;
+    pos[0] := tmp;
+    Self.Selectors[i] := tmp;
+  end;
+
+  // code lengths, delta-coded per group
+  SetLength(Self.Lens, Self.NGroups);
+  SetLength(Self.Limit, Self.NGroups);
+  SetLength(Self.Base, Self.NGroups);
+  SetLength(Self.Perm, Self.NGroups);
+  SetLength(Self.MinLens, Self.NGroups);
+
+  for t := 0 to Self.NGroups - 1 do
+  begin
+    SetLength(Self.Lens[t], BZ_MAX_ALPHA_SIZE);
+    curr := Integer(Self.ReadBits(5));
+    for i := 0 to Self.AlphaSize - 1 do
+    begin
+      while Self.ReadBits(1) = 1 do
+        if Self.ReadBits(1) = 0 then Inc(curr) else Dec(curr);
+      if (curr < 1) or (curr > 20) then
+        raise 'BZip2: code length out of range: ' + ToStr(curr);
+      Self.Lens[t][i] := curr;
+    end;
+  end;
+
+  for t := 0 to Self.NGroups - 1 do
+  begin
+    minLen := 32;
+    maxLen := 0;
+    for i := 0 to Self.AlphaSize - 1 do
+    begin
+      if Self.Lens[t][i] > maxLen then maxLen := Self.Lens[t][i];
+      if Self.Lens[t][i] < minLen then minLen := Self.Lens[t][i];
+    end;
+    Self.CreateDecodeTables(t, minLen, maxLen);
+    Self.MinLens[t] := minLen;
+  end;
+
+  Result := True;
+end;
+
+function TBZip2Decoder.NextSymbol(): Integer;
+var
+  zn: Integer;
+  zvec: Integer;
+begin
+  if Self.GroupPos = 0 then
+  begin
+    Inc(Self.GroupNo);
+    if Self.GroupNo >= Self.NSelectors then
+      raise 'BZip2: ran out of selectors';
+    Self.GroupPos := BZ_G_SIZE;
+    Self.CurrGroup := Self.Selectors[Self.GroupNo];
+  end;
+  Dec(Self.GroupPos);
+
+  zn := Self.MinLens[Self.CurrGroup];
+  zvec := Integer(Self.ReadBits(zn));
+  while zvec > Self.Limit[Self.CurrGroup][zn] do
+  begin
+    Inc(zn);
+    if zn > BZ_MAX_CODE_LEN then
+      raise 'BZip2: code length overflow while decoding a symbol';
+    zvec := (zvec shl 1) or Integer(Self.ReadBits(1));
+  end;
+
+  Result := Self.Perm[Self.CurrGroup][zvec - Self.Base[Self.CurrGroup][zn]];
+end;
+
+// Decodes the block's MTF/RLE2 stream into LL8. Returns the BWT block length.
+function TBZip2Decoder.DecodeSymbols(): Integer;
+var
+  mtf: TIntegerArray;
+  eob, sym, es, n, k, nn, b, i, limit: Integer;
+begin
+  eob := Self.AlphaSize - 1;
+  limit := 100000 * Self.BlockSize100k;
+  SetLength(Self.LL8, limit);
+
+  SetLength(mtf, Self.NInUse);
+  for i := 0 to Self.NInUse - 1 do
+    mtf[i] := i;
+
+  Self.GroupNo := -1;
+  Self.GroupPos := 0;
+  Result := 0;
+
+  sym := Self.NextSymbol();
+  while sym <> eob do
+  begin
+    if (sym = BZ_RUNA) or (sym = BZ_RUNB) then
+    begin
+      es := 0;
+      n := 1;
+      repeat
+        if sym = BZ_RUNA then
+          es += n
+        else
+          es += 2 * n;
+        n := n * 2;
+        if (n > limit) or (es > limit) then
+          raise 'BZip2: run length overflow';
+        sym := Self.NextSymbol();
+      until (sym <> BZ_RUNA) and (sym <> BZ_RUNB);
+
+      b := Self.SeqToUnseq[mtf[0]];
+      if Result + es > limit then
+        raise 'BZip2: block overflow during a run';
+      for k := 1 to es do
+      begin
+        Self.LL8[Result] := b;
+        Inc(Result);
+      end;
+    end
+    else
+    begin
+      nn := sym - 1;
+      if nn >= Self.NInUse then
+        raise 'BZip2: MTF index out of range: ' + ToStr(nn);
+
+      b := mtf[nn];
+      for k := nn downto 1 do
+        mtf[k] := mtf[k - 1];
+      mtf[0] := b;
+
+      if Result >= limit then
+        raise 'BZip2: block overflow';
+      Self.LL8[Result] := Self.SeqToUnseq[b];
+      Inc(Result);
+
+      sym := Self.NextSymbol();
+    end;
+  end;
+
+  SetLength(Self.LL8, Result);
+end;
+
+// Appends `times` copies of `value` to `output`, growing it geometrically.
+procedure BZEmit(var output: TByteArray; var outLen: Integer; value, times: Integer);
+var
+  j: Integer;
+begin
+  while outLen + times > Length(output) do
+    SetLength(output, Max(1024, Length(output) * 2));
+  for j := 1 to times do
+  begin
+    output[outLen] := value;
+    Inc(outLen);
+  end;
+end;
+
+// Undoes the Burrows-Wheeler transform, then the initial run-length encoding.
+// Appends the block's plaintext to `output`.
+procedure TBZip2Decoder.InverseBWTAndRLE(nblock: Integer; var output: TByteArray; var outLen: Integer);
+var
+  cftab: TIntegerArray;
+  tt: TIntegerArray;
+  bwt: TByteArray;
+  i, ch, sum, t, tPos, run, cnt: Integer;
+  b: Integer;
+begin
+  if (Self.OrigPtr < 0) or (Self.OrigPtr >= nblock) then
+    raise 'BZip2: origPtr out of range';
+
+  SetLength(cftab, 256);
+  for i := 0 to 255 do cftab[i] := 0;
+  for i := 0 to nblock - 1 do
+    cftab[Self.LL8[i]] += 1;
+
+  sum := 0;
+  for i := 0 to 255 do
+  begin
+    t := cftab[i];
+    cftab[i] := sum;
+    sum += t;
+  end;
+
+  SetLength(tt, nblock);
+  for i := 0 to nblock - 1 do
+  begin
+    ch := Self.LL8[i];
+    tt[cftab[ch]] := i;
+    cftab[ch] += 1;
+  end;
+
+  SetLength(bwt, nblock);
+  tPos := tt[Self.OrigPtr];
+  for i := 0 to nblock - 1 do
+  begin
+    bwt[i] := Self.LL8[tPos];
+    tPos := tt[tPos];
+  end;
+
+  // RLE1: four identical bytes are followed by a count byte of extra repeats
+  i := 0;
+  while i < nblock do
+  begin
+    b := bwt[i];
+    run := 1;
+    while (i + run < nblock) and (run < 4) and (bwt[i + run] = b) do
+      Inc(run);
+
+    BZEmit(output, outLen, b, run);
+
+    if run = 4 then
+    begin
+      if i + 4 >= nblock then
+        raise 'BZip2: truncated RLE1 run';
+      cnt := bwt[i + 4];
+      if cnt > 0 then
+        BZEmit(output, outLen, b, cnt);
+      i += 5;
+    end
+    else
+      i += run;
+  end;
+end;
+
+(*
+## BZip2Decompress
+```pascal
+function BZip2Decompress(data: TByteArray): TByteArray;
+```
+Decompresses a complete bzip2 stream: a `BZh<level>` header followed by one or
+more blocks, terminated by the end-of-stream marker.
+*)
+function BZip2Decompress(data: TByteArray): TByteArray;
+var
+  d: TBZip2Decoder;
+  outLen, nblock: Integer;
+begin
+  d.Data := data;
+  d.BitPos := 0;
+  d.ReadStreamHeader();
+
+  SetLength(Result, 1024);
+  outLen := 0;
+
+  while d.ReadBlockHeader() do
+  begin
+    nblock := d.DecodeSymbols();
+    d.InverseBWTAndRLE(nblock, Result, outLen);
+  end;
+
+  SetLength(Result, outLen);
+end;

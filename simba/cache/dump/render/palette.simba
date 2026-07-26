@@ -1,0 +1,193 @@
+(*
+# Render: Palette
+The two lookup tables the item-sprite rasteriser reads on every pixel and every
+vertex: the 65536-entry HSL colour palette, and the 2048-entry fixed-point
+sine/cosine tables. Ported from `net.runelite.cache.models.JagexColor` and
+`net.runelite.cache.item.CircularAngle`.
+
+```pascal
+BuildCircularAngle();
+BuildPalette(JAGEX_BRIGHTNESS_MAX);
+```
+
+Both are process-wide state, built once before any render and never touched
+again. Nothing in `utils/cache/dump/render/` builds them lazily on first use -
+a renderer that silently produced black because a table was empty would be far
+harder to notice than one that raises `Index out of range`.
+
+## Why this palette is not {ref}`JagexHSLtoRGB`
+`utils/cache/jagexcolor.simba` converts **one** packed HSL colour at a time
+through the chroma form of HSL->RGB. This unit builds the client's whole
+**table** through the client's own `q`/`p` form.
+
+The two are algebraically identical and round identically. Measured on this
+build, not inferred: `colorPalette[i]` equals `JagexHSLtoRGB(i, b)` for all
+65536 entries at all five brightnesses (0.5/0.6/0.7/0.8/0.9), table CRC32
+`3A225657` at 0.5 - which is the pinned value in the render spec. So the
+duplication is provably redundant and could be collapsed.
+
+It is kept anyway, and deliberately: the table builder is the shape the
+committed item-sprite hashes were produced with, and a renderer whose palette
+can move when an unrelated unit is edited is a renderer whose CRC32s can move
+for reasons that are hard to find. If it is ever collapsed, this equality is
+the check to re-run first.
+
+## The quantise-then-gamma order is the whole ball game
+`runelite-cache` reroutes `setBrightness()` through `createPaletteHSV`, which
+applies `Math.pow` to the *un-quantised* doubles. The real client - and
+therefore every committed hash in `wasp-assets/finders/items/data/hash.txt` -
+quantises each channel to 0..255 **first** and only then applies the brightness
+curve, with an `rgb == 0 -> 1` guard at the end. The two differ by up to 5 per
+channel: invisible to the eye, fatal to a CRC32. Measured, the fork's order
+scores 0/346 and this one 345/346 on the same sample.
+
+That is the upstream `JagexColor.createPalette(brightness, 0, 512)` still
+sitting unused at `JagexColor.java:257`, not the fork's rerouted builder.
+*)
+{$DEFINE WL_CACHE_RENDER_PALETTE_INCLUDED}
+{$IFNDEF WL_CACHE_JAGEXCOLOR_INCLUDED}{$INCLUDE_ONCE ../../jagexcolor.simba}{$ENDIF}
+
+var
+  // JagexColor.createPalette's output: 512 hue/saturation buckets x 128
+  // luminance steps of packed 0xRRGGBB.
+  colorPalette: TIntegerArray;
+  // CircularAngle.SINE / COSINE, 16.16 fixed point over 2048 units of turn.
+  ANGLE_SINE, ANGLE_COSINE: TIntegerArray;
+
+(*
+## JSar
+```pascal
+function JSar(v, n: Integer): Integer;
+```
+Java's `>>`: an **arithmetic** right shift, which keeps the sign bit.
+
+Lape's `shr` is logical, and the rasteriser shifts negative fixed-point
+coordinates constantly - every projected vertex, every colour gradient step,
+every scanline slope. Getting this wrong is silent and catastrophic, which is
+why the transpiler routes every single `>>` through here rather than trusting a
+reviewer to spot the ones that can go negative.
+
+Simba already declares a `Sar`; this one is named distinctly on purpose, and
+`_HeightMapSar` in the map dumper is a third copy for the same reason. They are
+kept separate so neither unit's dependency graph pulls in the other's.
+*)
+function JSar(v, n: Integer): Integer;
+begin
+  if v < 0 then
+    Result := not ((not v) shr n)
+  else
+    Result := v shr n;
+end;
+
+(*
+## BuildCircularAngle
+```pascal
+procedure BuildCircularAngle();
+```
+`CircularAngle.SINE` / `COSINE`: 2048 steps of turn, 16.16 fixed point,
+truncated (never rounded) exactly as the Java is.
+
+`0.0030679615` is the client's own literal for `2*PI/2048`, not a computed
+constant - it is a float in the source and reproducing it to more digits would
+change the last bit of a handful of entries.
+*)
+procedure BuildCircularAngle();
+var
+  i: Integer;
+begin
+  ANGLE_SINE := []; SetLength(ANGLE_SINE, 2048);
+  ANGLE_COSINE := []; SetLength(ANGLE_COSINE, 2048);
+  for i := 0 to 2047 do
+  begin
+    ANGLE_SINE[i]   := Trunc(Sin(i * 0.0030679615) * 65536.0);
+    ANGLE_COSINE[i] := Trunc(Cos(i * 0.0030679615) * 65536.0);
+  end;
+end;
+
+(*
+## BuildPalette
+```pascal
+procedure BuildPalette(brightness: Double);
+```
+`JagexColor.createPalette(brightness, 0, 512)`, the upstream builder. Pass
+{ref}`JAGEX_BRIGHTNESS_MAX` - 0.5 in this tree, which is the `runelite-cache`
+parity patch and is what the committed hashes were rendered at.
+
+The index is `(hueSat * 128) + luminance`, i.e. the packed HSL short itself, so
+the rasteriser can index straight with a face colour.
+
+`v19`/`v21` are the classic `q`/`p` of the HSL->RGB transform and keep their
+transpiled names; the two lines that assign `lum` to both before the branch
+immediately overwrites them are the Java's saturation-0 defaults, unreachable
+here because the unpacked saturation is at least 0.0625.
+*)
+procedure BuildPalette(brightness: Double);
+var
+  i, l, cursor, r, g, b, rgb: Integer;
+  hue, sat, lum, v19, v21, hr, hb: Double;
+begin
+  colorPalette := []; SetLength(colorPalette, 65536);
+  cursor := 0;
+  for i := 0 to 511 do
+  begin
+    hue := (i shr 3) / 64.0 + 0.0078125;
+    sat := (i and 7) / 8.0 + 0.0625;
+
+    for l := 0 to 127 do
+    begin
+      lum := l / 128.0;
+      // defaults when saturation is 0 (never here: sat >= 0.0625)
+      v19 := lum; v21 := lum;
+      if lum < 0.5 then
+        v19 := lum * (1.0 + sat)
+      else
+        v19 := lum + sat - lum * sat;
+      v21 := 2.0 * lum - v19;
+
+      hr := hue + 0.3333333333333333;
+      if hr > 1.0 then hr := hr - 1.0;
+      hb := hue - 0.3333333333333333;
+      if hb < 0.0 then hb := hb + 1.0;
+
+      if 6.0 * hr < 1.0 then
+        r := Trunc((v21 + (v19 - v21) * 6.0 * hr) * 256.0)
+      else if 2.0 * hr < 1.0 then
+        r := Trunc(v19 * 256.0)
+      else if 3.0 * hr < 2.0 then
+        r := Trunc((v21 + (v19 - v21) * (0.6666666666666666 - hr) * 6.0) * 256.0)
+      else
+        r := Trunc(v21 * 256.0);
+
+      if 6.0 * hue < 1.0 then
+        g := Trunc((v21 + (v19 - v21) * 6.0 * hue) * 256.0)
+      else if 2.0 * hue < 1.0 then
+        g := Trunc(v19 * 256.0)
+      else if 3.0 * hue < 2.0 then
+        g := Trunc((v21 + (v19 - v21) * (0.6666666666666666 - hue) * 6.0) * 256.0)
+      else
+        g := Trunc(v21 * 256.0);
+
+      if 6.0 * hb < 1.0 then
+        b := Trunc((v21 + (v19 - v21) * 6.0 * hb) * 256.0)
+      else if 2.0 * hb < 1.0 then
+        b := Trunc(v19 * 256.0)
+      else if 3.0 * hb < 2.0 then
+        b := Trunc((v21 + (v19 - v21) * (0.6666666666666666 - hb) * 6.0) * 256.0)
+      else
+        b := Trunc(v21 * 256.0);
+
+      rgb := b + (g shl 8) + (r shl 16);
+      // JagexColor.adjustForBrightness: quantise-then-pow. Deliberately a local
+      // copy rather than a call to JagexAdjustForBrightness, so this unit's
+      // arithmetic cannot move when that one is edited.
+      r := Trunc(Power(JSar(rgb, 16) / 256.0, brightness) * 256.0);
+      g := Trunc(Power(((rgb shr 8) and 255) / 256.0, brightness) * 256.0);
+      b := Trunc(Power((rgb and 255) / 256.0, brightness) * 256.0);
+      rgb := b + (g shl 8) + (r shl 16);
+      if rgb = 0 then rgb := 1;
+
+      colorPalette[cursor] := rgb;
+      cursor := cursor + 1;
+    end;
+  end;
+end;

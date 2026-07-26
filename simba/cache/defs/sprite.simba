@@ -1,0 +1,297 @@
+(*
+# SpriteDefinition
+Decodes a sprite archive (index 8) into one or more palette-indexed frames.
+Ported from `definitions/loaders/SpriteLoader.java` and `definitions/SpriteDefinition.java`.
+
+The archive is read back to front. The frame count is the last two bytes, the
+shared header and the per-frame dimension tables sit in front of it, the palette
+in front of those, and only the pixel planes start at offset 0:
+
+```
+0 .............................................................. Length
+[ per-frame pixel planes ][ palette ][ maxW maxH palLen ][ offX offY w h ][ n ]
+                            3 each      2  2   1           2  2  2  2      2
+                                                           x n per column
+```
+
+That is why nothing here can be read in one forward pass, and why a wrong seek
+is dangerous: every offset is derived from `Length(data)`, so an arithmetic slip
+lands the cursor inside real data and decodes plausible garbage instead of
+raising. The one structural invariant that catches it is that the pixel planes
+must end exactly where the palette begins - checked below, and asserted for
+every archive in the cache by `dev/tests/270_sprite.simba`.
+
+The four dimension tables are four separate runs of `n` u16s (all the `OffsetX`,
+then all the `OffsetY`, ...), not `n` interleaved 8-byte records.
+
+Colours are Java ARGB, `A shl 24 or R shl 16 or G shl 8 or B`, matching what
+`SpriteExporter` writes into a `TYPE_INT_ARGB` PNG - so `Pixels` is directly
+comparable to the committed `sprites/sprites.zip` output. Simba's own `TColor`
+is BGR, so `ToImage` swaps the outer channels; do not conflate the two.
+*)
+{$DEFINE WL_CACHE_DEF_SPRITE_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+
+const
+  // Both are bit flags on the per-frame lead byte.
+  SPRITE_FLAG_VERTICAL: Integer = 1; // pixels are stored column-major
+  SPRITE_FLAG_ALPHA: Integer = 2;    // an alpha plane follows the index plane
+
+  // Fixed part of the trailing header: 2 bytes frame count + 2 max width +
+  // 2 max height + 1 palette length.
+  SPRITE_HEADER_SIZE: Integer = 7;
+  // Per frame in the dimension tables: offsetX, offsetY, width, height, u16 each.
+  SPRITE_ENTRY_SIZE: Integer = 8;
+
+(*
+## TSpriteDefinition
+```pascal
+TSpriteDefinition = record
+  Id, Frame: Integer;
+  OffsetX, OffsetY, Width, Height, MaxWidth, MaxHeight: Integer;
+  Flags: Integer;
+  Pixels: TIntegerArray;
+  PixelIdx: TByteArray;
+  Palette: TIntegerArray;
+end;
+```
+One frame of one sprite archive. `Id` is the archive id and `Frame` its position
+in it, which together are the `<id>-<frame>.png` name the Java pipeline exports.
+
+`Pixels` is ARGB, one entry per pixel, row-major. `PixelIdx` is the raw palette
+index of the same pixel and `Palette` the archive's colour table - both mirror
+the `transient` fields on the Java `SpriteDefinition`, which downstream code
+needs to re-place a frame inside its `MaxWidth` x `MaxHeight` canvas without
+going back to the cache.
+
+`Palette` is shared by reference between every frame of an archive, exactly as
+the Java shares one `int[]`. Do not mutate it through one frame.
+
+`Flags` is the only field with no Java counterpart: `SpriteLoader` reads the
+lead byte into a local and drops it. It is kept because it is the only evidence
+of how the plane was stored, and the pixel-plane size of an archive cannot be
+recomputed without it.
+
+`Width` and `Height` may both be 0. Sprites with no size are real - the font
+archives carry them for non-printable characters - and `SimbaSpriteDumper`
+skips them rather than treating them as an error, so consumers must too.
+*)
+type
+  TSpriteDefinition = record
+    Id, Frame: Integer;
+    OffsetX, OffsetY, Width, Height, MaxWidth, MaxHeight: Integer;
+    Flags: Integer;
+    Pixels: TIntegerArray;
+    PixelIdx: TByteArray;
+    Palette: TIntegerArray;
+  end;
+
+(*
+## TSpriteDefinition.Normalize
+```pascal
+function TSpriteDefinition.Normalize(): TSpriteDefinition;
+```
+Returns the frame on its full `MaxWidth` x `MaxHeight` canvas, matching the
+client's `SpriteDefinition.normalize()`. Texture definitions use palette
+indices, not the already-expanded ARGB `Pixels`, so both `PixelIdx` and
+`Pixels` are moved. The source record is never mutated: all frames in an
+archive share the palette and callers commonly cache the decoded archive.
+*)
+function TSpriteDefinition.Normalize(): TSpriteDefinition;
+var
+  x, y, src, dst: Integer;
+begin
+  Result := Self;
+  if (Self.Width = Self.MaxWidth) and (Self.Height = Self.MaxHeight) then Exit;
+
+  Result.PixelIdx := [];
+  Result.Pixels := [];
+  SetLength(Result.PixelIdx, Self.MaxWidth * Self.MaxHeight);
+  SetLength(Result.Pixels, Self.MaxWidth * Self.MaxHeight);
+  for y := 0 to Self.Height - 1 do
+    for x := 0 to Self.Width - 1 do
+    begin
+      src := x + y * Self.Width;
+      dst := x + Self.OffsetX + (y + Self.OffsetY) * Self.MaxWidth;
+      Result.PixelIdx[dst] := Self.PixelIdx[src];
+      Result.Pixels[dst] := Self.Pixels[src];
+    end;
+  Result.Width := Self.MaxWidth;
+  Result.Height := Self.MaxHeight;
+  Result.OffsetX := 0;
+  Result.OffsetY := 0;
+end;
+
+(*
+## TSpriteDefinition.LoadAll
+```pascal
+function TSpriteDefinition.LoadAll(id: Integer; data: TByteArray): array of TSpriteDefinition; static;
+```
+Decodes one whole sprite archive. `id` is the archive id, stamped onto every
+frame; `data` is the decompressed container, i.e. what
+`TCacheStore.Read(Ord(EIndexType.SPRITES), id, [])` returns.
+
+An empty `data` yields an empty array - index 8 has unallocated archive slots
+and the caller should not have to special-case them. Anything else that does not
+parse raises.
+*)
+function TSpriteDefinition.LoadAll(id: Integer; data: TByteArray): array of TSpriteDefinition; static;
+var
+  s: TByteStream;
+  count, paletteLength, paletteStart, i, j, k, w, h, dim, opaque: Integer;
+  maxWidth, maxHeight: Integer;
+  palette, argb, pixels: TIntegerArray;
+  idx, alphas: TByteArray;
+begin
+  if Length(data) = 0 then Exit;
+
+  s := TByteStream.Create(data);
+  s.SetPosition(s.Length() - 2);
+  count := s.ReadUShort();
+  if count = 0 then Exit;
+
+  SetLength(Result, count);
+
+  s.SetPosition(s.Length() - SPRITE_HEADER_SIZE - count * SPRITE_ENTRY_SIZE);
+  maxWidth := s.ReadUShort();
+  maxHeight := s.ReadUShort();
+  // Stored as "one less than the entry count" because slot 0 is the implicit
+  // transparent colour and is never written to the archive.
+  paletteLength := s.ReadUByte() + 1;
+
+  for i := 0 to count - 1 do
+  begin
+    Result[i].Id := id;
+    Result[i].Frame := i;
+    Result[i].MaxWidth := maxWidth;
+    Result[i].MaxHeight := maxHeight;
+  end;
+
+  // Four separate columns, not four fields of a per-frame record.
+  for i := 0 to count - 1 do Result[i].OffsetX := s.ReadUShort();
+  for i := 0 to count - 1 do Result[i].OffsetY := s.ReadUShort();
+  for i := 0 to count - 1 do Result[i].Width := s.ReadUShort();
+  for i := 0 to count - 1 do Result[i].Height := s.ReadUShort();
+
+  paletteStart := s.Length() - SPRITE_HEADER_SIZE - count * SPRITE_ENTRY_SIZE -
+                  (paletteLength - 1) * 3;
+  s.SetPosition(paletteStart);
+
+  SetLength(palette, paletteLength);
+  SetLength(argb, paletteLength);
+  opaque := 255 shl 24; // = $FF000000; written this way because the literal
+                        // does not fit a signed 32-bit Integer.
+
+  for i := 1 to paletteLength - 1 do
+  begin
+    palette[i] := s.ReadUMedium();
+    // Pure black would be indistinguishable from "no colour" once it is or-ed
+    // with an alpha of 0, so the client nudges it to $000001. Faithful to
+    // SpriteLoader.java:92-95 - a one-bit colour error, not a rounding choice
+    // we are free to make.
+    if palette[i] = 0 then palette[i] := 1;
+    argb[i] := palette[i] or opaque;
+  end;
+
+  s.SetPosition(0);
+
+  for i := 0 to count - 1 do
+  begin
+    w := Result[i].Width;
+    h := Result[i].Height;
+    dim := w * h;
+
+    Result[i].Palette := palette;
+    Result[i].Flags := s.ReadUByte();
+
+    if (Result[i].Flags and SPRITE_FLAG_VERTICAL) = 0 then
+      idx := s.ReadBytes(dim)
+    else
+    begin
+      // Column-major on disk, row-major in memory.
+      idx := [];
+      SetLength(idx, dim);
+      for j := 0 to w - 1 do
+        for k := 0 to h - 1 do
+          idx[w * k + j] := s.ReadUByte();
+    end;
+
+    // Reallocated rather than resized: SetLength keeps the contents of the
+    // overlapping prefix, so reusing the buffer would leak the previous
+    // frame's alpha into every frame that has no alpha plane of its own.
+    alphas := [];
+    if (Result[i].Flags and SPRITE_FLAG_ALPHA) = 0 then
+      SetLength(alphas, dim)
+    else if (Result[i].Flags and SPRITE_FLAG_VERTICAL) = 0 then
+      alphas := s.ReadBytes(dim)
+    else
+    begin
+      SetLength(alphas, dim);
+      for j := 0 to w - 1 do
+        for k := 0 to h - 1 do
+          alphas[w * k + j] := s.ReadUByte();
+    end;
+
+    SetLength(Result[i].Pixels, dim);
+    // Dynamic arrays alias on assignment, so this writes straight into the
+    // record; it is here only to keep the array-of-record walk out of the
+    // per-pixel loop, which runs over the whole sprite index.
+    pixels := Result[i].Pixels;
+
+    // Java sets alpha to $FF for every non-zero palette index before building
+    // the pixel, so a non-zero index ignores the alpha plane entirely and
+    // index 0 contributes no colour (palette[0] is always 0). Folding both
+    // into the argb table makes this a lookup instead of a branch per channel.
+    for j := 0 to dim - 1 do
+      if idx[j] <> 0 then
+        pixels[j] := argb[idx[j]]
+      else
+        pixels[j] := alphas[j] shl 24;
+
+    Result[i].PixelIdx := idx;
+  end;
+
+  // The planes must stop exactly where the palette starts. Overrunning means
+  // the cursor is decoding the palette as pixels, which never raises on its
+  // own - see the header note.
+  if s.Position > paletteStart then
+    raise 'SpriteDefinition: archive ' + ToStr(id) + ' pixel data overruns its palette by ' +
+          ToStr(s.Position - paletteStart) + ' bytes';
+end;
+
+(*
+## TSpriteDefinition.ToImage
+```pascal
+function TSpriteDefinition.ToImage(): TImage;
+```
+Renders the frame into a `Width` x `Height` `TImage`, alpha included. A frame
+with no size gives a 0x0 image rather than raising.
+
+The channel swap is the point: `Pixels` is Java ARGB while a Simba `TColor` is
+BGR, so writing `Pixels` in unchanged would invert red and blue on every sprite.
+Pixels are written through `TImage.Data` because per-pixel `Pixel[]`/`Alpha[]`
+assignments cannot carry both channels in one go.
+
+`Data` is read into a local first: it is a property, and going through it four
+times per pixel costs 64ms per 250k pixels against roughly nothing for the
+hoisted pointer (measured). Over the whole sprite index that is the difference
+between a rendering pass you notice and one you do not.
+*)
+function TSpriteDefinition.ToImage(): TImage;
+var
+  data: PColorBGRA;
+  i, n, argb: Integer;
+begin
+  Result := new TImage(Self.Width, Self.Height);
+
+  n := Self.Width * Self.Height;
+  data := Result.Data;
+  for i := 0 to n - 1 do
+  begin
+    argb := Self.Pixels[i];
+    data[i]^.R := (argb shr 16) and $FF;
+    data[i]^.G := (argb shr 8) and $FF;
+    data[i]^.B := argb and $FF;
+    data[i]^.A := (argb shr 24) and $FF;
+  end;
+end;

@@ -1,0 +1,316 @@
+(*
+# Dump NPC spawns
+
+Builds the runtime `map/npcs.zip` from the cache-derived NPC helper archive and
+the spawn list maintained by mejrs/data_osrs.  Spawn coordinates are not part
+of the OSRS cache, so this is deliberately the one network-backed asset
+dumper.  The fetch wrapper makes up to three attempts and is non-fatal: an
+unavailable third-party source removes any stale output and leaves the rest of
+an asset run usable.
+
+The output is a zip of chunk JSON arrays.  It is intentionally written in the
+same framing and key order as `wasp-assets/tools/update_npcs.simba`:
+
+```
+[
+ {"id":...},
+ {"id":...}
+]
+```
+
+Records are grouped by world chunk (`x div 64`, `y div 64`) and coordinates
+are map pixels (`[4*x, 50428 - 4*y]`).  The two-pixel difference from object
+centres is historical and observable in the NPC asset; `mapjson.simba` reads
+these coordinates as stored and has no alternate transform.
+*)
+{$DEFINE WL_CACHE_DUMP_NPCSPAWNS_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ZIPWRITER_INCLUDED}{$INCLUDE_ONCE zipwriter.simba}{$ENDIF}
+
+const
+  NPC_SPAWN_URL: String = 'https://raw.githubusercontent.com/mejrs/data_osrs/master/NPCList_OSRS.json';
+  NPC_SPAWN_MAX_PLANE: Integer = 3;
+  NPC_SPAWN_MAX_CHUNK_X: Integer = 99;
+  NPC_SPAWN_MAX_CHUNK_Y: Integer = 199;
+  NPC_SPAWN_FETCH_ATTEMPTS: Integer = 3;
+  NPC_SPAWN_RETRY_MS: Integer = 1500;
+
+type
+  TNPCSpawn = record
+    ID, Plane, X, Y: Integer;
+  end;
+
+  TNPCSpawnArray = array of TNPCSpawn;
+
+// A chunk keeps an insertion-ordered list of ids as well as the coordinates
+// keyed by id.  TMap's Values ordering is deliberately not used for output:
+// the source file's order is the stable, inspectable ordering contract here.
+  TNPCSpawnChunk = record
+    IDs: TIntegerArray;
+    Points: TMap<Integer, TPointArray>;
+  end;
+
+  TNPCSpawnChunks = array of array of array of TNPCSpawnChunk;
+
+function _NPCSpawnBytes(s: String): TByteArray;
+begin
+  Result := [];
+  if s = '' then Exit;
+  SetLength(Result, Length(s));
+  Move(s[1], Result[0], Length(s));
+end;
+
+function _NPCSpawnBool(b: Boolean): String;
+begin
+  if b then Result := 'true' else Result := 'false';
+end;
+
+(*
+## ParseNPCSpawns
+
+Parses the external JSON array into only the four fields this artifact owns:
+`id`, `p`, `x`, and `y`. It intentionally scans records instead of building a
+`TJSONParser` tree for the whole source: the live payload is about 10 MB and
+its irrelevant animation/model data makes the generic parser take minutes.
+The source's `{"name":` record delimiter is established upstream format; every
+required numeric field is still checked strictly, so a source-shape change
+fails loudly instead of manufacturing zero coordinates.
+*)
+function ParseNPCSpawns(source: String): TNPCSpawnArray;
+var
+  entries: TStringArray;
+  i: Integer;
+  spawn: TNPCSpawn;
+  valid: Boolean;
+
+  function FieldInt(entry, field: String; var value: Integer): Boolean;
+  var
+    marker: String;
+    p, start, sign: Integer;
+  begin
+    marker := '"' + field + '":';
+    p := Pos(marker, entry);
+    if p = 0 then Exit(False);
+    p += Length(marker);
+    while (p <= Length(entry)) and (entry[p] in [' ', #9, #10, #13]) do Inc(p);
+    sign := 1;
+    if (p <= Length(entry)) and (entry[p] = '-') then
+    begin
+      sign := -1;
+      Inc(p);
+    end;
+    start := p;
+    while (p <= Length(entry)) and InRange(Ord(entry[p]), Ord('0'), Ord('9')) do Inc(p);
+    if start = p then Exit(False);
+    value := sign * StrToInt(Copy(entry, start, p - start));
+    Result := True;
+  end;
+begin
+  if source = '' then
+    raise 'DumpNPCSpawns: empty spawn payload';
+
+  entries := source.Split('{"name":', True);
+  if Length(entries) < 2 then
+    raise 'DumpNPCSpawns: source contains no "{\"name\":" records';
+
+  // Element zero is the array opening before the first record.
+  for i := 1 to High(entries) do
+  begin
+    valid := FieldInt(entries[i], 'id', spawn.ID) and
+             FieldInt(entries[i], 'p', spawn.Plane) and
+             FieldInt(entries[i], 'x', spawn.X) and
+             FieldInt(entries[i], 'y', spawn.Y);
+    if not valid then
+      raise 'DumpNPCSpawns: malformed spawn entry at index ' + ToStr(i);
+    Result += spawn;
+  end;
+
+  if Length(Result) = 0 then
+    raise 'DumpNPCSpawns: spawn payload contains no entries';
+end;
+
+function NPCSpawnPoint(x, y: Integer): TPoint;
+begin
+  Result.X := x * 4;
+  // This is `update_npcs.simba`'s Transform, reduced algebraically.  Do not
+  // replace it with the object's centre convention (50430 - 4*y).
+  Result.Y := 50428 - y * 4;
+end;
+
+function NPCSpawnChunk(x, y: Integer): TPoint;
+begin
+  Result := [x div 64, y div 64];
+end;
+
+function _NPCSpawnJSON(id: Integer; helper: TJSONObject; points: TPointArray): String;
+var
+  i: Integer;
+begin
+  // These fields are copied from the helper, and this literal key ordering is
+  // what TMapJSON's consumers have always received.
+  Result := '{"id":' + ToStr(id) +
+            ',"name":"' + JSONEscape(helper.Item['name'].AsString) + '"' +
+            ',"level":' + ToStr(helper.Item['level'].AsInt) +
+            ',"category":' + ToStr(helper.Item['category'].AsInt) +
+            ',"minimapdot":' + _NPCSpawnBool(helper.Item['minimapdot'].AsBool) +
+            ',"actions":' + helper.Item['actions'].Format([EJSONFormatOption.NO_WHITESPACE, EJSONFormatOption.SINGLE_LINE_ARR]) +
+            ',"size":' + helper.Item['size'].Format([EJSONFormatOption.NO_WHITESPACE, EJSONFormatOption.SINGLE_LINE_ARR]) +
+            ',"coordinates":[';
+
+  for i := 0 to High(points) do
+  begin
+    if i > 0 then Result += ',';
+    Result += '[' + ToStr(points[i].X) + ',' + ToStr(points[i].Y) + ']';
+  end;
+
+  Result += '],"colors":' + helper.Item['colors'].Format([EJSONFormatOption.NO_WHITESPACE, EJSONFormatOption.SINGLE_LINE_ARR]) + '}';
+end;
+
+function _NPCSpawnHelper(helperDir: String; id: Integer): TJSONObject;
+var
+  filename: String;
+begin
+  filename := helperDir + ToStr(id) + '.json';
+  if not FileExists(filename) then Exit(nil);
+  Result := new TJSONObject();
+  TJSONParser(Result).Load(filename);
+end;
+
+(*
+## DumpNPCSpawns
+
+Merges `helperZip` with a previously fetched `source`, and writes `zipPath`.
+The source parameter is intentionally separate from the HTTP wrapper so the
+full transformation is deterministic and testable without network access.
+
+Entries whose source coordinates are outside the map's 4×100×200 chunk grid
+are reported and skipped.  That avoids an array-bounds failure if the external
+project adds an instanced or non-map coordinate while still making the data
+loss visible.
+*)
+procedure DumpNPCSpawns(helperZip, zipPath, source: String);
+var
+  spawns: TNPCSpawnArray;
+  chunks: TNPCSpawnChunks;
+  helperDir, chunkText: String;
+  spawn: TNPCSpawn;
+  chunk, point: TPoint;
+  helper: TJSONObject;
+  zip: TZipWriter;
+  p, x, y, i, idx, written, skipped, records: Integer;
+begin
+  if not FileExists(helperZip) then
+    raise 'DumpNPCSpawns: helper archive does not exist: ' + helperZip;
+
+  spawns := ParseNPCSpawns(source);
+  helperDir := SimbaEnv.TempPath + 'wasplib-npc-spawn-helper' + PATH_SEP;
+  DirDelete(helperDir, False);
+  if not DirCreate(helperDir) then
+    raise 'DumpNPCSpawns: cannot create temporary helper directory';
+
+  try
+    if not ZipExtract(helperZip, helperDir) then
+      raise 'DumpNPCSpawns: cannot extract helper archive: ' + helperZip;
+
+    SetLength(chunks, NPC_SPAWN_MAX_PLANE + 1,
+                     NPC_SPAWN_MAX_CHUNK_X + 1,
+                     NPC_SPAWN_MAX_CHUNK_Y + 1);
+    for i := 0 to High(spawns) do
+    begin
+      spawn := spawns[i];
+      chunk := NPCSpawnChunk(spawn.X, spawn.Y);
+      if (spawn.Plane < 0) or (spawn.Plane > NPC_SPAWN_MAX_PLANE) or
+         (chunk.X < 0) or (chunk.X > NPC_SPAWN_MAX_CHUNK_X) or
+         (chunk.Y < 0) or (chunk.Y > NPC_SPAWN_MAX_CHUNK_Y) then
+      begin
+        Inc(skipped);
+        Continue;
+      end;
+
+      point := NPCSpawnPoint(spawn.X, spawn.Y);
+      idx := chunks[spawn.Plane, chunk.X, chunk.Y].Points.IndexOf(spawn.ID);
+      if idx = -1 then
+      begin
+        chunks[spawn.Plane, chunk.X, chunk.Y].Points.Value[spawn.ID] := [point];
+        chunks[spawn.Plane, chunk.X, chunk.Y].IDs += spawn.ID;
+      end
+      else
+        chunks[spawn.Plane, chunk.X, chunk.Y].Points.ValueFromIndex[idx] += point;
+    end;
+
+    zip.Init();
+    for p := 0 to NPC_SPAWN_MAX_PLANE do
+      for x := 0 to NPC_SPAWN_MAX_CHUNK_X do
+        for y := 0 to NPC_SPAWN_MAX_CHUNK_Y do
+        begin
+          if Length(chunks[p, x, y].IDs) = 0 then Continue;
+          chunkText := '[' + #13 + #10;
+          written := 0;
+          for i := 0 to High(chunks[p, x, y].IDs) do
+          begin
+            helper := _NPCSpawnHelper(helperDir, chunks[p, x, y].IDs[i]);
+            // The source can legitimately contain ids outside an older cache.
+            // Do not emit a half-record; keep this visible in the summary.
+            if helper = nil then Continue;
+            if written > 0 then chunkText += ',' + #13 + #10;
+            idx := chunks[p, x, y].Points.IndexOf(chunks[p, x, y].IDs[i]);
+            chunkText += ' ' + _NPCSpawnJSON(chunks[p, x, y].IDs[i], helper,
+                                              chunks[p, x, y].Points.ValueFromIndex[idx]);
+            Inc(written);
+            Inc(records);
+          end;
+          if written = 0 then Continue;
+          chunkText += #13 + #10 + ']';
+          zip.AddBytes(ToStr(p) + '-' + ToStr(x) + '-' + ToStr(y) + '.json',
+                       _NPCSpawnBytes(chunkText));
+        end;
+
+    if records = 0 then
+      raise 'DumpNPCSpawns: no source NPC id exists in the helper archive';
+    zip.Save(zipPath);
+    WriteLn('DumpNPCSpawns: ', records, ' records in ', Length(zip.Entries),
+            ' chunks (', skipped, ' out-of-grid source records skipped)');
+  finally
+    DirDelete(helperDir, False);
+  end;
+end;
+
+(*
+## FetchNPCSpawnData
+
+Fetches the third-party source without raising.  Callers use `False` to skip
+only `map/npcs.zip`; failures in this dependency must never discard the cache
+assets that were already generated in the same run.
+*)
+function FetchNPCSpawnData(url: String; var source: String): Boolean;
+var
+  attempt, status: Integer;
+begin
+  source := '';
+  for attempt := 1 to NPC_SPAWN_FETCH_ATTEMPTS do
+  begin
+    WriteLn('DumpNPCSpawns: fetching live spawn data (attempt ', attempt, '/',
+            NPC_SPAWN_FETCH_ATTEMPTS, ')…');
+    try
+      source := HTTPClient.Get(url);
+      status := HTTPClient.ResponseStatus.AsInteger;
+      if InRange(status, 200, 299) and (source <> '') then Exit(True);
+      if not InRange(status, 200, 299) then
+        WriteLn('DumpNPCSpawns: HTTP ', status, ' from spawn source');
+      if source = '' then
+        WriteLn('DumpNPCSpawns: spawn source returned an empty body');
+    except
+      WriteLn('DumpNPCSpawns: attempt ', attempt, ' failed: ', GetExceptionMessage());
+    end;
+
+    source := '';
+    if attempt < NPC_SPAWN_FETCH_ATTEMPTS then
+    begin
+      WriteLn('DumpNPCSpawns: retrying in ', NPC_SPAWN_RETRY_MS, ' ms…');
+      Sleep(NPC_SPAWN_RETRY_MS);
+    end;
+  end;
+
+  WriteLn('DumpNPCSpawns: WARNING live spawn source unavailable after ',
+          NPC_SPAWN_FETCH_ATTEMPTS, ' attempts');
+end;

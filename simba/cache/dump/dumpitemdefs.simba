@@ -1,0 +1,828 @@
+(*
+# Dump Item Definitions
+Produces `jsons/item-definitions.zip`: one Gson-pretty-printed JSON document per
+item of the CONFIGS/ITEM archive, named `<id>.json`.
+
+This is a **byte-parity** artifact. The Java it replaces is
+`SimbaItemDumper` -> `ItemExporter.export()` -> `new GsonBuilder()
+.setPrettyPrinting().create().toJson(item)`, and the committed archive is
+*unlinked* - `SimbaItemDumper.link()` is never called by `dumpItems`, so item 7
+still ships `"name": "null"` next to `notedTemplate: 799`. Raw
+`TItemDefinition.Load` output is therefore directly comparable, and
+`dev/tests/411_itemdefs.simba` holds all 33745 entries to byte equality.
+
+## What Gson's serialiser does, and why each rule matters
+
+1. **Field order is Java declaration order**, not alphabetical and not cache
+   order: `ItemDefinition.java:34-112`. Gson reflects over the class in
+   declaration order and writes what it finds.
+2. **Null object fields are omitted entirely.** No `serializeNulls`, so
+   `examine`, `unknown1`, `colorFind`, `colorReplace`, `textureFind`,
+   `textureReplace`, `countCo`, `countObj`, `subops` and `params` appear only
+   when the Java field is non-null. Nulls *inside* arrays are still written -
+   `interfaceOptions`, `groundOps.ops` and `subops` all carry them.
+3. **Pretty printing** is a 2-space indent per level, `": "` between key and
+   value, `\n` newlines, `[]`/`{}` for an empty container, and **no trailing
+   newline** at the end of the document.
+4. **HTML-safe escaping is ON**, because the instance came from `GsonBuilder`.
+   The five characters `&` `'` `<` `=` `>` go out as their `\u00xx` long form -
+   3536 apostrophes across 2800 files in the committed archive, and not one raw
+   one anywhere. See {ref}`JSONEscapeHTML`. Non-ASCII is raw UTF-8: only `a`
+   grave, `e` acute and `U+2122` occur, in 7 files.
+5. **Never emit a float.** Every value in this archive is an integer, a boolean
+   or a string; a port that routes an int through a Double and writes `1.0`
+   loses parity silently.
+6. **Shorts are signed.** Opcodes 40/41 store `(short) readUnsignedShort()`, so
+   item 22 reads 43968 off the wire and this writes `-21568`. 4199 items have
+   palette entries at or above `$8000`. The loader already stores them signed;
+   this unit must not "fix" them.
+
+## params is in Java HashMap bucket order
+`ItemLoader` builds a `HashMap<Integer,Object>` and `ItemExporter` hands it
+straight to Gson, so the committed key order is the map's *iteration* order:
+
+* table size starts at 16 with threshold `0.75n`; after inserting the k-th
+  entry, `k > threshold` doubles both.
+* bucket = `(h ^ (h >>> 16)) and (n-1)`, and for an `Integer` key `h` is the
+  value itself.
+* buckets ascending, and **within a bucket, insertion order** - which is cache
+  order, *not* ascending key order. Java 8 preserves relative order across a
+  resize, so the chain never gets reshuffled.
+
+Item **6523** is the case that discriminates the two: it emits param 434 before
+param 2 and both land in bucket 2 at `n=16`, so ascending-within-bucket writes
+them the wrong way round. Measured over the committed archive, the bucket model
+reproduces 11711/11711 param orders; assuming ascending insertion reproduces
+11244. `TCacheParams`' parallel arrays already carry cache order, which is
+exactly what the model needs.
+
+## The one thing the loader cannot tell you: "" versus null
+`TItemDefinition` stores `''` for both a Java `null` string and a genuinely
+empty one (see `defs/item.simba`, divergence 3). That is not academic here:
+**243 of the 33745 committed entries ship `"examine": ""`** rather than omitting
+the key, and item 2749 ships an empty `name` as well. Emitting on `Examine <> ''`
+alone therefore costs 243 entries.
+
+{ref}`ItemDefJSONOf` resolves it by asking the loader instead of guessing, with
+no second opcode table to keep in sync: when a string field decodes empty it
+re-runs `TItemDefinition.Load` over `03 2A 00 09 2A 00` + the original bytes.
+Those six bytes are two complete, well-formed opcodes - opcode 3 (`examine`) and
+opcode 9 (`unknown1`), each carrying the one-character string `*` - so the
+stream stays exactly consumed and every other field decodes identically. A real
+opcode later in the data overwrites the sentinel; no opcode leaves it standing.
+The sentinel can never be mistaken for a real value, because the probe is only
+consulted for fields whose real value is already known to be `''`.
+
+`name` needs none of this: `ItemDefinition.name` is initialised to `"null"` and
+is never null, so it is always written.
+
+## Emitted but never exercised on this cache
+`groundOps.subOps`, `groundOps.conditionalOps` and `groundOps.conditionalSubOps`
+are `[]` for every one of the 33745 committed entries, so the reconstruction
+below is written from `EntityOpsDefinition.java` rather than measured. Two
+assumptions are baked in and would need revisiting if a cache revision starts
+emitting them: `TEntityOps` keeps one entry per `(index, subId)` where Java's
+list keeps duplicates in insertion order, and this writes sub-ops in ascending
+`subId` where Java writes them in insertion order.
+*)
+{$DEFINE WL_CACHE_DUMP_ITEMDEFS_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_ZIPWRITER_INCLUDED}{$INCLUDE_ONCE zipwriter.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_ITEM_INCLUDED}{$INCLUDE_ONCE ../defs/item.simba}{$ENDIF}
+
+const
+  // The probe prefix and its marker, see the docstring. Byte 42 is '*'.
+  ITEMDEF_PROBE_BYTE: Integer = 42;
+  ITEMDEF_PROBE_MARK: String = '*';
+
+// 2 spaces per level. A local typed const is static in Lape - it is not rebuilt
+// per call - and nesting never gets past 5 here, so the loop is a safety net
+// rather than a path anything takes.
+function _JsonIndent(depth: Integer): String;
+const
+  LEVELS: TStringArray = ['', '  ', '    ', '      ', '        ', '          ',
+                          '            '];
+begin
+  if (depth >= 0) and (depth <= High(LEVELS)) then Exit(LEVELS[depth]);
+  Result := '';
+  while depth > 0 do
+  begin
+    Result += '  ';
+    Dec(depth);
+  end;
+end;
+
+type
+(*
+## TJsonPretty
+```pascal
+TJsonPretty = record
+  Text: String;
+  Depth: Integer;
+  Fresh: Boolean;
+end;
+```
+A cursor that writes Gson's pretty form directly into one string, so nothing is
+built into intermediate arrays and thrown away. `Fresh` is "nothing has been
+written inside the container we are in yet", which is what decides between a
+leading newline and a leading comma - and what makes an untouched container come
+out as `{}` / `[]` rather than `{\n}`.
+
+No stack is needed for `Fresh`. Opening a container is always preceded by a
+{ref}`TJsonPretty.Key` or a {ref}`TJsonPretty.Sep`, both of which clear the
+parent's `Fresh`, so closing one can restore it unconditionally to False.
+
+Appending with `+=` is deliberate: measured on this build, Lape appends in place
+and beats a preallocated buffer with manual growth.
+*)
+  TJsonPretty = record
+    Text: String;
+    Depth: Integer;
+    Fresh: Boolean;
+  end;
+
+// Starts a fresh document. A record local is not zero-filled per call, so this
+// has to clear all three fields rather than just Text.
+procedure TJsonPretty.Init();
+begin
+  Self.Text := '';
+  Self.Depth := 0;
+  Self.Fresh := False;
+end;
+
+(*
+## TJsonPretty.Sep
+```pascal
+procedure TJsonPretty.Sep();
+```
+Opens the next member or element of the current container: the comma if one is
+needed, then the newline and this level's indent.
+*)
+procedure TJsonPretty.Sep();
+begin
+  if Self.Fresh then Self.Text += #10
+  else Self.Text += ',' + #10;
+  Self.Text += _JsonIndent(Self.Depth);
+  Self.Fresh := False;
+end;
+
+(*
+## TJsonPretty.Key
+```pascal
+procedure TJsonPretty.Key(name: String);
+```
+Writes `"name": ` as the next member of the current object. `name` is written
+verbatim - every key in this artifact is a bare identifier or a decimal number.
+*)
+procedure TJsonPretty.Key(name: String);
+begin
+  Self.Sep();
+  Self.Text += '"' + name + '": ';
+end;
+
+(*
+## TJsonPretty.Field
+```pascal
+procedure TJsonPretty.Field(name, value: String);
+```
+One `"name": value` member, where `value` is already-rendered JSON.
+*)
+procedure TJsonPretty.Field(name, value: String);
+begin
+  Self.Key(name);
+  Self.Text += value;
+end;
+
+(*
+## TJsonPretty.Elem
+```pascal
+procedure TJsonPretty.Elem(value: String);
+```
+One array element, where `value` is already-rendered JSON.
+*)
+procedure TJsonPretty.Elem(value: String);
+begin
+  Self.Sep();
+  Self.Text += value;
+end;
+
+procedure TJsonPretty.OpenObj();
+begin
+  Self.Text += '{';
+  Inc(Self.Depth);
+  Self.Fresh := True;
+end;
+
+procedure TJsonPretty.CloseObj();
+begin
+  Dec(Self.Depth);
+  if Self.Fresh then Self.Text += '}'
+  else Self.Text += #10 + _JsonIndent(Self.Depth) + '}';
+  Self.Fresh := False;
+end;
+
+procedure TJsonPretty.OpenArr();
+begin
+  Self.Text += '[';
+  Inc(Self.Depth);
+  Self.Fresh := True;
+end;
+
+procedure TJsonPretty.CloseArr();
+begin
+  Dec(Self.Depth);
+  if Self.Fresh then Self.Text += ']'
+  else Self.Text += #10 + _JsonIndent(Self.Depth) + ']';
+  Self.Fresh := False;
+end;
+
+(*
+## JSONQuoteHTML
+```pascal
+function JSONQuoteHTML(s: String): String;
+```
+`s` as a JSON string literal, quotes included, escaped the HTML-safe way this
+artifact uses.
+*)
+function JSONQuoteHTML(s: String): String;
+begin
+  Result := '"' + JSONEscapeHTML(s) + '"';
+end;
+
+function _JsonBool(b: Boolean): String;
+begin
+  if b then Result := 'true' else Result := 'false';
+end;
+
+// A `short[]` / `int[]` field: one number per line, `[]` when empty. Only ever
+// reached for a non-null Java array, since a null one omits the key entirely.
+procedure _JsonIntArray(var j: TJsonPretty; arr: TIntegerArray);
+var
+  i: Integer;
+begin
+  j.OpenArr();
+  for i := 0 to High(arr) do
+    j.Elem(ToStr(arr[i]));
+  j.CloseArr();
+end;
+
+// A fixed-slot `String[]` - interfaceOptions, and one row of subops. An unset
+// slot is Java's null, which this port stores as ''.
+procedure _JsonSlotArray(var j: TJsonPretty; arr: TStringArray);
+var
+  i: Integer;
+begin
+  j.OpenArr();
+  for i := 0 to High(arr) do
+    if arr[i] = '' then j.Elem('null')
+    else j.Elem(JSONQuoteHTML(arr[i]));
+  j.CloseArr();
+end;
+
+(*
+## ItemDefParamOrder
+```pascal
+procedure ItemDefParamOrder(params: TCacheParams; var order: TIntegerArray);
+```
+Fills `order` with positions into `params`' parallel arrays, in the order a Java
+`HashMap<Integer,Object>` built by inserting them in cache order would iterate.
+See the unit docstring for the model; this is the whole of it.
+
+Duplicate ids are collapsed the way `HashMap.put` collapses them - the **first**
+occurrence fixes the position in the chain, the **last** supplies the value - so
+`order` can be shorter than `params.Ids`. No item in cache 2625 has a duplicate
+param id, so that branch is reasoned from `HashMap`, not measured.
+
+Treeification is not modelled: a bucket would need 8 entries in a table of at
+least 64, and the largest param block in the archive is 53 entries spread over
+128 buckets.
+*)
+procedure ItemDefParamOrder(params: TCacheParams; var order: TIntegerArray);
+var
+  uniqIds, uniqPos, buckets: TIntegerArray;
+  i, k, n, h, table, threshold: Integer;
+  found: Integer;
+begin
+  order := [];
+  n := Length(params.Ids);
+  if n = 0 then Exit;
+
+  // Dedupe into insertion order. n is at most 53 here, so the linear scan is
+  // cheaper than anything with a table behind it.
+  for i := 0 to n - 1 do
+  begin
+    found := -1;
+    for k := 0 to High(uniqIds) do
+      if uniqIds[k] = params.Ids[i] then
+      begin
+        found := k;
+        Break;
+      end;
+    if found = -1 then
+    begin
+      uniqIds += params.Ids[i];
+      uniqPos += i;
+    end
+    else
+      uniqPos[found] := i;  // HashMap.put keeps the last value in the first slot
+  end;
+
+  // HashMap's default constructor: capacity 16, load factor 0.75, and
+  // `if (++size > threshold) resize()` doubling both.
+  table := 16;
+  threshold := 12;
+  for k := 1 to Length(uniqIds) do
+    if k > threshold then
+    begin
+      table := table * 2;
+      threshold := table * 3 div 4;
+    end;
+
+  SetLength(buckets, Length(uniqIds));
+  for k := 0 to High(uniqIds) do
+  begin
+    // HashMap.hash: h ^ (h >>> 16), with h = Integer.hashCode = the value.
+    // Param ids come off the wire as a 24-bit unsigned, so h is never negative
+    // and the mask only guards against a future signed one.
+    h := uniqIds[k];
+    buckets[k] := (h xor ((h shr 16) and $FFFF)) and (table - 1);
+  end;
+
+  // Buckets ascending, insertion order preserved within each - which is exactly
+  // what walking the table and following each chain gives.
+  for i := 0 to table - 1 do
+    for k := 0 to High(uniqIds) do
+      if buckets[k] = i then
+        order += uniqPos[k];
+end;
+
+// EntityOpsDefinition.ops is a List that setOp grows to `index + 1`, so its
+// length is the highest slot ever written plus one - and never less than 3,
+// because ItemDefinition seeds ground op 2 with "Take" at construction.
+function _ItemGroundOpsLength(ops: TStringArray): Integer;
+var
+  i: Integer;
+begin
+  Result := 3;
+  for i := Result to High(ops) do
+    if ops[i] <> '' then Result := i + 1;
+end;
+
+// groundOps.subOps / conditionalOps / conditionalSubOps. See the unit
+// docstring: every committed entry has all three empty, so this is a port of
+// EntityOpsDefinition rather than a measured shape.
+procedure _ItemSubOps(var j: TJsonPretty; ops: TEntityOps);
+var
+  rows, i, k: Integer;
+begin
+  rows := 0;
+  for i := 0 to High(ops.SubOps) do
+    for k := 0 to High(ops.SubOps[i]) do
+      if ops.SubOps[i][k] <> '' then
+      begin
+        rows := i + 1;
+        Break;
+      end;
+
+  j.OpenArr();
+  for i := 0 to rows - 1 do
+  begin
+    j.Sep();
+    j.OpenArr();
+    for k := 0 to High(ops.SubOps[i]) do
+      if ops.SubOps[i][k] <> '' then
+      begin
+        j.Sep();
+        j.OpenObj();
+        // Gson walks the declared class before its superclass, so SubOp's own
+        // subID precedes Op's text.
+        j.Field('subID', ToStr(k));
+        j.Field('text', JSONQuoteHTML(ops.SubOps[i][k]));
+        j.CloseObj();
+      end;
+    j.CloseArr();
+  end;
+  j.CloseArr();
+end;
+
+// One ConditionalOp/ConditionalSubOp body. `withSubId` picks the subclass:
+// ConditionalSubOp declares subID, then ConditionalOp's four fields, then Op's
+// text - Gson's subclass-before-superclass order again.
+procedure _ItemConditionalBody(var j: TJsonPretty; op: TEntityConditionalOp; withSubId: Boolean);
+begin
+  j.OpenObj();
+  if withSubId then j.Field('subID', ToStr(op.SubId));
+  j.Field('varpID', ToStr(op.Varp));
+  j.Field('varbitID', ToStr(op.Varb));
+  j.Field('minValue', ToStr(op.Min));
+  j.Field('maxValue', ToStr(op.Max));
+  j.Field('text', JSONQuoteHTML(op.Text));
+  j.CloseObj();
+end;
+
+procedure _ItemConditionalOps(var j: TJsonPretty; ops: array of TEntityConditionalOp);
+var
+  rows, i, k: Integer;
+begin
+  rows := 0;
+  for i := 0 to High(ops) do
+    if ops[i].Index + 1 > rows then rows := ops[i].Index + 1;
+
+  j.OpenArr();
+  for i := 0 to rows - 1 do
+  begin
+    j.Sep();
+    j.OpenArr();
+    for k := 0 to High(ops) do
+      if ops[k].Index = i then
+      begin
+        j.Sep();
+        _ItemConditionalBody(j, ops[k], False);
+      end;
+    j.CloseArr();
+  end;
+  j.CloseArr();
+end;
+
+// conditionalSubOps is a List of HashMaps padded with **null**, not with empty
+// maps - the one place EntityOpsDefinition pads differently.
+procedure _ItemConditionalSubOps(var j: TJsonPretty; ops: array of TEntityConditionalOp);
+var
+  rows, i, k, m, table, threshold, h, s: Integer;
+  subIds, buckets: TIntegerArray;
+  any, known: Boolean;
+begin
+  rows := 0;
+  for i := 0 to High(ops) do
+    if ops[i].Index + 1 > rows then rows := ops[i].Index + 1;
+
+  j.OpenArr();
+  for i := 0 to rows - 1 do
+  begin
+    any := False;
+    subIds := [];
+    for k := 0 to High(ops) do
+      if ops[k].Index = i then
+      begin
+        any := True;
+        // First appearance fixes the key's place in the map's chain.
+        known := False;
+        for s := 0 to High(subIds) do
+          if subIds[s] = ops[k].SubId then
+          begin
+            known := True;
+            Break;
+          end;
+        if not known then subIds += ops[k].SubId;
+      end;
+
+    if not any then
+    begin
+      j.Elem('null');
+      Continue;
+    end;
+
+    table := 16;
+    threshold := 12;
+    for k := 1 to Length(subIds) do
+      if k > threshold then
+      begin
+        table := table * 2;
+        threshold := table * 3 div 4;
+      end;
+    SetLength(buckets, Length(subIds));
+    for k := 0 to High(subIds) do
+    begin
+      h := subIds[k];
+      buckets[k] := (h xor ((h shr 16) and $FFFF)) and (table - 1);
+    end;
+
+    j.Sep();
+    j.OpenObj();
+    for m := 0 to table - 1 do
+      for k := 0 to High(subIds) do
+        if buckets[k] = m then
+        begin
+          j.Key(ToStr(subIds[k]));
+          j.OpenArr();
+          for h := 0 to High(ops) do
+            if (ops[h].Index = i) and (ops[h].SubId = subIds[k]) then
+            begin
+              j.Sep();
+              _ItemConditionalBody(j, ops[h], True);
+            end;
+          j.CloseArr();
+        end;
+    j.CloseObj();
+  end;
+  j.CloseArr();
+end;
+
+(*
+## ItemDefJSON
+```pascal
+function ItemDefJSON(item: TItemDefinition; hasExamine, hasUnknown1: Boolean): String;
+```
+One item as `ItemExporter` would have written it: Gson pretty form, HTML-safe
+escaping, fields in `ItemDefinition.java` declaration order, no trailing
+newline.
+
+`hasExamine` / `hasUnknown1` say whether the cache actually carried opcode 3 /
+opcode 9, which the record itself cannot answer - `''` covers both "absent" and
+"present and empty", and 243 items really do ship `"examine": ""`. Pass what
+{ref}`ItemDefJSONOf` works out, or compute it the same way.
+
+```pascal
+WriteLn(ItemDefJSON(defs.Item(4151), True, False));
+```
+*)
+function ItemDefJSON(item: TItemDefinition; hasExamine, hasUnknown1: Boolean): String;
+var
+  j: TJsonPretty;
+  order: TIntegerArray;
+  i, k, n: Integer;
+begin
+  j.Init();
+  j.OpenObj();
+
+  j.Field('id', ToStr(item.Id));
+  // ItemDefinition.name starts at "null" and is never null, so it is always
+  // written - including for the 1-item case where the cache set it to "".
+  j.Field('name', JSONQuoteHTML(item.Name));
+  if hasExamine then j.Field('examine', JSONQuoteHTML(item.Examine));
+  if hasUnknown1 then j.Field('unknown1', JSONQuoteHTML(item.Unknown1));
+
+  j.Field('resizeX', ToStr(item.ResizeX));
+  j.Field('resizeY', ToStr(item.ResizeY));
+  j.Field('resizeZ', ToStr(item.ResizeZ));
+
+  j.Field('xan2d', ToStr(item.XAn2D));
+  j.Field('yan2d', ToStr(item.YAn2D));
+  j.Field('zan2d', ToStr(item.ZAn2D));
+
+  j.Field('cost', ToStr(item.Cost));
+  j.Field('stackable', ToStr(item.Stackable));
+  j.Field('inventoryModel', ToStr(item.InventoryModel));
+
+  j.Field('tradeable', _JsonBool(item.Tradeable));
+  j.Field('geTradeable', _JsonBool(item.GeTradeable));
+
+  j.Field('wearPos1', ToStr(item.WearPos1));
+  j.Field('wearPos2', ToStr(item.WearPos2));
+  j.Field('wearPos3', ToStr(item.WearPos3));
+
+  j.Field('members', _JsonBool(item.Members));
+
+  // Opcodes 40/41 allocate both arrays together and never at length 0, so
+  // "empty" and "null" coincide here; no committed entry carries a `[]`.
+  if Length(item.ColorFind) > 0 then
+  begin
+    j.Key('colorFind');
+    _JsonIntArray(j, item.ColorFind);
+  end;
+  if Length(item.ColorReplace) > 0 then
+  begin
+    j.Key('colorReplace');
+    _JsonIntArray(j, item.ColorReplace);
+  end;
+  if Length(item.TextureFind) > 0 then
+  begin
+    j.Key('textureFind');
+    _JsonIntArray(j, item.TextureFind);
+  end;
+  if Length(item.TextureReplace) > 0 then
+  begin
+    j.Key('textureReplace');
+    _JsonIntArray(j, item.TextureReplace);
+  end;
+
+  j.Field('zoom2d', ToStr(item.Zoom2D));
+  j.Field('xOffset2d', ToStr(item.XOffset2D));
+  j.Field('yOffset2d', ToStr(item.YOffset2D));
+
+  j.Field('ambient', ToStr(item.Ambient));
+  j.Field('contrast', ToStr(item.Contrast));
+
+  // Declaration order is countCo before countObj, which is the reverse of the
+  // order opcode 100..109 fills them in.
+  if Length(item.CountCo) > 0 then
+  begin
+    j.Key('countCo');
+    _JsonIntArray(j, item.CountCo);
+  end;
+  if Length(item.CountObj) > 0 then
+  begin
+    j.Key('countObj');
+    _JsonIntArray(j, item.CountObj);
+  end;
+
+  j.Key('groundOps');
+  j.OpenObj();
+    j.Key('ops');
+    j.OpenArr();
+    n := _ItemGroundOpsLength(item.Ops.Ops);
+    for i := 0 to n - 1 do
+      if item.Ops.Ops[i] = '' then j.Elem('null')
+      else
+      begin
+        j.Sep();
+        j.OpenObj();
+        j.Field('text', JSONQuoteHTML(item.Ops.Ops[i]));
+        j.CloseObj();
+      end;
+    j.CloseArr();
+
+    j.Key('subOps');
+    _ItemSubOps(j, item.Ops);
+    j.Key('conditionalOps');
+    _ItemConditionalOps(j, item.Ops.Conditionals);
+    j.Key('conditionalSubOps');
+    _ItemConditionalSubOps(j, item.Ops.ConditionalSubs);
+  j.CloseObj();
+
+  j.Key('interfaceOptions');
+  _JsonSlotArray(j, item.InterfaceOptions);
+
+  // String[5][] - the outer array is allocated whole, the rows lazily, so a
+  // row this port left at length 0 is Java's null row.
+  if Length(item.Subops) > 0 then
+  begin
+    j.Key('subops');
+    j.OpenArr();
+    for i := 0 to High(item.Subops) do
+      if Length(item.Subops[i]) = 0 then j.Elem('null')
+      else
+      begin
+        j.Sep();
+        _JsonSlotArray(j, item.Subops[i]);
+      end;
+    j.CloseArr();
+  end;
+
+  j.Field('maleModel0', ToStr(item.MaleModel0));
+  j.Field('maleModel1', ToStr(item.MaleModel1));
+  j.Field('maleModel2', ToStr(item.MaleModel2));
+  j.Field('maleOffset', ToStr(item.MaleOffset));
+  j.Field('maleHeadModel', ToStr(item.MaleHeadModel));
+  j.Field('maleHeadModel2', ToStr(item.MaleHeadModel2));
+
+  j.Field('femaleModel0', ToStr(item.FemaleModel0));
+  j.Field('femaleModel1', ToStr(item.FemaleModel1));
+  j.Field('femaleModel2', ToStr(item.FemaleModel2));
+  j.Field('femaleOffset', ToStr(item.FemaleOffset));
+  j.Field('femaleHeadModel', ToStr(item.FemaleHeadModel));
+  j.Field('femaleHeadModel2', ToStr(item.FemaleHeadModel2));
+
+  j.Field('category', ToStr(item.Category));
+
+  // The key really is `notedID` with a capital D - it is the Java field name.
+  j.Field('notedID', ToStr(item.NotedId));
+  j.Field('notedTemplate', ToStr(item.NotedTemplate));
+
+  j.Field('team', ToStr(item.Team));
+  j.Field('weight', ToStr(item.Weight));
+
+  j.Field('shiftClickDropIndex', ToStr(item.ShiftClickDropIndex));
+
+  j.Field('boughtId', ToStr(item.BoughtId));
+  j.Field('boughtTemplateId', ToStr(item.BoughtTemplateId));
+
+  j.Field('placeholderId', ToStr(item.PlaceholderId));
+  j.Field('placeholderTemplateId', ToStr(item.PlaceholderTemplateId));
+
+  if Length(item.Params.Ids) > 0 then
+  begin
+    ItemDefParamOrder(item.Params, order);
+    j.Key('params');
+    j.OpenObj();
+    for i := 0 to High(order) do
+    begin
+      k := order[i];
+      // Gson writes a Map<Integer,...> key as String.valueOf(key), and the
+      // value through the runtime type's adapter: a bare number or a quoted,
+      // escaped string. Never a float - nothing in this archive is one.
+      j.Key(ToStr(item.Params.Ids[k]));
+      if item.Params.IsString[k] then
+        j.Text += JSONQuoteHTML(item.Params.Strings[k])
+      else
+        j.Text += ToStr(item.Params.Ints[k]);
+    end;
+    j.CloseObj();
+  end;
+
+  j.CloseObj();
+  Result := j.Text;
+end;
+
+(*
+## ItemDefJSONOf
+```pascal
+function ItemDefJSONOf(id: Integer; data: TByteArray): String;
+```
+Decodes one ITEM archive file and renders it, resolving the `''`-versus-null
+ambiguity on `examine` and `unknown1` for you. `data` is the file's bytes as
+`TCacheStore.ReadFiles` returns them and `id` is its **file id**, which is the
+item id and not its position in that array.
+
+The probe decode only runs when one of the two fields came back empty, and it
+costs a second `TItemDefinition.Load` when it does. See the unit docstring for
+why it is exact rather than a heuristic.
+
+```pascal
+files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.ITEM), []);
+WriteLn(ItemDefJSONOf(4151, files[FilePositionOf(table, Ord(EConfigType.ITEM), 4151)]));
+```
+*)
+function ItemDefJSONOf(id: Integer; data: TByteArray): String;
+var
+  item, probe: TItemDefinition;
+  hasExamine, hasUnknown1: Boolean;
+  probed: TByteArray;
+begin
+  item := TItemDefinition.Load(id, data);
+
+  hasExamine := item.Examine <> '';
+  hasUnknown1 := item.Unknown1 <> '';
+
+  if (not hasExamine) or (not hasUnknown1) then
+  begin
+    // Two complete opcodes: 3 (examine) and 9 (unknown1), each carrying the
+    // one-character string '*' terminated by 0. The stream stays exactly
+    // consumed, so the loader's end-of-data check still holds.
+    probed := [3, ITEMDEF_PROBE_BYTE, 0, 9, ITEMDEF_PROBE_BYTE, 0] + data;
+    probe := TItemDefinition.Load(id, probed);
+    if not hasExamine then hasExamine := probe.Examine <> ITEMDEF_PROBE_MARK;
+    if not hasUnknown1 then hasUnknown1 := probe.Unknown1 <> ITEMDEF_PROBE_MARK;
+  end;
+
+  Result := ItemDefJSON(item, hasExamine, hasUnknown1);
+end;
+
+// A String as its raw bytes. `Result := []` first because SetLength keeps the
+// overlapping prefix of whatever the slot held before.
+function _ItemDefBytes(s: String): TByteArray;
+begin
+  Result := [];
+  if s = '' then Exit;
+  SetLength(Result, Length(s));
+  Move(s[1], Result[0], Length(s));
+end;
+
+
+(*
+## DumpItemDefinitions
+```pascal
+procedure DumpItemDefinitions(var store: TCacheStore; zipPath: String);
+```
+Writes the whole `jsons/item-definitions.zip` for `store`: every file of the
+CONFIGS/ITEM archive, unfiltered, named `<id>.json`, in byte-lexicographic entry
+order.
+
+**The container's bytes will not match the committed zip and are not meant
+to.** Simba's deflate compresses harder than the JDK's and `TZipWriter` pins its
+own timestamps, so verification is per-entry content - which
+`dev/tests/411_itemdefs.simba` does against all 33745 committed entries.
+
+```pascal
+store := TCacheStore.Create(cacheDir);
+DumpItemDefinitions(store, dump.Path('jsons/item-definitions.zip'));
+```
+*)
+procedure DumpItemDefinitions(var store: TCacheStore; zipPath: String);
+var
+  files: array of TByteArray;
+  table: TCacheRefTable;
+  ids, order: TIntegerArray;
+  names: TStringArray;
+  zip: TZipWriter;
+  a, i, k: Integer;
+begin
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.ITEM));
+  if a = -1 then
+    raise 'DumpItemDefs: this cache has no CONFIGS/ITEM archive';
+
+  ids := table.Archives[a].FileIds;
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.ITEM), []);
+  if Length(files) <> Length(ids) then
+    raise 'DumpItemDefs: the ITEM archive holds ' + ToStr(Length(files)) +
+          ' files but its reference table names ' + ToStr(Length(ids));
+
+  SetLength(names, Length(ids));
+  for i := 0 to High(ids) do
+    names[i] := ToStr(ids[i]) + '.json';
+  order := DumpEntryOrder(names);
+
+  zip.Init();
+  for i := 0 to High(order) do
+  begin
+    k := order[i];
+    // One document at a time: the whole archive is 132 MB of json, and the
+    // writer already holds every deflated payload.
+    zip.AddBytes(names[k], _ItemDefBytes(ItemDefJSONOf(ids[k], files[k])));
+  end;
+
+  zip.Save(zipPath);
+end;

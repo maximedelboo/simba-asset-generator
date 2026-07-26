@@ -1,0 +1,211 @@
+(*
+# EntityOps
+The five right-click actions an item, object or NPC carries, plus the
+sub-op and conditional-op variants. Shared by all three definition loaders.
+
+The four decoders map one-to-one onto `EntityOpsLoader.java`, and are dispatched
+from these opcodes:
+
+| decoder | item | object | npc |
+|---|---|---|---|
+| `DecodeOp` (index = opcode - 30) | 30..34 | 30..34 | 30..34 |
+| `DecodeSubOp` | 200 | 100 | 251 |
+| `DecodeConditionalOp` | 201 | 101 | 252 |
+| `DecodeConditionalSubOp` | 202 | 102 | 253 |
+
+What is consumed downstream differs per definition kind. The object JSON takes
+`Ops` alone, as its `actions` array (`SimbaObjectInfoDumper.java:381-387`). The
+item JSON (`jsons/item-definitions.zip`) serialises the whole `groundOps` object -
+all four fields - e.g.
+
+```json
+{"ops":[null,null,{"text":"Take"}],"subOps":[],"conditionalOps":[],"conditionalSubOps":[]}
+```
+
+Note the shape of `ops` there: a variable-length list whose length is the highest
+set index + 1, with `null` for the unset slots in between. `Ops: TStringArray` is
+fixed-length and uses `''` for both "never set" and "set to empty string", where
+Java distinguishes `null` from `""`. A serialiser reconstructing those `null`
+holes from `Ops` therefore assumes no op has genuinely empty text - true for all
+33745 committed item definitions today, but an assumption, not a proof.
+
+Either way all four must decode to the byte: they share a stream with the rest of
+the definition, so a field read at the wrong width desynchronises everything after it.
+`DecodeSubOp` reads its sub-id as one byte while `DecodeConditionalSubOp` reads
+two - that asymmetry is in the client format, not a typo.
+*)
+{$DEFINE WL_CACHE_ENTITYOPS_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+
+const
+  ENTITY_OP_COUNT: Integer = 5;
+  ENTITY_SUBOP_COUNT: Integer = 20;
+
+type
+  // SubId is only ever filled by DecodeConditionalSubOp. Entries that reach
+  // TEntityOps.Conditionals come from DecodeConditionalOp, whose opcode carries
+  // no sub-id, so their SubId is always 0 - it is not a real sub-id 0.
+  TEntityConditionalOp = record
+    Index, SubId, Varp, Varb, Min, Max: Integer;
+    Text: String;
+  end;
+
+(*
+## TEntityOps
+```pascal
+TEntityOps = record
+  Ops: TStringArray;
+  SubOps: array of TStringArray;
+  Conditionals: array of TEntityConditionalOp;
+  ConditionalSubs: array of TEntityConditionalOp;
+end;
+```
+Use one `TEntityOps` per definition, and never copy one and then mutate the copy:
+the record's two halves alias differently. `Ops` and `SubOps` are shared by
+reference across a copy, so `b := a; b.DecodeOp(s, 1)` also writes `a.Ops[1]`,
+while `Conditionals` and `ConditionalSubs` reallocate on `+=`, so appending to
+`b` leaves `a` untouched. Copying therefore gives half-shared, half-independent
+state, which no caller wants. `dev/tests/220_entityops.simba` pins both
+behaviours so a change to either is caught.
+*)
+  TEntityOps = record
+    Ops: TStringArray;
+    SubOps: array of TStringArray;
+    Conditionals: array of TEntityConditionalOp;
+    ConditionalSubs: array of TEntityConditionalOp;
+  end;
+
+(*
+## TEntityOps.Create
+```pascal
+function TEntityOps.Create(): TEntityOps; static;
+```
+Allocates the op and sub-op grids at `ENTITY_OP_COUNT` x `ENTITY_SUBOP_COUNT`.
+That 5 x 20 is the **default allocation size, not a limit**: it is the shape the
+client itself allocates (`ItemLoader.java:188-217`, opcode 43) and it covers every
+sub-op seen in practice, but `DecodeSubOp` grows past it rather than dropping,
+since its index and sub-id are arbitrary stream bytes. Only `DecodeOp` is bounded
+by 5, and there by construction - its index is `opcode - 30` over opcodes 30..34.
+
+One divergence from Java remains: `SubOps[index][subId]` keeps a single entry per
+`(index, subId)` pair, so a repeated pair is last-write-wins, where
+`EntityOpsDefinition.setSubOp` appends to an ordered list and preserves both. This
+is currently unobservable - every one of the 33745 item definitions in the
+committed `jsons/item-definitions.zip` has an empty `subOps` - and would need
+revisiting if a cache revision starts emitting them.
+
+Eagerly allocating 5 x 20 strings costs ~32ms across 110k definitions (measured),
+which is noise next to decompressing the archives they come from - so this stays
+simple rather than lazy.
+*)
+function TEntityOps.Create(): TEntityOps; static;
+var
+  i: Integer;
+begin
+  SetLength(Result.Ops, ENTITY_OP_COUNT);
+  SetLength(Result.SubOps, ENTITY_OP_COUNT);
+  for i := 0 to ENTITY_OP_COUNT - 1 do
+    SetLength(Result.SubOps[i], ENTITY_SUBOP_COUNT);
+end;
+
+(*
+## TEntityOps.DecodeOp
+```pascal
+procedure TEntityOps.DecodeOp(var s: TByteStream; index: Integer);
+```
+Opcodes 30..34, with `index = opcode - 30`.
+*)
+// "Hidden" means the client shows no menu entry, so the slot stays empty.
+// The string is read before any bounds check: an ignored op must still consume
+// its bytes or the rest of the definition reads garbage.
+procedure TEntityOps.DecodeOp(var s: TByteStream; index: Integer);
+var
+  text: String;
+begin
+  text := s.ReadJagexString();
+  // Java compares with equalsIgnoreCase; SameText is the ASCII equivalent and
+  // WaspLib's String.Lower() is out of reach here (utils/cache is dependency-free).
+  if SameText(text, 'Hidden') then Exit;
+  if (index < 0) or (index >= ENTITY_OP_COUNT) then Exit;
+  // Ops is only ENTITY_OP_COUNT long after Create(); on a record that was never
+  // created the write below would raise a bare 'Index out of range' naming
+  // neither the unit nor the actual mistake.
+  if index > High(Self.Ops) then
+    raise 'EntityOps: op slot ' + ToStr(index) + ' is unallocated - TEntityOps.Create() was not called';
+  Self.Ops[index] := text;
+end;
+
+(*
+## TEntityOps.DecodeSubOp
+```pascal
+procedure TEntityOps.DecodeSubOp(var s: TByteStream);
+```
+Item opcode 200, object 100, NPC 251. Sub-id is a single byte here.
+
+Both index and sub-id are raw stream bytes, so neither is bounded by the 5 x 20
+that `Create` allocates. `EntityOpsDefinition.setSubOp` grows its lists to fit;
+so does this, rather than dropping the write - a cap here would silently discard
+data the Java keeps, on any cache revision that starts emitting larger indexes.
+No further guard is needed to keep the allocation sane: two `ReadUByte`s bound
+the grid at 256 x 256 by themselves.
+*)
+procedure TEntityOps.DecodeSubOp(var s: TByteStream);
+var
+  index, subId: Integer;
+  text: String;
+begin
+  index := s.ReadUByte();
+  subId := s.ReadUByte();
+  text := s.ReadJagexString();
+
+  if index > High(Self.SubOps) then
+    SetLength(Self.SubOps, index + 1);
+  if subId > High(Self.SubOps[index]) then
+    SetLength(Self.SubOps[index], subId + 1);
+
+  Self.SubOps[index][subId] := text;
+end;
+
+(*
+## TEntityOps.DecodeConditionalOp
+```pascal
+procedure TEntityOps.DecodeConditionalOp(var s: TByteStream);
+```
+Item opcode 201, object 101, NPC 252. The op is shown only while the varp/varbit
+sits in [Min, Max]. Appended rather than slotted, since one op index can carry
+several conditions.
+*)
+procedure TEntityOps.DecodeConditionalOp(var s: TByteStream);
+var
+  op: TEntityConditionalOp;
+begin
+  op.Index := s.ReadUByte();
+  op.Varp := s.ReadUShort();
+  op.Varb := s.ReadUShort();
+  op.Min := s.ReadInt();
+  op.Max := s.ReadInt();
+  op.Text := s.ReadJagexString();
+  Self.Conditionals += op;
+end;
+
+(*
+## TEntityOps.DecodeConditionalSubOp
+```pascal
+procedure TEntityOps.DecodeConditionalSubOp(var s: TByteStream);
+```
+Item opcode 202, object 102, NPC 253. As DecodeConditionalOp but with a sub-id,
+read as an unsigned **short** - unlike DecodeSubOp's single byte.
+*)
+procedure TEntityOps.DecodeConditionalSubOp(var s: TByteStream);
+var
+  op: TEntityConditionalOp;
+begin
+  op.Index := s.ReadUByte();
+  op.SubId := s.ReadUShort();
+  op.Varp := s.ReadUShort();
+  op.Varb := s.ReadUShort();
+  op.Min := s.ReadInt();
+  op.Max := s.ReadInt();
+  op.Text := s.ReadJagexString();
+  Self.ConditionalSubs += op;
+end;

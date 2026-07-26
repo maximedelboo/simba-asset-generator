@@ -1,0 +1,1014 @@
+(*
+# ModelDefinition
+Decodes one archive of index 7 `MODELS` into the geometry the asset dumpers
+consume. A port of `net.runelite.cache.definitions.loaders.ModelLoader`, whose
+`decodeType3` and `decodeType2` bodies this file follows statement for statement.
+
+The format is **positional, not opcode-driven**. A 24- or 21-byte header at the
+tail of the buffer declares the counts and the byte length of a dozen data
+sections; every section offset is then derived by adding those lengths up in a
+fixed order, and five (type2) or seven (type3) independent cursors read the
+sections in parallel - the same buffer, seven positions. There
+is nothing to resynchronise on: get one length wrong and the decode still
+"succeeds", producing a plausible-looking model built from the wrong bytes. The
+guards against that are in `Load` (the section table must account for exactly
+the whole buffer) and in `dev/tests/280_model.simba` (every decoded index must
+address a vertex that exists, across all 60484 models).
+
+## Which formats are ported
+Only type2 and type3. Across the 60484 models in the live cache the census is
+27039 type2, 33445 type3, and zero of anything else; cache 2625 agrees (26990 /
+34616 / 0). `decodeType1` and `decodeOldFormat` are therefore **not** ported and
+`Load` raises when it meets one, the same choice `TCacheStore` made for the
+extended sector format. The format is picked from the last two bytes:
+
+| last two bytes | format |
+|---|---|
+| `FF FD` | type3 |
+| `FF FE` | type2 |
+| `FF FF` | type1 - raises |
+| anything else | old format - raises |
+
+## Not ported
+`computeNormals`, `computeTextureUVCoordinates` and `computeAnimationTables`
+run in Java's `load` but nothing in the dump path calls them: the object and NPC
+dumps need `Height` and `Colors`, and both read the raw geometry. Porting a
+2000-line renderer that no consumer exercises would be dead code.
+
+## Signed narrowing is load-bearing
+Java stores face colours and texture ids in `short[]` and priorities,
+transparencies and render types in `byte[]`, and the narrowing casts really do
+produce negative values: 20392 of the 60484 models in the live cache carry at
+least one face colour above 32767, 3518377 faces in all. Two of those signs are
+not cosmetic:
+
+- type2 moves the raw face colour into `FaceTextures` and then tests it against
+  -1 to decide whether the model has textures at all. Keeping the value
+  unsigned turns a raw 65535 ("no texture") into a real texture id.
+- `Colors` deduplicates on the face colour, and `ObjExporter` deduplicates on
+  the same signed value. Both work as long as the two agree.
+
+So every field Java narrows is narrowed here too. `TIntegerArray` is the carrier
+- Lape has no 16- or 8-bit array type and every consumer widens anyway.
+
+## Empty means absent
+Java nulls `faceTextures`, `faceRenderTypes` and `textureCoords` at the end of
+`decodeType2` when nothing used them, and `Colors` branches on
+`faceTextures != null`. Here that is `Length(...) = 0`. The two readings differ
+only for a model with `FaceCount = 0` (20 of them in the live cache), where an
+allocated array is also empty - and nothing iterates a zero-length model, so the
+difference is unobservable.
+*)
+{$DEFINE WL_CACHE_DEF_MODEL_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_JAGEXCOLOR_INCLUDED}{$INCLUDE_ONCE ../jagexcolor.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_TERRAIN_INCLUDED}{$INCLUDE_ONCE terrain.simba}{$ENDIF}
+
+type
+(*
+## TModelDefinition
+```pascal
+TModelDefinition = record
+  Id, Format: Integer;
+  VertexCount, FaceCount, NumTextureFaces: Integer;
+  VertexX, VertexY, VertexZ: TIntegerArray;
+  FaceIndices1, FaceIndices2, FaceIndices3: TIntegerArray;
+  FaceColors, FaceTextures: TIntegerArray;
+  FaceRenderPriorities, FaceTransparencies, FaceRenderTypes: TIntegerArray;
+  TextureRenderTypes: TIntegerArray;
+  TexIndices1, TexIndices2, TexIndices3: TIntegerArray;
+  Priority: Integer;
+  TextureCoords, PackedVertexGroups, PackedTransparencyVertexGroups: TIntegerArray;
+  FaceZOffsets: TIntegerArray;
+  AnimayaGroups, AnimayaScales: array of TIntegerArray;
+end;
+```
+Every field `ModelDefinition.java` has that either decoder writes. The `transient`
+ones (`vertexNormals`, `faceNormals`, `faceTextureU/VCoordinates`, `vertexGroups`,
+`origV*`, `maxPriority`) belong to the renderers that are not ported, and
+`texturePrimaryColors` is declared in Java but never written by any loader.
+
+`Format` is 2 or 3 and has no Java counterpart - it is the branch `load` took,
+kept because the two formats disagree on which fields exist and a caller that
+cares should not have to re-sniff the buffer.
+
+`Priority` is the model-wide fallback, set only when `FaceRenderPriorities` is
+absent. Java stores it in a `byte`, so the 128..254 range comes back negative.
+*)
+  TModelDefinition = record
+    Id: Integer;
+    Format: Integer;
+
+    VertexCount: Integer;
+    FaceCount: Integer;
+    NumTextureFaces: Integer;
+
+    VertexX: TIntegerArray;
+    VertexY: TIntegerArray;
+    VertexZ: TIntegerArray;
+
+    FaceIndices1: TIntegerArray;
+    FaceIndices2: TIntegerArray;
+    FaceIndices3: TIntegerArray;
+
+    FaceColors: TIntegerArray;
+    FaceTextures: TIntegerArray;
+
+    FaceRenderPriorities: TIntegerArray;
+    FaceTransparencies: TIntegerArray;
+    FaceRenderTypes: TIntegerArray;
+
+    TextureRenderTypes: TIntegerArray;
+    TexIndices1: TIntegerArray;
+    TexIndices2: TIntegerArray;
+    TexIndices3: TIntegerArray;
+
+    Priority: Integer;
+    TextureCoords: TIntegerArray;
+    PackedVertexGroups: TIntegerArray;
+    PackedTransparencyVertexGroups: TIntegerArray;
+    FaceZOffsets: TIntegerArray;
+
+    AnimayaGroups: array of TIntegerArray;
+    AnimayaScales: array of TIntegerArray;
+  end;
+
+// Java's (short) and (byte) narrowing casts. See the unit docstring - the signs
+// these produce are read by later branches, they are not decoration.
+function ModelToShort(v: Integer): Integer;
+begin
+  Result := v and $FFFF;
+  if Result > $7FFF then Result -= $10000;
+end;
+
+function ModelToByte(v: Integer): Integer;
+begin
+  Result := v and $FF;
+  if Result > $7F then Result -= $100;
+end;
+
+// Allocate zeroed. SetLength alone keeps whatever the array held before, and
+// `Result` in a Lape function can alias a caller variable that is being reused
+// in a loop - which is exactly how these records are consumed.
+procedure ModelAlloc(var arr: TIntegerArray; count: Integer);
+begin
+  arr := [];
+  SetLength(arr, count);
+end;
+
+// Linear scan. Deliberately local: whether Lape's array helpers are available on
+// a plain TIntegerArray in this build is unverified, and utils/cache/ units must
+// not depend on anything unproven.
+function ModelIndexOf(var arr: TIntegerArray; value: Integer): Integer;
+begin
+  for Result := 0 to High(arr) do
+    if arr[Result] = value then Exit;
+  Result := -1;
+end;
+
+procedure ModelAppend(var arr: TIntegerArray; value: Integer);
+begin
+  SetLength(arr, Length(arr) + 1);
+  arr[High(arr)] := value;
+end;
+
+(*
+## TModelDefinition.Reset
+```pascal
+procedure TModelDefinition.Reset(id: Integer);
+```
+Clears every field. `Load` calls this first because a Lape record's arrays are
+shared by reference with whatever variable receives the result, so a record
+reused across a loop would otherwise start each decode holding the previous
+model's arrays - and `SetLength` preserves the overlapping prefix rather than
+zeroing it.
+*)
+procedure TModelDefinition.Reset(id: Integer);
+begin
+  Self.Id := id;
+  Self.Format := 0;
+  Self.VertexCount := 0;
+  Self.FaceCount := 0;
+  Self.NumTextureFaces := 0;
+  Self.Priority := 0;
+
+  Self.VertexX := [];
+  Self.VertexY := [];
+  Self.VertexZ := [];
+  Self.FaceIndices1 := [];
+  Self.FaceIndices2 := [];
+  Self.FaceIndices3 := [];
+  Self.FaceColors := [];
+  Self.FaceTextures := [];
+  Self.FaceRenderPriorities := [];
+  Self.FaceTransparencies := [];
+  Self.FaceRenderTypes := [];
+  Self.TextureRenderTypes := [];
+  Self.TexIndices1 := [];
+  Self.TexIndices2 := [];
+  Self.TexIndices3 := [];
+  Self.TextureCoords := [];
+  Self.PackedVertexGroups := [];
+  Self.PackedTransparencyVertexGroups := [];
+  Self.FaceZOffsets := [];
+  Self.AnimayaGroups := [];
+  Self.AnimayaScales := [];
+end;
+
+(*
+## TModelDefinition.DecodeType3
+```pascal
+procedure TModelDefinition.DecodeType3(data: TByteArray);
+```
+`ModelLoader.decodeType3`. The 24-byte header sits at `Length(data) - 26`, ahead
+of the two-byte `FF FD` marker; the sections it describes run from offset 0 to
+that header.
+
+Section order, in the order the offsets are accumulated - this *is* the file
+layout, and getting one entry's size or its position in the chain wrong shifts
+every section after it:
+
+| section | size | present when |
+|---|---|---|
+| texture render types | textureCount | textureCount > 0 |
+| vertex flags | vertexCount | always |
+| face render types | faceCount | hasRenderTypes = 1 |
+| face index compression types | faceCount | always |
+| face render priorities | faceCount | priority = 255 |
+| packed transparency vertex groups | faceCount | hasTexVertexGroups = 1 |
+| vertex groups + animaya | vertexGroupLen | always |
+| face transparencies | faceCount | hasTransparencies = 1 |
+| face index deltas | faceIndexLen | always |
+| face textures | faceCount * 2 | hasTextures = 1 |
+| texture coords | texCoordLen | always |
+| face colours | faceCount * 2 | always |
+| vertex X / Y / Z deltas | xLen / yLen / zLen | always |
+| texture triples, render type 0 | simpleTex * 6 | always |
+| render type 1..3 blocks | complexTex * (6+6+2+1+2), plus type-2 extras | always |
+| footer | 1 (+7) (+1) (+faceCount) | always |
+
+The footer is a marker byte (non-zero pulls in a 10-byte vertex offset block),
+then a flag byte and, if set, one signed byte of Z offset per face.
+*)
+procedure TModelDefinition.DecodeType3(data: TByteArray);
+var
+  s1, s2, s3, s4, s5, s6, s7: TByteStream;
+  vertexCount, faceCount, textureCount: Integer;
+  hasRenderTypes, priority, hasTransparencies, hasTexVertexGroups: Integer;
+  hasTextures, hasVertexGroups, hasAnimaya: Integer;
+  xLen, yLen, zLen, faceIndexLen, texCoordLen, vertexGroupLen: Integer;
+  simpleTex, complexTex, alphaTex: Integer;
+  cursor: Integer;
+  offRenderTypes, offFaceIdxTypes, offPriorities, offTexVGroups, offVGroups: Integer;
+  offTransparencies, offFaceIdxData, offTextures, offTexCoords, offColors: Integer;
+  offVX, offVY, offVZ: Integer;
+  offTex0, offTex1, offTex2, offTex3, offTex4, offTex5: Integer;
+  i, j, n, flags, dx, dy, dz, px, py, pz: Integer;
+  kind, a, b, c, last, swap: Integer;
+begin
+  s1 := TByteStream.Create(data);
+  s2 := TByteStream.Create(data);
+  s3 := TByteStream.Create(data);
+  s4 := TByteStream.Create(data);
+  s5 := TByteStream.Create(data);
+  s6 := TByteStream.Create(data);
+  s7 := TByteStream.Create(data);
+
+  s1.SetPosition(s1.Length() - 26);
+  vertexCount        := s1.ReadUShort();
+  faceCount          := s1.ReadUShort();
+  textureCount       := s1.ReadUByte();
+  hasRenderTypes     := s1.ReadUByte();
+  priority           := s1.ReadUByte();
+  hasTransparencies  := s1.ReadUByte();
+  hasTexVertexGroups := s1.ReadUByte();
+  hasTextures        := s1.ReadUByte();
+  hasVertexGroups    := s1.ReadUByte();
+  hasAnimaya         := s1.ReadUByte();
+  xLen               := s1.ReadUShort();
+  yLen               := s1.ReadUShort();
+  zLen               := s1.ReadUShort();
+  faceIndexLen       := s1.ReadUShort();
+  texCoordLen        := s1.ReadUShort();
+  vertexGroupLen     := s1.ReadUShort();
+
+  simpleTex := 0;
+  complexTex := 0;
+  alphaTex := 0;
+  if textureCount > 0 then
+  begin
+    ModelAlloc(Self.TextureRenderTypes, textureCount);
+    s1.SetPosition(0);
+    for i := 0 to textureCount - 1 do
+    begin
+      // Signed: the counters below compare against 0..3, and Java reads a byte.
+      n := s1.ReadByte();
+      Self.TextureRenderTypes[i] := n;
+      if n = 0 then Inc(simpleTex);
+      if (n >= 1) and (n <= 3) then Inc(complexTex);
+      if n = 2 then Inc(alphaTex);
+    end;
+  end;
+
+  cursor := textureCount + vertexCount;
+  offRenderTypes := cursor;
+  if hasRenderTypes = 1 then cursor += faceCount;
+  offFaceIdxTypes := cursor;
+  cursor += faceCount;
+  offPriorities := cursor;
+  if priority = 255 then cursor += faceCount;
+  offTexVGroups := cursor;
+  if hasTexVertexGroups = 1 then cursor += faceCount;
+  offVGroups := cursor;
+  cursor += vertexGroupLen;
+  offTransparencies := cursor;
+  if hasTransparencies = 1 then cursor += faceCount;
+  offFaceIdxData := cursor;
+  cursor += faceIndexLen;
+  offTextures := cursor;
+  if hasTextures = 1 then cursor += faceCount * 2;
+  offTexCoords := cursor;
+  cursor += texCoordLen;
+  offColors := cursor;
+  cursor += faceCount * 2;
+  offVX := cursor;
+  cursor += xLen;
+  offVY := cursor;
+  cursor += yLen;
+  offVZ := cursor;
+  cursor += zLen;
+  offTex0 := cursor;
+  cursor += simpleTex * 6;
+  offTex1 := cursor;
+  cursor += complexTex * 6;
+  offTex2 := cursor;
+  cursor += complexTex * 6;
+  offTex3 := cursor;
+  cursor += complexTex * 2;
+  offTex4 := cursor;
+  cursor += complexTex;
+  offTex5 := cursor;
+  cursor := cursor + complexTex * 2 + alphaTex * 2;
+
+  Self.VertexCount := vertexCount;
+  Self.FaceCount := faceCount;
+  Self.NumTextureFaces := textureCount;
+  ModelAlloc(Self.VertexX, vertexCount);
+  ModelAlloc(Self.VertexY, vertexCount);
+  ModelAlloc(Self.VertexZ, vertexCount);
+  ModelAlloc(Self.FaceIndices1, faceCount);
+  ModelAlloc(Self.FaceIndices2, faceCount);
+  ModelAlloc(Self.FaceIndices3, faceCount);
+  if hasVertexGroups = 1 then ModelAlloc(Self.PackedVertexGroups, vertexCount);
+  if hasRenderTypes = 1 then ModelAlloc(Self.FaceRenderTypes, faceCount);
+  if priority = 255 then
+    ModelAlloc(Self.FaceRenderPriorities, faceCount)
+  else
+    Self.Priority := ModelToByte(priority);
+  if hasTransparencies = 1 then ModelAlloc(Self.FaceTransparencies, faceCount);
+  if hasTexVertexGroups = 1 then ModelAlloc(Self.PackedTransparencyVertexGroups, faceCount);
+  if hasTextures = 1 then ModelAlloc(Self.FaceTextures, faceCount);
+  if (hasTextures = 1) and (textureCount > 0) then ModelAlloc(Self.TextureCoords, faceCount);
+  if hasAnimaya = 1 then
+  begin
+    Self.AnimayaGroups := [];
+    Self.AnimayaScales := [];
+    SetLength(Self.AnimayaGroups, vertexCount);
+    SetLength(Self.AnimayaScales, vertexCount);
+  end;
+  ModelAlloc(Self.FaceColors, faceCount);
+  if textureCount > 0 then
+  begin
+    ModelAlloc(Self.TexIndices1, textureCount);
+    ModelAlloc(Self.TexIndices2, textureCount);
+    ModelAlloc(Self.TexIndices3, textureCount);
+  end;
+
+  // Vertices: one flag byte per vertex picks which of the three delta streams
+  // advance, and each axis is a running total.
+  s1.SetPosition(textureCount);
+  s2.SetPosition(offVX);
+  s3.SetPosition(offVY);
+  s4.SetPosition(offVZ);
+  s5.SetPosition(offVGroups);
+  px := 0;
+  py := 0;
+  pz := 0;
+  for i := 0 to vertexCount - 1 do
+  begin
+    flags := s1.ReadUByte();
+    dx := 0;
+    if (flags and 1) <> 0 then dx := s2.ReadShortSmart();
+    dy := 0;
+    if (flags and 2) <> 0 then dy := s3.ReadShortSmart();
+    dz := 0;
+    if (flags and 4) <> 0 then dz := s4.ReadShortSmart();
+
+    px += dx;
+    py += dy;
+    pz += dz;
+    Self.VertexX[i] := px;
+    Self.VertexY[i] := py;
+    Self.VertexZ[i] := pz;
+    if hasVertexGroups = 1 then
+      Self.PackedVertexGroups[i] := s5.ReadUByte();
+  end;
+
+  // Animaya continues in the same stream as the vertex groups.
+  if hasAnimaya = 1 then
+    for i := 0 to vertexCount - 1 do
+    begin
+      n := s5.ReadUByte();
+      ModelAlloc(Self.AnimayaGroups[i], n);
+      ModelAlloc(Self.AnimayaScales[i], n);
+      for j := 0 to n - 1 do
+      begin
+        Self.AnimayaGroups[i][j] := s5.ReadUByte();
+        Self.AnimayaScales[i][j] := s5.ReadUByte();
+      end;
+    end;
+
+  s1.SetPosition(offColors);
+  s2.SetPosition(offRenderTypes);
+  s3.SetPosition(offPriorities);
+  s4.SetPosition(offTransparencies);
+  s5.SetPosition(offTexVGroups);
+  s6.SetPosition(offTextures);
+  s7.SetPosition(offTexCoords);
+
+  for i := 0 to faceCount - 1 do
+  begin
+    Self.FaceColors[i] := ModelToShort(s1.ReadUShort());
+    if hasRenderTypes = 1 then Self.FaceRenderTypes[i] := s2.ReadByte();
+    if priority = 255 then Self.FaceRenderPriorities[i] := s3.ReadByte();
+    if hasTransparencies = 1 then Self.FaceTransparencies[i] := s4.ReadByte();
+    if hasTexVertexGroups = 1 then Self.PackedTransparencyVertexGroups[i] := s5.ReadUByte();
+    // Stored one higher than the id, so 0 means "no texture" and lands on -1.
+    if hasTextures = 1 then Self.FaceTextures[i] := ModelToShort(s6.ReadUShort() - 1);
+    // TextureCoords is only allocated when FaceTextures is, so the guard below
+    // can dereference it - the same short-circuit the Java relies on.
+    if (Length(Self.TextureCoords) > 0) and (Self.FaceTextures[i] <> -1) then
+      Self.TextureCoords[i] := ModelToByte(s7.ReadUByte() - 1);
+  end;
+
+  // Faces: a per-face compression byte says how many of the three indices are
+  // re-read and how the previous triple is rotated into the new one.
+  s1.SetPosition(offFaceIdxData);
+  s2.SetPosition(offFaceIdxTypes);
+  a := 0;
+  b := 0;
+  c := 0;
+  last := 0;
+  for i := 0 to faceCount - 1 do
+  begin
+    kind := s2.ReadUByte();
+    if kind = 1 then
+    begin
+      a := s1.ReadShortSmart() + last;
+      b := s1.ReadShortSmart() + a;
+      c := s1.ReadShortSmart() + b;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := b;
+      Self.FaceIndices3[i] := c;
+    end;
+
+    if kind = 2 then
+    begin
+      b := c;
+      c := s1.ReadShortSmart() + last;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := b;
+      Self.FaceIndices3[i] := c;
+    end;
+
+    if kind = 3 then
+    begin
+      a := c;
+      c := s1.ReadShortSmart() + last;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := b;
+      Self.FaceIndices3[i] := c;
+    end;
+
+    if kind = 4 then
+    begin
+      // The swap is written back to FaceIndices2, not b: the Java stores the
+      // pre-swap value there while b keeps the post-swap one for the next face.
+      swap := a;
+      a := b;
+      b := swap;
+      c := s1.ReadShortSmart() + last;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := swap;
+      Self.FaceIndices3[i] := c;
+    end;
+  end;
+
+  // Only render type 0 stores a vertex triple. Types 1..3 have their own blocks,
+  // which the offsets above reserve space for and which nothing reads - the Java
+  // does not decode them either.
+  s1.SetPosition(offTex0);
+  s2.SetPosition(offTex1);
+  s3.SetPosition(offTex2);
+  s4.SetPosition(offTex3);
+  s5.SetPosition(offTex4);
+  s6.SetPosition(offTex5);
+
+  for i := 0 to textureCount - 1 do
+    if (Self.TextureRenderTypes[i] and 255) = 0 then
+    begin
+      Self.TexIndices1[i] := ModelToShort(s1.ReadUShort());
+      Self.TexIndices2[i] := ModelToShort(s1.ReadUShort());
+      Self.TexIndices3[i] := ModelToShort(s1.ReadUShort());
+    end;
+
+  s1.SetPosition(cursor);
+  n := s1.ReadUByte();
+  if n <> 0 then
+  begin
+    s1.ReadUShort();
+    s1.ReadUShort();
+    s1.ReadUShort();
+    s1.ReadInt();
+  end;
+
+  if s1.ReadUByte() = 1 then
+  begin
+    ModelAlloc(Self.FaceZOffsets, faceCount);
+    for i := 0 to faceCount - 1 do
+      Self.FaceZOffsets[i] := s1.ReadByte();
+  end;
+
+  // The footer must end exactly where the header begins. Nothing else in this
+  // decoder can fail, so this is the only place a mis-sized section shows up.
+  if s1.Position <> s1.Length() - 26 then
+    raise 'ModelDefinition: type3 model ' + ToStr(Self.Id) + ' ends at ' +
+          ToStr(s1.Position) + ', expected ' + ToStr(s1.Length() - 26);
+end;
+
+(*
+## TModelDefinition.DecodeType2
+```pascal
+procedure TModelDefinition.DecodeType2(data: TByteArray);
+```
+`ModelLoader.decodeType2`. A 21-byte header at `Length(data) - 23`, ahead of the
+`FF FE` marker, and five cursors instead of seven.
+
+Two structural differences from type3 rather than just a shorter header:
+
+- **Textures ride on the face colours.** There is no separate texture stream. A
+  face flag byte with bit 1 set moves that face's colour into `FaceTextures` and
+  replaces the colour with 127. `hasRenderTypes` therefore gates all three of
+  `FaceRenderTypes`, `TextureCoords` and `FaceTextures`.
+- **Three arrays are dropped again at the end.** If no face turned out to use a
+  render type, a texture or a distinct texture coordinate, Java nulls the whole
+  array. `Colors` reads `FaceTextures` through exactly that test, so the drop is
+  not cosmetic: a model where every textured face was folded away must come back
+  with no textures at all.
+
+`TextureCoords` is dropped by a different rule from the other two - a coordinate
+is cleared when its texture triple already equals the face's own vertex triple,
+and only if *every* coordinate clears does the array go.
+*)
+procedure TModelDefinition.DecodeType2(data: TByteArray);
+var
+  s1, s2, s3, s4, s5: TByteStream;
+  vertexCount, faceCount, textureCount: Integer;
+  isTextured, priority, hasTransparencies, hasTexVertexGroups: Integer;
+  hasVertexGroups, hasAnimaya: Integer;
+  xLen, yLen, zLen, faceIndexLen, vertexGroupLen: Integer;
+  cursor: Integer;
+  offVertexFlags, offFaceIdxTypes, offPriorities, offTexVGroups, offTexFlags: Integer;
+  offVGroups, offTransparencies, offFaceIdxData, offColors, offTexTriples: Integer;
+  offVX, offVY, offVZ: Integer;
+  i, j, n, flags, dx, dy, dz, px, py, pz: Integer;
+  kind, a, b, c, last, swap, coord: Integer;
+  usesRenderTypes, usesTextures, usesTexCoords: Boolean;
+begin
+  s1 := TByteStream.Create(data);
+  s2 := TByteStream.Create(data);
+  s3 := TByteStream.Create(data);
+  s4 := TByteStream.Create(data);
+  s5 := TByteStream.Create(data);
+
+  s1.SetPosition(s1.Length() - 23);
+  vertexCount        := s1.ReadUShort();
+  faceCount          := s1.ReadUShort();
+  textureCount       := s1.ReadUByte();
+  isTextured         := s1.ReadUByte();
+  priority           := s1.ReadUByte();
+  hasTransparencies  := s1.ReadUByte();
+  hasTexVertexGroups := s1.ReadUByte();
+  hasVertexGroups    := s1.ReadUByte();
+  hasAnimaya         := s1.ReadUByte();
+  xLen               := s1.ReadUShort();
+  yLen               := s1.ReadUShort();
+  zLen               := s1.ReadUShort();
+  faceIndexLen       := s1.ReadUShort();
+  vertexGroupLen     := s1.ReadUShort();
+
+  offVertexFlags := 0;
+  cursor := offVertexFlags + vertexCount;
+  offFaceIdxTypes := cursor;
+  cursor += faceCount;
+  offPriorities := cursor;
+  if priority = 255 then cursor += faceCount;
+  offTexVGroups := cursor;
+  if hasTexVertexGroups = 1 then cursor += faceCount;
+  offTexFlags := cursor;
+  if isTextured = 1 then cursor += faceCount;
+  offVGroups := cursor;
+  cursor += vertexGroupLen;
+  offTransparencies := cursor;
+  if hasTransparencies = 1 then cursor += faceCount;
+  offFaceIdxData := cursor;
+  cursor += faceIndexLen;
+  offColors := cursor;
+  cursor += faceCount * 2;
+  offTexTriples := cursor;
+  cursor += textureCount * 6;
+  offVX := cursor;
+  cursor += xLen;
+  offVY := cursor;
+  cursor += yLen;
+  offVZ := cursor;
+  cursor += zLen;
+
+  Self.VertexCount := vertexCount;
+  Self.FaceCount := faceCount;
+  Self.NumTextureFaces := textureCount;
+  ModelAlloc(Self.VertexX, vertexCount);
+  ModelAlloc(Self.VertexY, vertexCount);
+  ModelAlloc(Self.VertexZ, vertexCount);
+  ModelAlloc(Self.FaceIndices1, faceCount);
+  ModelAlloc(Self.FaceIndices2, faceCount);
+  ModelAlloc(Self.FaceIndices3, faceCount);
+  if textureCount > 0 then
+  begin
+    ModelAlloc(Self.TextureRenderTypes, textureCount);
+    ModelAlloc(Self.TexIndices1, textureCount);
+    ModelAlloc(Self.TexIndices2, textureCount);
+    ModelAlloc(Self.TexIndices3, textureCount);
+  end;
+  if hasVertexGroups = 1 then ModelAlloc(Self.PackedVertexGroups, vertexCount);
+  if isTextured = 1 then
+  begin
+    ModelAlloc(Self.FaceRenderTypes, faceCount);
+    ModelAlloc(Self.TextureCoords, faceCount);
+    ModelAlloc(Self.FaceTextures, faceCount);
+  end;
+  if priority = 255 then
+    ModelAlloc(Self.FaceRenderPriorities, faceCount)
+  else
+    Self.Priority := ModelToByte(priority);
+  if hasTransparencies = 1 then ModelAlloc(Self.FaceTransparencies, faceCount);
+  if hasTexVertexGroups = 1 then ModelAlloc(Self.PackedTransparencyVertexGroups, faceCount);
+  if hasAnimaya = 1 then
+  begin
+    Self.AnimayaGroups := [];
+    Self.AnimayaScales := [];
+    SetLength(Self.AnimayaGroups, vertexCount);
+    SetLength(Self.AnimayaScales, vertexCount);
+  end;
+  ModelAlloc(Self.FaceColors, faceCount);
+
+  s1.SetPosition(offVertexFlags);
+  s2.SetPosition(offVX);
+  s3.SetPosition(offVY);
+  s4.SetPosition(offVZ);
+  s5.SetPosition(offVGroups);
+  px := 0;
+  py := 0;
+  pz := 0;
+  for i := 0 to vertexCount - 1 do
+  begin
+    flags := s1.ReadUByte();
+    dx := 0;
+    if (flags and 1) <> 0 then dx := s2.ReadShortSmart();
+    dy := 0;
+    if (flags and 2) <> 0 then dy := s3.ReadShortSmart();
+    dz := 0;
+    if (flags and 4) <> 0 then dz := s4.ReadShortSmart();
+
+    px += dx;
+    py += dy;
+    pz += dz;
+    Self.VertexX[i] := px;
+    Self.VertexY[i] := py;
+    Self.VertexZ[i] := pz;
+    if hasVertexGroups = 1 then
+      Self.PackedVertexGroups[i] := s5.ReadUByte();
+  end;
+
+  if hasAnimaya = 1 then
+    for i := 0 to vertexCount - 1 do
+    begin
+      n := s5.ReadUByte();
+      ModelAlloc(Self.AnimayaGroups[i], n);
+      ModelAlloc(Self.AnimayaScales[i], n);
+      for j := 0 to n - 1 do
+      begin
+        Self.AnimayaGroups[i][j] := s5.ReadUByte();
+        Self.AnimayaScales[i][j] := s5.ReadUByte();
+      end;
+    end;
+
+  s1.SetPosition(offColors);
+  s2.SetPosition(offTexFlags);
+  s3.SetPosition(offPriorities);
+  s4.SetPosition(offTransparencies);
+  s5.SetPosition(offTexVGroups);
+
+  usesRenderTypes := False;
+  usesTextures := False;
+  for i := 0 to faceCount - 1 do
+  begin
+    Self.FaceColors[i] := ModelToShort(s1.ReadUShort());
+    if isTextured = 1 then
+    begin
+      flags := s2.ReadUByte();
+      if (flags and 1) = 1 then
+      begin
+        Self.FaceRenderTypes[i] := 1;
+        usesRenderTypes := True;
+      end
+      else
+        Self.FaceRenderTypes[i] := 0;
+
+      if (flags and 2) = 2 then
+      begin
+        Self.TextureCoords[i] := ModelToByte(flags shr 2);
+        Self.FaceTextures[i] := Self.FaceColors[i];
+        Self.FaceColors[i] := 127;
+        // The colour was a signed short, so a raw 65535 arrives here as -1 and
+        // means "no texture after all".
+        if Self.FaceTextures[i] <> -1 then
+          usesTextures := True;
+      end
+      else
+      begin
+        Self.TextureCoords[i] := -1;
+        Self.FaceTextures[i] := -1;
+      end;
+    end;
+
+    if priority = 255 then Self.FaceRenderPriorities[i] := s3.ReadByte();
+    if hasTransparencies = 1 then Self.FaceTransparencies[i] := s4.ReadByte();
+    if hasTexVertexGroups = 1 then Self.PackedTransparencyVertexGroups[i] := s5.ReadUByte();
+  end;
+
+  s1.SetPosition(offFaceIdxData);
+  s2.SetPosition(offFaceIdxTypes);
+  a := 0;
+  b := 0;
+  c := 0;
+  last := 0;
+  for i := 0 to faceCount - 1 do
+  begin
+    kind := s2.ReadUByte();
+    if kind = 1 then
+    begin
+      a := s1.ReadShortSmart() + last;
+      b := s1.ReadShortSmart() + a;
+      c := s1.ReadShortSmart() + b;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := b;
+      Self.FaceIndices3[i] := c;
+    end;
+
+    if kind = 2 then
+    begin
+      b := c;
+      c := s1.ReadShortSmart() + last;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := b;
+      Self.FaceIndices3[i] := c;
+    end;
+
+    if kind = 3 then
+    begin
+      a := c;
+      c := s1.ReadShortSmart() + last;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := b;
+      Self.FaceIndices3[i] := c;
+    end;
+
+    if kind = 4 then
+    begin
+      swap := a;
+      a := b;
+      b := swap;
+      c := s1.ReadShortSmart() + last;
+      last := c;
+      Self.FaceIndices1[i] := a;
+      Self.FaceIndices2[i] := swap;
+      Self.FaceIndices3[i] := c;
+    end;
+  end;
+
+  // type2 has no per-texture render type in the file: every triple is type 0.
+  s1.SetPosition(offTexTriples);
+  for i := 0 to textureCount - 1 do
+  begin
+    Self.TextureRenderTypes[i] := 0;
+    Self.TexIndices1[i] := ModelToShort(s1.ReadUShort());
+    Self.TexIndices2[i] := ModelToShort(s1.ReadUShort());
+    Self.TexIndices3[i] := ModelToShort(s1.ReadUShort());
+  end;
+
+  s1.SetPosition(cursor);
+  if s1.ReadUByte() = 1 then
+  begin
+    ModelAlloc(Self.FaceZOffsets, faceCount);
+    for i := 0 to faceCount - 1 do
+      Self.FaceZOffsets[i] := s1.ReadByte();
+  end;
+
+  if s1.Position <> s1.Length() - 23 then
+    raise 'ModelDefinition: type2 model ' + ToStr(Self.Id) + ' ends at ' +
+          ToStr(s1.Position) + ', expected ' + ToStr(s1.Length() - 23);
+
+  // Post step: drop the three arrays nothing turned out to use.
+  if Length(Self.TextureCoords) > 0 then
+  begin
+    usesTexCoords := False;
+    for i := 0 to faceCount - 1 do
+    begin
+      coord := Self.TextureCoords[i] and 255;
+      if coord <> 255 then
+      begin
+        if (Self.FaceIndices1[i] = (Self.TexIndices1[coord] and $FFFF)) and
+           (Self.FaceIndices2[i] = (Self.TexIndices2[coord] and $FFFF)) and
+           (Self.FaceIndices3[i] = (Self.TexIndices3[coord] and $FFFF)) then
+          Self.TextureCoords[i] := -1
+        else
+          usesTexCoords := True;
+      end;
+    end;
+    if not usesTexCoords then Self.TextureCoords := [];
+  end;
+
+  if not usesTextures then Self.FaceTextures := [];
+  if not usesRenderTypes then Self.FaceRenderTypes := [];
+end;
+
+(*
+## TModelDefinition.Load
+```pascal
+function TModelDefinition.Load(id: Integer; data: TByteArray): TModelDefinition; static;
+```
+Decodes one MODELS archive. Every archive in index 7 holds a single file, so
+`data` is `TCacheStore.Read(Ord(EIndexType.MODELS), id, [])` - there is no
+reference-table lookup and no archive split.
+
+Raises on a type1 or old-format model rather than decoding it, and on a model
+whose section sizes do not add up to its buffer.
+*)
+function TModelDefinition.Load(id: Integer; data: TByteArray): TModelDefinition; static;
+var
+  n: Integer;
+begin
+  Result.Reset(id);
+
+  n := Length(data);
+  if n < 2 then
+    raise 'ModelDefinition: model ' + ToStr(id) + ' is ' + ToStr(n) + ' byte(s), too short to carry a format marker';
+
+  if (data[n - 2] = $FF) and (data[n - 1] = $FD) then
+  begin
+    Result.Format := 3;
+    Result.DecodeType3(data);
+  end
+  else if (data[n - 2] = $FF) and (data[n - 1] = $FE) then
+  begin
+    Result.Format := 2;
+    Result.DecodeType2(data);
+  end
+  else if (data[n - 2] = $FF) and (data[n - 1] = $FF) then
+    raise 'ModelDefinition: model ' + ToStr(id) + ' is type 1, which is not ported'
+  else
+    raise 'ModelDefinition: model ' + ToStr(id) + ' is in the old format, which is not ported';
+end;
+
+(*
+## TModelDefinition.Height
+```pascal
+function TModelDefinition.Height(): Integer;
+```
+`ObjExporter.getSimbaHeight`: the vertical extent of the model in game units,
+measured over the negated Y axis because model space grows downwards.
+
+**The two seeds are not neutral, and this is not a rounding detail.** `hi` starts
+at 0 and `lo` at Java's `0xffffffff`, which as a signed int is **-1, not MaxInt**.
+Neither can be moved the wrong way, so any model that does not already straddle
+both bounds measures wider than it is: 45605 of the 60484 models in the live
+cache are one unit taller than their real extent because no vertex reaches
+`-y = -1`, and 429 more are stretched by the `hi` seed. An empty model measures
+1, not 0.
+
+Reproducing that inflation is the whole point - it is what the committed
+`wasp-assets` heights contain, so "fixing" either seed breaks parity with every
+object and NPC size the pipeline has ever published.
+*)
+function TModelDefinition.Height(): Integer;
+var
+  i, hi, lo, current: Integer;
+begin
+  hi := 0;
+  lo := -1;
+  for i := 0 to High(Self.VertexY) do
+  begin
+    current := Self.VertexY[i] * -1;
+    if current > hi then hi := current;
+    if current < lo then lo := current;
+  end;
+  Result := hi - lo;
+end;
+
+// TextureManager.findTexture: by definition id, not by position. The ids have a
+// gap (54 is missing from the live cache), so indexing the array by id would
+// return the wrong texture for every id above the gap - and 84 models really do
+// change colour if you get this wrong.
+function ModelFindTextureRGB(var textures: array of TTextureDefinition; id: Integer): Integer;
+var
+  i: Integer;
+begin
+  if (id >= 0) and (id <= High(textures)) and (textures[id].Id = id) then
+    Exit(textures[id].AverageRGB);
+
+  for i := 0 to High(textures) do
+    if textures[i].Id = id then
+      Exit(textures[i].AverageRGB);
+
+  raise 'ModelDefinition: no texture with id ' + ToStr(id);
+end;
+
+(*
+## TModelDefinition.Colors
+```pascal
+function TModelDefinition.Colors(textures: array of TTextureDefinition): TIntegerArray;
+```
+`ObjExporter.getSimbaColors`: the model's palette as packed BGR, in the order the
+faces first introduce each colour. This is the `colors` array the object and NPC
+dumps carry.
+
+Per face, a textured face contributes its texture's average colour and an
+untextured one its own HSL, both at `JAGEX_BRIGHTNESS_MAX`, converted to BGR.
+There are three separate deduplications and they are not equivalent:
+
+1. a texture id already seen is skipped,
+2. a face colour already seen is skipped,
+3. a BGR value already in the result is not appended again.
+
+The first two are *continues* - they skip the face entirely - while the third
+only suppresses the append. Two different HSL values that gamma-correct to the
+same BGR are therefore recorded in `knownHSL` twice but appear once, which is
+what makes the result a set while the palette order stays first-seen order.
+
+`textures` is a parameter rather than a global: the dumpers hold one texture
+list and a model is meaningless without knowing which. Pass the full index 9
+archive 0 list with each definition's real `Id` - the lookup is by id.
+
+Note `AverageRGB` is a 16-bit field, so its red channel is always 0 before the
+brightness pass. That is what `TextureDefinition.averageRGB` holds in Java too.
+*)
+function TModelDefinition.Colors(textures: array of TTextureDefinition): TIntegerArray;
+var
+  i, textureId, rgb, bgr: Integer;
+  knownTextures, knownHSL: TIntegerArray;
+begin
+  Result := [];
+  knownTextures := [];
+  knownHSL := [];
+  for i := 0 to Self.FaceCount - 1 do
+  begin
+    textureId := -1;
+    if Length(Self.FaceTextures) > 0 then
+      textureId := Self.FaceTextures[i];
+
+    if textureId <> -1 then
+    begin
+      if ModelIndexOf(knownTextures, textureId) <> -1 then Continue;
+      rgb := JagexAdjustForBrightness(ModelFindTextureRGB(textures, textureId), JAGEX_BRIGHTNESS_MAX);
+      ModelAppend(knownTextures, textureId);
+    end
+    else
+    begin
+      if ModelIndexOf(knownHSL, Self.FaceColors[i]) <> -1 then Continue;
+      rgb := JagexHSLtoRGB(Self.FaceColors[i], JAGEX_BRIGHTNESS_MAX);
+      ModelAppend(knownHSL, Self.FaceColors[i]);
+    end;
+
+    bgr := JagexRGBtoBGR(rgb);
+    if ModelIndexOf(Result, bgr) = -1 then
+      ModelAppend(Result, bgr);
+  end;
+end;

@@ -1,0 +1,413 @@
+(*
+# ItemDefinition
+Decodes one file of the ITEM archive (index 2 CONFIGS, archive 10) into a
+`TItemDefinition`. A port of `ItemLoader.java` and the field defaults of
+`ItemDefinition.java`; the Java is the specification, this docstring records
+where and why the port departs from it.
+
+## Divergences from the Java
+
+1. **An unrecognised opcode raises.** `ItemLoader.decodeValues` logs
+   `Unrecognized opcode {}` and returns, leaving the cursor parked mid-field.
+   Every subsequent read then takes its bytes from the wrong offset, so one
+   unknown opcode silently corrupts the rest of the definition rather than
+   losing a single field. Here it raises with the opcode, the item id and the
+   byte offset, which is also the fastest way to spot a cache revision that
+   introduced a new opcode.
+2. **The stream must be exactly consumed.** After the terminating `0` opcode the
+   cursor has to sit at end-of-data. The Java never checks, but a mis-sized
+   opcode is otherwise invisible on the many definitions where the damaged field
+   happens to still decode: across all 33372 items in the ITEM archive not one
+   leaves a trailing byte, so this is a real, always-on parity check rather than
+   a heuristic.
+3. **`''` stands in for Java's `null` strings.** `Name`, `Examine`, `Unknown1`,
+   `InterfaceOptions[i]` and `Subops[i][j]` are `null` in the Java when unset and
+   empty here, so "unset" and "set to empty" are indistinguishable. Same caveat
+   as `TEntityOps.Ops` - see `entityops.simba`. A serialiser reproducing the
+   Java JSON has to write `null` for these - and it cannot decide which to
+   write from this record alone: **243 items in the committed
+   `jsons/item-definitions.zip` ship `"examine": ""`**, a genuinely empty
+   string rather than an omitted key, so both shapes occur in the ground truth.
+   An earlier version of this note claimed no such item existed; the parity
+   sweep in `dev/tests/320_parity_2625.simba` measured otherwise. Distinguishing
+   them needs a separate "was this opcode seen" flag, which this record does
+   not carry.
+
+## Things the opcode table gets wrong if read casually
+
+- `ColorFind`/`ColorReplace`/`TextureFind`/`TextureReplace` are read as unsigned
+  shorts but **stored as signed shorts** (`(short) stream.readUnsignedShort()`),
+  so anything from 32768 up comes out negative. Item 22 "Blue cog" reads 43968
+  and the Java pipeline's `22.json` says `-21568`; storing the unsigned value
+  would break JSON parity for the 4199 items whose palettes cross 0x8000.
+- `Tradeable` defaults to **True** - opcode 15 only ever clears it. There is no
+  opcode that sets it.
+- `Category` and `InventoryModel` default to **0**, not -1. 22065 of the 33745
+  committed item JSONs carry `"category": 0` and none carries -1.
+- `Ops` is not empty by default: the client seeds ground op index 2 with "Take"
+  (`ItemDefinition.java:78`), which is why every item JSON shows
+  `"ops":[null,null,{"text":"Take"}]` even with no opcode 30..34 in its bytes.
+- `InterfaceOptions[4]` defaults to "Drop" for the same reason.
+- `Subops` (opcode 43) is a **separate field from `Ops.SubOps`**. The Java keeps
+  `def.subops` and `def.groundOps` apart, and only `Ops.SubOps` is fed by opcode
+  200. Opcode 43 is also the one place where a value is read and then thrown
+  away: an out-of-range op or sub-op id still consumes its string.
+
+## Post-processing this does NOT do
+`SimbaItemDumper.link()` calls `linkNote`/`linkBought`/`linkPlaceholder` to copy
+name, cost and members from an item's unnoted or placeholder counterpart. That
+needs the whole archive, so it belongs to a later pass, not to a single-file
+loader - and the committed `jsons/item-definitions.zip` is in fact *unlinked*,
+matching `Load` output field-for-field.
+*)
+{$DEFINE WL_CACHE_DEF_ITEM_INCLUDED}
+{$IFNDEF WL_CACHE_BYTESTREAM_INCLUDED}{$INCLUDE_ONCE ../bytestream.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_ENTITYOPS_INCLUDED}{$INCLUDE_ONCE entityops.simba}{$ENDIF}
+
+const
+  // The client's own allocation sizes, hardcoded in ItemLoader.decodeValues:
+  // opcode 43 keeps op ids 0..4 with sub-op ids 0..19, opcodes 100..109 fill a
+  // fixed 10-slot stack-size table. They are deliberately not shared with
+  // entityops.simba's ENTITY_* constants - the numbers coincide, the fields do not.
+  ITEM_SUBOP_ROWS: Integer = 5;
+  ITEM_SUBOP_COLS: Integer = 20;
+  ITEM_COUNT_SLOTS: Integer = 10;
+  ITEM_INTERFACE_OPTIONS: Integer = 5;
+
+(*
+## TItemDefinition
+```pascal
+TItemDefinition = record
+  Id: Integer;
+  Name, Examine, Unknown1: String;
+  ResizeX, ResizeY, ResizeZ: Integer;
+  XAn2D, YAn2D, ZAn2D: Integer;
+  Zoom2D, XOffset2D, YOffset2D: Integer;
+  Cost, Stackable, InventoryModel: Integer;
+  Tradeable, GeTradeable, Members: Boolean;
+  WearPos1, WearPos2, WearPos3: Integer;
+  ColorFind, ColorReplace, TextureFind, TextureReplace: TIntegerArray;
+  Ambient, Contrast: Integer;
+  CountObj, CountCo: TIntegerArray;
+  Ops: TEntityOps;
+  InterfaceOptions: TStringArray;
+  Subops: array of TStringArray;
+  MaleModel0, MaleModel1, MaleModel2, MaleOffset: Integer;
+  MaleHeadModel, MaleHeadModel2: Integer;
+  FemaleModel0, FemaleModel1, FemaleModel2, FemaleOffset: Integer;
+  FemaleHeadModel, FemaleHeadModel2: Integer;
+  Category, NotedId, NotedTemplate: Integer;
+  Team, Weight, ShiftClickDropIndex: Integer;
+  BoughtId, BoughtTemplateId: Integer;
+  PlaceholderId, PlaceholderTemplateId: Integer;
+  Params: TCacheParams;
+end;
+```
+One record per item. It carries dynamic arrays and an embedded `TEntityOps`, so
+copying it and then mutating the copy writes through to the original for the
+array fields - the same trap `TEntityOps` documents. `Default` hands back freshly
+allocated arrays on every call, so definitions produced by `Load` never alias
+each other.
+
+`CountObj`/`CountCo` are the stack-size ladder used to swap an item's inventory
+model as the stack grows (coins: 996 at 2, 997 at 3, ... 1004 at 10000). They are
+empty unless opcode 100..109 appeared, and 10 slots long once it did.
+*)
+type
+  TItemDefinition = record
+    Id: Integer;
+
+    Name, Examine, Unknown1: String;
+
+    ResizeX, ResizeY, ResizeZ: Integer;
+    XAn2D, YAn2D, ZAn2D: Integer;
+    Zoom2D, XOffset2D, YOffset2D: Integer;
+
+    Cost, Stackable, InventoryModel: Integer;
+    Tradeable, GeTradeable, Members: Boolean;
+
+    WearPos1, WearPos2, WearPos3: Integer;
+
+    // Signed 16-bit, see the docstring: the Java casts these to short.
+    ColorFind, ColorReplace, TextureFind, TextureReplace: TIntegerArray;
+
+    Ambient, Contrast: Integer;
+    CountObj, CountCo: TIntegerArray;
+
+    Ops: TEntityOps;
+    InterfaceOptions: TStringArray;
+    Subops: array of TStringArray;
+
+    MaleModel0, MaleModel1, MaleModel2, MaleOffset: Integer;
+    MaleHeadModel, MaleHeadModel2: Integer;
+    FemaleModel0, FemaleModel1, FemaleModel2, FemaleOffset: Integer;
+    FemaleHeadModel, FemaleHeadModel2: Integer;
+
+    Category, NotedId, NotedTemplate: Integer;
+    Team, Weight, ShiftClickDropIndex: Integer;
+    BoughtId, BoughtTemplateId: Integer;
+    PlaceholderId, PlaceholderTemplateId: Integer;
+
+    Params: TCacheParams;
+  end;
+
+(*
+## TItemDefinition.Default
+```pascal
+function TItemDefinition.Default(id: Integer): TItemDefinition; static;
+```
+The state an item starts in before a single opcode is read, mirroring the field
+initialisers of `ItemDefinition.java`. Two of these defaults are observable
+values rather than "unset" markers and are easy to get wrong: `Tradeable` starts
+True and ground op 2 starts as "Take".
+*)
+function TItemDefinition.Default(id: Integer): TItemDefinition; static;
+begin
+  Result.Id := id;
+
+  Result.Name := 'null';
+  Result.ResizeX := 128;
+  Result.ResizeY := 128;
+  Result.ResizeZ := 128;
+  Result.Zoom2D := 2000;
+  Result.Cost := 1;
+  Result.Tradeable := True;
+  Result.WearPos1 := -1;
+  Result.WearPos2 := -1;
+  Result.WearPos3 := -1;
+
+  Result.MaleModel0 := -1;
+  Result.MaleModel1 := -1;
+  Result.MaleModel2 := -1;
+  Result.MaleHeadModel := -1;
+  Result.MaleHeadModel2 := -1;
+  Result.FemaleModel0 := -1;
+  Result.FemaleModel1 := -1;
+  Result.FemaleModel2 := -1;
+  Result.FemaleHeadModel := -1;
+  Result.FemaleHeadModel2 := -1;
+
+  Result.NotedId := -1;
+  Result.NotedTemplate := -1;
+  Result.ShiftClickDropIndex := -2;
+  Result.BoughtId := -1;
+  Result.BoughtTemplateId := -1;
+  Result.PlaceholderId := -1;
+  Result.PlaceholderTemplateId := -1;
+
+  // Everything else is 0/''/False already, which is what the Java leaves it at:
+  // Category, InventoryModel, Team, Weight, Ambient, Contrast, the offsets and
+  // the 2D angles included.
+
+  Result.Ops := TEntityOps.Create();
+  // The client seeds the ground menu with "Take"; opcode 32 can overwrite it,
+  // nothing ever removes it.
+  Result.Ops.Ops[2] := 'Take';
+
+  SetLength(Result.InterfaceOptions, ITEM_INTERFACE_OPTIONS);
+  Result.InterfaceOptions[ITEM_INTERFACE_OPTIONS - 1] := 'Drop';
+end;
+
+// Opcodes 40 and 41 share this. Java allocates both arrays at the declared
+// length before filling them, so a truncated block would leave zeroes rather
+// than a short array - immaterial here because the reads raise first.
+procedure _ItemReadShortPairs(var s: TByteStream; var find, replace: TIntegerArray);
+var
+  i, n: Integer;
+begin
+  n := s.ReadUByte();
+  SetLength(find, n);
+  SetLength(replace, n);
+  for i := 0 to n - 1 do
+  begin
+    // Read unsigned, store signed: `(short) readUnsignedShort()` in the Java.
+    find[i] := s.ReadShort();
+    replace[i] := s.ReadShort();
+  end;
+end;
+
+// Opcode 43. `Subops` is lazily allocated, exactly as the Java lazily news
+// `String[5][]` and `String[20]`, so "no opcode 43" stays distinguishable from
+// "opcode 43 with no entries". Out-of-range ids are dropped but their string is
+// always consumed - dropping the read too would desynchronise the stream.
+procedure _ItemDecodeSubops(var s: TByteStream; var subops: array of TStringArray);
+var
+  opId, subId: Integer;
+  valid: Boolean;
+  text: String;
+begin
+  opId := s.ReadUByte();
+
+  if Length(subops) = 0 then
+    SetLength(subops, ITEM_SUBOP_ROWS);
+
+  valid := (opId >= 0) and (opId < ITEM_SUBOP_ROWS);
+  if valid and (Length(subops[opId]) = 0) then
+    SetLength(subops[opId], ITEM_SUBOP_COLS);
+
+  while True do
+  begin
+    subId := s.ReadUByte() - 1;
+    if subId = -1 then Break;
+
+    text := s.ReadJagexString();
+    if valid and (subId >= 0) and (subId < ITEM_SUBOP_COLS) then
+      subops[opId][subId] := text;
+  end;
+end;
+
+(*
+## TItemDefinition.Load
+```pascal
+function TItemDefinition.Load(id: Integer; data: TByteArray): TItemDefinition; static;
+```
+Decodes one ITEM archive file. `data` is the file's bytes as
+`TCacheStore.ReadFiles` returns them; `id` is its file id, which is the item id
+(and is **not** its position in that array - use `FilePositionOf`).
+
+Raises on an unrecognised opcode and on leftover bytes after the terminating
+opcode 0; both mean the reader and the cache disagree about a field width, and
+both messages carry the item id and the byte offset.
+
+```pascal
+files := store.ReadFiles(2, Ord(EConfigType.ITEM), []);
+item := TItemDefinition.Load(4151, files[FilePositionOf(table, Ord(EConfigType.ITEM), 4151)]);
+WriteLn(item.Name);  // Abyssal whip
+```
+*)
+function TItemDefinition.Load(id: Integer; data: TByteArray): TItemDefinition; static;
+var
+  s: TByteStream;
+  opcode, start: Integer;
+begin
+  Result := TItemDefinition.Default(id);
+  s := TByteStream.Create(data);
+
+  while True do
+  begin
+    // Kept for the error messages: pointing at the opcode itself is far more
+    // useful than pointing at wherever its operands ran out.
+    start := s.Position;
+    opcode := s.ReadUByte();
+    if opcode = 0 then Break;
+
+    case opcode of
+      1: Result.InventoryModel := s.ReadUShort();
+      2: Result.Name := s.ReadJagexString();
+      3: Result.Examine := s.ReadJagexString();
+      4: Result.Zoom2D := s.ReadUShort();
+      5: Result.XAn2D := s.ReadUShort();
+      6: Result.YAn2D := s.ReadUShort();
+      // Read unsigned then folded into [-32768, 32767]; the Java spells out the
+      // subtraction here instead of using readShort, but it is the same value.
+      7: Result.XOffset2D := s.ReadShort();
+      8: Result.YOffset2D := s.ReadShort();
+      9: Result.Unknown1 := s.ReadJagexString();
+      11: Result.Stackable := 1;
+      12: Result.Cost := s.ReadInt();
+      13: Result.WearPos1 := s.ReadByte();
+      14: Result.WearPos2 := s.ReadByte();
+      15: Result.Tradeable := False;
+      16: Result.Members := True;
+      23:
+        begin
+          Result.MaleModel0 := s.ReadUShort();
+          Result.MaleOffset := s.ReadUByte();
+        end;
+      24: Result.MaleModel1 := s.ReadUShort();
+      25:
+        begin
+          Result.FemaleModel0 := s.ReadUShort();
+          Result.FemaleOffset := s.ReadUByte();
+        end;
+      26: Result.FemaleModel1 := s.ReadUShort();
+      27: Result.WearPos3 := s.ReadByte();
+      30..34: Result.Ops.DecodeOp(s, opcode - 30);
+      35..39: Result.InterfaceOptions[opcode - 35] := s.ReadJagexString();
+      40: _ItemReadShortPairs(s, Result.ColorFind, Result.ColorReplace);
+      41: _ItemReadShortPairs(s, Result.TextureFind, Result.TextureReplace);
+      42: Result.ShiftClickDropIndex := s.ReadByte();
+      43: _ItemDecodeSubops(s, Result.Subops);
+      44: Result.InventoryModel := s.ReadInt();
+      45:
+        begin
+          Result.MaleModel0 := s.ReadInt();
+          Result.MaleOffset := s.ReadUByte();
+        end;
+      46: Result.MaleModel1 := s.ReadInt();
+      47: Result.MaleModel2 := s.ReadInt();
+      48:
+        begin
+          Result.FemaleModel0 := s.ReadInt();
+          Result.FemaleOffset := s.ReadUByte();
+        end;
+      49: Result.FemaleModel1 := s.ReadInt();
+      50: Result.FemaleModel2 := s.ReadInt();
+      51: Result.MaleHeadModel := s.ReadInt();
+      52: Result.MaleHeadModel2 := s.ReadInt();
+      53: Result.FemaleHeadModel := s.ReadInt();
+      54: Result.FemaleHeadModel2 := s.ReadInt();
+      65: Result.GeTradeable := True;
+      75: Result.Weight := s.ReadShort();
+      78: Result.MaleModel2 := s.ReadUShort();
+      79: Result.FemaleModel2 := s.ReadUShort();
+      90: Result.MaleHeadModel := s.ReadUShort();
+      91: Result.FemaleHeadModel := s.ReadUShort();
+      92: Result.MaleHeadModel2 := s.ReadUShort();
+      93: Result.FemaleHeadModel2 := s.ReadUShort();
+      94: Result.Category := s.ReadUShort();
+      95: Result.ZAn2D := s.ReadUShort();
+      97: Result.NotedId := s.ReadUShort();
+      98: Result.NotedTemplate := s.ReadUShort();
+      100..109:
+        begin
+          if Length(Result.CountObj) = 0 then
+          begin
+            SetLength(Result.CountObj, ITEM_COUNT_SLOTS);
+            SetLength(Result.CountCo, ITEM_COUNT_SLOTS);
+          end;
+          Result.CountObj[opcode - 100] := s.ReadUShort();
+          Result.CountCo[opcode - 100] := s.ReadUShort();
+        end;
+      110: Result.ResizeX := s.ReadUShort();
+      111: Result.ResizeY := s.ReadUShort();
+      112: Result.ResizeZ := s.ReadUShort();
+      113: Result.Ambient := s.ReadByte();
+      // Stored RAW, as the cache holds it and as RuneLite's ItemLoader reads
+      // it - which is what the committed item-definitions.zip contains, so
+      // scaling here would cost 934 items of JSON parity.
+      //
+      // The renderer MUST scale it by 5 before use. The decompiled client
+      // scales at decode (LostCityRS/OS1 ObjType.java:311,
+      // `this.contrast = buf.g1b() * 5`) and consumes it as
+      // `light(ambient + 64, contrast + 768, ...)`. RuneLite omits that scale
+      // in BOTH its loader and its renderer, so its own item sprites are
+      // wrong: measured over 3331 rendered items, raw gives 3158 matches
+      // against the committed hashes and x5 gives 3331. See
+      // docs/phase2-render-spec.md.
+      114: Result.Contrast := s.ReadByte();
+      115: Result.Team := s.ReadUByte();
+      139: Result.BoughtId := s.ReadUShort();
+      140: Result.BoughtTemplateId := s.ReadUShort();
+      148: Result.PlaceholderId := s.ReadUShort();
+      149: Result.PlaceholderTemplateId := s.ReadUShort();
+      160: Result.Stackable := 2;
+      200: Result.Ops.DecodeSubOp(s);
+      201: Result.Ops.DecodeConditionalOp(s);
+      202: Result.Ops.DecodeConditionalSubOp(s);
+      249: Result.Params := s.ReadParams();
+      else
+        raise 'ItemDefinition: unknown opcode ' + ToStr(opcode) + ' in item ' +
+              ToStr(id) + ' at offset ' + ToStr(start);
+    end;
+  end;
+
+  if s.Position <> s.Length() then
+    raise 'ItemDefinition: item ' + ToStr(id) + ' ended at offset ' +
+          ToStr(s.Position) + ' with ' + ToStr(s.Remaining()) +
+          ' bytes left of ' + ToStr(s.Length());
+
+  // ItemLoader.post: a stackable item carries no weight, whatever opcode 75 said.
+  if Result.Stackable = 1 then
+    Result.Weight := 0;
+end;

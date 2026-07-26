@@ -1,0 +1,1053 @@
+(*
+# Render: ModelLit
+Everything between a decoded {ref}`TModelDefinition` and a stream of triangles:
+vertex normals, per-vertex lighting, the bounding volumes, the back-to-front
+depth sort, and the projection. Ported from
+`net.runelite.cache.definitions.ModelDefinition.computeNormals`,
+`net.runelite.cache.item.ItemSpriteFactory.light` and
+`net.runelite.cache.item.Model`, verified against `LostCityRS/OS1`
+`ModelUnlit` / `ModelLit`.
+
+```pascal
+LightModel(model, item.Ambient + 64, item.Contrast * CONTRAST_SCALE + 768, -50, -10, -50);
+CalculateBoundsCylinder();
+ProjectAndDraw(0, item.YAn2D, item.ZAn2D, item.XAn2D, xOff, yOff, zOff);
+```
+
+The lit model is process-wide state, not a record, exactly as the Java's
+`Model` fields are. One model is lit and drawn at a time.
+
+## This unit refuses models rather than rendering them wrong
+Render types, flat faces and face alpha are implemented here. The texture
+pipeline is also present, but its caller keeps texture-bearing models behind a
+coverage gate while 15 corpus mismatches are investigated. The important
+contract remains the same: a partial feature must be refused at the boundary,
+never quietly emitted as a plausible wrong icon.
+
+**But the refusal set is not complete**, and the hole used to be a big one:
+{ref}`ModelDraw` took `Model.draw`'s `facePriorities == null` branch
+unconditionally, so a model **with** face priorities was drawn in plain depth
+order and nothing raised - 9129 items of the corpus, silently plausible and
+wrong. Task 3D.5 closed it by implementing {ref}`ModelDrawPriority` rather than
+by adding a guard, but the shape of the hazard is worth keeping in mind: a
+feature that only reorders work, or that lives in the *item* definition
+(templates, `textureFind`), cannot be detected from inside the renderer at all.
+Those are refused by the caller through `ITEM_SPRITE_UNSUPPORTED_ITEM` in
+`utils/cache/dump/render/itemsprite.simba`.
+
+So the contract is split: the renderer refuses what it can detect, the caller
+refuses the rest. A dumper that calls {ref}`RenderItemSprite` without consulting
+those masks gets plausible, wrong icons and no exception.
+
+## computeNormals: `magnitude` is a face count, not a vector length
+It is divided by, not normalised with. The `runelite-cache` fork skips the
+accumulation loop entirely whenever `faceRenderTypes` is non-null, which leaves
+that count at 0 and makes `light()` divide by zero for 3017 of 19771 items.
+Upstream's condition - accumulate unless the render type is exactly 1 - is what
+is ported.
+
+OS1 accumulates only when `renderType == 0`; render types 2 and 3 contribute
+**nothing**. Render type 1 stores one face normal for flat lighting. This is
+why the loop below cannot use RuneLite's whole-model `faceRenderTypes == null`
+branch: mixed models need both behaviours face by face.
+
+## Contrast is scaled by 5 in the render path, not at decode
+`TItemDefinition.Contrast` deliberately stores the raw byte, because the
+committed `item-definitions.zip` contains the raw value and scaling at decode
+costs 934 items of JSON parity. The client scales it by 5
+(`LostCityRS/OS1 ObjType.java:311`), RuneLite never does, and measured over
+3331 items the raw value scores 94.8% against the committed hashes and `x5`
+scores 100%. {ref}`CONTRAST_SCALE` applies it here. See
+`utils/cache/dump/render/itemsprite.simba`.
+*)
+{$DEFINE WL_CACHE_RENDER_MODELLIT_INCLUDED}
+{$IFNDEF WL_CACHE_RENDER_RASTER3D_INCLUDED}{$INCLUDE_ONCE raster3d.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_MODEL_INCLUDED}{$INCLUDE_ONCE ../../defs/model.simba}{$ENDIF}
+
+(*
+## BIN_MODE
+```pascal
+var BIN_MODE: Integer = 0;
+```
+Depth-bin bounds mode. See `docs/phase2-render-spec.md` 3.1a.
+
+Java and OS1 both bin faces by `avgZ + radius` into a FIXED 1600-entry table and
+then draw only bins `diameter-1 .. 0`, where `radius`/`diameter` come from the
+bounding *cylinder*. That literal reading silently discards every face whose
+bin lands at or above `diameter` - and measured against the committed hashes it
+is wrong: it costs 6 items. Two forms reproduce all 3338 renderable items:
+
+  0  AABB       radius = ceil(sqrt(max(x^2+y^2+z^2)) + 0.99), diameter = 2*radius,
+                draw diameter-1 .. 0.  Source-grounded (Model.java:132-152,
+                OS1 ModelLit.calcAABB:513-534).  THIS IS THE SHIPPED FORM.
+                It works because diameter is EXACTLY 2*radius, so the drawn
+                window is avgViewZ in [-R, R) - centred on the same +radius the
+                bin index adds - and R bounds |viewZ| by construction (the eye
+                offset cancels against zrv, and every rotation preserves the
+                norm).  It is NOT simply wider: measured, the AABB diameter is
+                narrower than the cylinder's for 1706 of 3338 models.
+  1  EXTENDED   cylinder radius/diameter for the bin index, draw 1599 .. 0.
+                Indistinguishable from mode 0 on both measured caches.
+  2  LITERAL    cylinder radius/diameter, draw diameter-1 .. 0.  The literal
+                Java/OS1 reading; kept only so the 6-item regression stays
+                measurable.
+
+Modes 0 and 1 are equal on cache 2625 AND on 2639, so nothing here proves which
+one the reference renderer used. Mode 0 is shipped because it has source
+backing, not because it is proven. `dev/tests/430_depthbins.simba` pins all
+three.
+*)
+var
+  BIN_MODE: Integer = 0;
+  // Diagnostics, cumulative across renders.  binClampLo counts faces whose bin
+  // index went negative (nothing in the algorithm forbids it; measured 0).
+  // binOverDraw counts faces binned at or above the top of the draw range -
+  // i.e. faces the literal reading would silently drop.
+  binClampLo: Integer = 0;
+  binOverDraw: Integer = 0;
+  // binNarrower counts models where the AABB bound came out NARROWER than the
+  // cylinder one. It is not a theorem that it cannot: the cylinder combines the
+  // widest horizontal extent with the tallest vertex, which may be different
+  // vertices, so a flat disc plus a vertical spike defeats it. Measured, not
+  // assumed.
+  binNarrower: Integer = 0;
+
+// The lit model. `Model`'s fields, flattened: one model is lit and drawn at a
+// time, as in ItemSpriteFactory.
+var
+  mVertX, mVertY, mVertZ: TIntegerArray;
+  mIdx1, mIdx2, mIdx3: TIntegerArray;
+  mColors1, mColors2, mColors3: TIntegerArray;
+  mVerticesCount, mIndicesCount: Integer;
+  mModelHeight, mBottomY, mXYZMag, mRadius, mDiameter: Integer;
+  mFacePriorities: TIntegerArray;
+  vpX, vpY, vpZ: TIntegerArray;
+  faceClipped: array of Boolean;
+  distanceFaceCount: TIntegerArray;
+  facesByDistance: array of TIntegerArray;
+  // computeNormals output. `fn*` holds the normal of each render-type-1 face;
+  // type 0 contributes only to the three vertex normals, and types 2/3 do
+  // neither.
+  vnX, vnY, vnZ, vnMag: TIntegerArray;
+  fnX, fnY, fnZ: TIntegerArray;
+  // Per-face fields copied through the lit model for RasterFace. They are
+  // read-only aliases of the decoded definition arrays.
+  mFaceTransparencies: TIntegerArray;
+  mFaceTextures, mTextureCoords, mTexIndices1, mTexIndices2, mTexIndices3: TIntegerArray;
+  // Camera-space coordinates before the icon renderer subtracts its depth
+  // origin. Perspective texture mapping uses these, whereas depth sorting uses
+  // the relative `vpZ` values.
+  vpLocalX, vpLocalY, vpLocalZ: TIntegerArray;
+  // The 12-level priority sort's scratch. Java gives every Model its own
+  // `int[12]`/`int[12][2000]`/`int[2000]`; these are reused across items, so
+  // `prioCapacity` grows to the largest face count seen and every slot is
+  // written before it is read. See {ref}`ModelDrawPriority`.
+  prioCount, prioDepthSum, prio10Depth, prio11Depth: TIntegerArray;
+  prioFaces: array of TIntegerArray;
+  prioCapacity: Integer = 0;
+
+(*
+## Bound2to126
+```pascal
+function Bound2to126(v: Integer): Integer;
+```
+Clamps a luminance to 2..126. The client reserves 0..1 and 127 so that a shaded
+face can never land on the palette's transparency key or its clipping value.
+*)
+function Bound2to126(v: Integer): Integer;
+begin
+  if v < 2 then Exit(2);
+  if v > 126 then Exit(126);
+  Result := v;
+end;
+
+(*
+## Method2608
+```pascal
+function Method2608(v0, v1: Integer): Integer;
+```
+`Graphics3D.method2608`: scales the luminance of packed HSL colour `v0` by
+`v1/128`, clamps it, and puts it back. The hue and saturation bits
+(`and $FF80`) are untouched, so lighting only ever moves a face along its own
+luminance ramp - which is why the palette can be a plain 65536-entry lookup.
+*)
+function Method2608(v0, v1: Integer): Integer;
+begin
+  v1 := JSar((v0 and $7F) * v1, 7);
+  v1 := Bound2to126(v1);
+  Result := (v0 and $FF80) + v1;
+end;
+
+(*
+## ModelResize
+```pascal
+function ModelResize(m: TModelDefinition; sx, sy, sz: Integer): TModelDefinition;
+```
+`ModelDefinition.resize` / OS1 `ModelUnlit.resize`: scale every vertex by
+`s/128` per axis. The first transform in the model-preparation order
+(render spec 2.1), and it runs before {ref}`ComputeNormals`, which is what the
+Java's `reset()` / OS1's `geometryChanged()` exist to force. This port has no
+normal cache to invalidate - {ref}`LightModel` always recomputes - so the order
+is the whole of the requirement.
+
+`div` truncates toward zero in Lape exactly as Java's `/` does, which is the
+behaviour needed: every model has negative coordinates and `Floor` would be off
+by one on all of them.
+
+**Applied unconditionally when all three axes are 128 this would be a no-op**
+(`v * 128 div 128 = v` for every representable vertex), so the guard is an
+optimisation, not a correctness condition - it is `ItemSpriteFactory.getModel`'s
+and OS1 `getModelLit`'s, and it is kept where they keep it, in the caller. What
+it saves is the vertex copy below, on 19546 of 19771 items.
+
+**Returns a new model rather than mutating in place.** See {ref}`ModelRecolor`
+for why - and this is the transform that actually forced the question, because
+{ref}`LightModel` binds `mVertX := m.VertexX` straight onto the definition's
+array.
+
+## The camera height disagrees with every available source - measured, not read
+`ItemSpriteFactory` positions the camera at `modelHeight / 2`, and
+{ref}`CalculateBoundsCylinder` derives `modelHeight` from the vertex array as
+`max(-y)`. With the truncating scale above that is
+`floor(unscaledHeight * s / 128)` - and against the committed hashes it is
+**wrong for 40 of the 84 resized items**: their reference render is ours with
+the camera one unit lower, and nothing else.
+
+What reproduces all 84 is the same bound computed from an **arithmetic-shifted**
+scale, `-((minY * s) >> 7)` = `ceil(unscaledHeight * s / 128)` -
+{ref}`RESIZE_HEIGHT_SHIFT`. Measured over the whole corpus:
+
+| model height | total match | resized match / miss |
+|---|---:|---:|
+| `floor` (from the truncated array) | 5993 | 44 / 40 |
+| **`ceil` (this unit's `mResizeHeight`)** | **6033** | **84 / 0** |
+
+**The geometry is not in question, only the bound.** All eight roundings of the
+vertex scale were swept over the 84: truncation scores 44 and every alternative
+- floor, round-half, away-from-zero, and per-axis mixtures - scores 0 or 1. And
+truncation is what `ModelDefinition.resize`, OS1 `ModelUnlit.resize` and
+`xrsps ModelData.resize` all say, in three independent lineages. So the array
+holds truncated values while the bound holds the floored one, which no single
+expression over one array can produce.
+
+The coherent story - unverified, because no source for the modern client's item
+path is available - is that the bound is carried as the **negative** `minY` and
+scaled with `>>` where the vertices are scaled with `/`: an arithmetic shift
+floors a negative, so it lands one lower and the height comes out one higher.
+This is the same class of finding as the depth-bin range in task 3D.0, where the
+literal Java/OS1 reading also fails against the committed output, and it belongs
+in the same `docs/phase2-render-spec.md` 7 table. **It affects 84 of 19771 rows
+and nothing else** - with `s = 128` both forms are exact and equal, so the 3338
+unresized baseline cannot see it.
+
+Sets {ref}`mResizeHeight`, which {ref}`RenderItemSprite` applies after
+{ref}`CalculateBoundsCylinder`.
+*)
+var
+  (*
+  ## RESIZE_HEIGHT_SHIFT
+  ```pascal
+  var RESIZE_HEIGHT_SHIFT: Boolean = True;
+  ```
+  Use the arithmetic-shifted camera height for resized models. `False` restores
+  the literal `ItemSpriteFactory` / OS1 reading and costs 40 items. Kept as a
+  switch, like {ref}`BIN_MODE` and {ref}`CONTRAST_SCALE`, because the deviation
+  is measured rather than read out of a source.
+  *)
+  RESIZE_HEIGHT_SHIFT: Boolean = True;
+  (*
+  ## mResizeHeight
+  ```pascal
+  var mResizeHeight: Integer = -1;
+  ```
+  The camera height {ref}`ModelResize` measured, or `-1` when no resize ran and
+  {ref}`CalculateBoundsCylinder`'s own value stands. Reset by
+  {ref}`RenderItemSprite` on every render, so a stale value cannot leak from the
+  previous item.
+  *)
+  mResizeHeight: Integer = -1;
+
+function ModelResize(m: TModelDefinition; sx, sy, sz: Integer): TModelDefinition;
+var
+  i, h: Integer;
+begin
+  Result := m;
+  Result.VertexX := Copy(m.VertexX);
+  Result.VertexY := Copy(m.VertexY);
+  Result.VertexZ := Copy(m.VertexZ);
+  mResizeHeight := 0;
+  for i := 0 to Result.VertexCount - 1 do
+  begin
+    h := -JSar(Result.VertexY[i] * sy, 7);
+    if h > mResizeHeight then mResizeHeight := h;
+    Result.VertexX[i] := Result.VertexX[i] * sx div 128;
+    Result.VertexY[i] := Result.VertexY[i] * sy div 128;
+    Result.VertexZ[i] := Result.VertexZ[i] * sz div 128;
+  end;
+  if not RESIZE_HEIGHT_SHIFT then mResizeHeight := -1;
+end;
+
+(*
+## ModelRecolor
+```pascal
+function ModelRecolor(m: TModelDefinition; find, replace: Integer): TModelDefinition;
+```
+`ModelDefinition.recolor` / OS1 `ModelUnlit.recolour`: every face whose colour
+equals `find` gets `replace`. Applied **before** lighting, because lighting
+reads `FaceColors` (render spec 2.1).
+
+Both operands are **signed** shorts on both sides - `utils/cache/defs/item.simba`
+stores opcode 40 through `ReadShort` and `utils/cache/defs/model.simba` stores
+face colours through `ModelToShort`, so the 4199 items whose palette entries
+cross `$8000` compare correctly. Store either side unsigned and they never match.
+
+Applying several pairs is a fold - `m := ModelRecolor(m, find[i], replace[i])` -
+and each pair sees the previous pair's replacements, exactly as the Java's
+repeated in-place calls do. So a pair whose `find` equals an earlier pair's
+`replace` recolours twice; that is the reference behaviour, not a bug.
+
+**Returns a new model rather than mutating in place, and that is the whole
+point.** Lape shares a record's dynamic-array fields on assignment and on a
+by-value parameter pass, so `m.FaceColors[i] := replace` would write straight
+into the caller's `TModelDefinition` - and any dumper that caches definitions
+would then light every later item that reuses the model from already-replaced
+colours. `Result := m` shares the arrays; rebinding `Result.FaceColors` to a
+`Copy` leaves the caller's field pointing at the original. `dev/tests/432` renders
+two items from one definition, in both orders, to prove it.
+*)
+function ModelRecolor(m: TModelDefinition; find, replace: Integer): TModelDefinition;
+var
+  i: Integer;
+begin
+  Result := m;
+  Result.FaceColors := Copy(m.FaceColors);
+  for i := 0 to Result.FaceCount - 1 do
+    if Result.FaceColors[i] = find then Result.FaceColors[i] := replace;
+end;
+
+(*
+## ModelRetexture
+```pascal
+function ModelRetexture(m: TModelDefinition; find, replace: Integer): TModelDefinition;
+```
+`ModelDefinition.retexture` / OS1 `ModelUnlit.retexture`: replace matching
+signed-short texture ids before lighting. Like recolouring it returns a record
+whose texture array is copied, so a shared decoded model cannot acquire a
+previous item's transformation. An untextured model is returned unchanged.
+*)
+function ModelRetexture(m: TModelDefinition; find, replace: Integer): TModelDefinition;
+var
+  i: Integer;
+begin
+  Result := m;
+  if Length(m.FaceTextures) = 0 then Exit;
+  Result.FaceTextures := Copy(m.FaceTextures);
+  for i := 0 to Result.FaceCount - 1 do
+    if Result.FaceTextures[i] = find then Result.FaceTextures[i] := replace;
+end;
+
+(*
+## ComputeNormals
+```pascal
+procedure ComputeNormals(m: TModelDefinition);
+```
+`ModelDefinition.computeNormals`. `utils/cache/defs/model.simba` deliberately
+does not port this - nothing in the object or NPC dump path calls it - so the
+renderer carries it.
+
+Each face contributes its scaled cross product to its three vertices, and
+`vnMag` counts the contributions. The `while` loop halves the normal until it
+fits in 14 bits, which is a range guard against the `int` overflow the
+subsequent `nx * 256` would otherwise hit; it is arithmetic, so it goes through
+{ref}`JSar`.
+
+`len <= 0 -> 1` is the Java's degenerate-face guard, not a rounding fix.
+*)
+procedure ComputeNormals(m: TModelDefinition);
+var
+  i, va, vb, vc, dxAB, dyAB, dzAB, dxAC, dyAC, dzAC, nx, ny, nz, len, faceType: Integer;
+begin
+  vnX := []; SetLength(vnX, m.VertexCount);
+  vnY := []; SetLength(vnY, m.VertexCount);
+  vnZ := []; SetLength(vnZ, m.VertexCount);
+  vnMag := []; SetLength(vnMag, m.VertexCount);
+  fnX := []; SetLength(fnX, m.FaceCount);
+  fnY := []; SetLength(fnY, m.FaceCount);
+  fnZ := []; SetLength(fnZ, m.FaceCount);
+
+  for i := 0 to m.FaceCount - 1 do
+  begin
+    va := m.FaceIndices1[i];
+    vb := m.FaceIndices2[i];
+    vc := m.FaceIndices3[i];
+
+    dxAB := m.VertexX[vb] - m.VertexX[va];
+    dyAB := m.VertexY[vb] - m.VertexY[va];
+    dzAB := m.VertexZ[vb] - m.VertexZ[va];
+    dxAC := m.VertexX[vc] - m.VertexX[va];
+    dyAC := m.VertexY[vc] - m.VertexY[va];
+    dzAC := m.VertexZ[vc] - m.VertexZ[va];
+
+    nx := dyAB * dzAC - dzAB * dyAC;
+    ny := dzAB * dxAC - dxAB * dzAC;
+    nz := dxAB * dyAC - dxAC * dyAB;
+
+    while (nx > 8192) or (ny > 8192) or (nz > 8192) or
+          (nx < -8192) or (ny < -8192) or (nz < -8192) do
+    begin
+      nx := JSar(nx, 1); ny := JSar(ny, 1); nz := JSar(nz, 1);
+    end;
+
+    len := Trunc(Sqrt(1.0 * (nz * nz + nx * nx + ny * ny)));
+    if len <= 0 then len := 1;
+
+    nx := nx * 256 div len;
+    ny := ny * 256 div len;
+    nz := nz * 256 div len;
+
+    faceType := 0;
+    if Length(m.FaceRenderTypes) > 0 then faceType := m.FaceRenderTypes[i];
+    if faceType = 0 then
+    begin
+      vnX[va] += nx; vnY[va] += ny; vnZ[va] += nz; vnMag[va] += 1;
+      vnX[vb] += nx; vnY[vb] += ny; vnZ[vb] += nz; vnMag[vb] += 1;
+      vnX[vc] += nx; vnY[vc] += ny; vnZ[vc] += nz; vnMag[vc] += 1;
+    end;
+    if faceType = 1 then
+    begin
+      fnX[i] := nx; fnY[i] := ny; fnZ[i] := nz;
+    end;
+  end;
+end;
+
+(*
+## LightModel
+```pascal
+procedure LightModel(m: TModelDefinition; ambient, contrast, lx, ly, lz: Integer);
+```
+`ItemSpriteFactory.light`. Untextured type 0 uses three vertex normals and
+Gouraud shading; textured type 0 uses the same normals but carries 2..126
+texture luminances instead of palette HSL values. Type 1 uses its face normal,
+type 2 is skipped and type 3 is flat dark grey. Alpha -1 and -2 reroute into
+types 2 and 3 before this dispatch.
+
+`attenuation` is `|light| * contrast >> 8`, and the per-vertex divisor is
+`attenuation * vnMag[v]`: the face count from {ref}`ComputeNormals` divides
+here, which is why a fork that leaves it at 0 divides by zero rather than
+producing a dark model.
+
+Copies the geometry into the flattened model state on the way out, so
+{ref}`ProjectAndDraw` never touches the definition again.
+
+**`mVertX := m.VertexX` shares the array, it does not copy it.** Lape assigns
+dynamic arrays by reference, so an element write through `mVertX` would reach
+straight back into the caller's `TModelDefinition`. Nothing in this slice writes
+to them - the projection reads into separate `vpX/vpY/vpZ` buffers - but
+`resize` (task 3D.4) and template compositing (3D.9) are exactly the features
+that would want to scale vertices in place. They must copy first, or the second
+render of a shared model gets the first one's mutations.
+*)
+procedure LightModel(m: TModelDefinition; ambient, contrast, lx, ly, lz: Integer);
+var
+  i, lightMagnitude, attenuation, c, t, faceType, faceAlpha, textureCount: Integer;
+  textureUses, textureRemap: TIntegerArray;
+begin
+  ComputeNormals(m);
+  lightMagnitude := Trunc(Sqrt(1.0 * (lz * lz + lx * lx + ly * ly)));
+  attenuation := JSar(lightMagnitude * contrast, 8);
+
+  mColors1 := []; SetLength(mColors1, m.FaceCount);
+  mColors2 := []; SetLength(mColors2, m.FaceCount);
+  mColors3 := []; SetLength(mColors3, m.FaceCount);
+
+  // ItemSpriteFactory compacts the mapping triangles and drops mapping types
+  // 1..3. A face whose mapping is dropped deliberately falls back to its own
+  // three vertices in RasterFace, matching Model.rasterFace.
+  mTextureCoords := [];
+  mTexIndices1 := []; mTexIndices2 := []; mTexIndices3 := [];
+  if (m.NumTextureFaces > 0) and (Length(m.TextureCoords) > 0) then
+  begin
+    textureUses := []; SetLength(textureUses, m.NumTextureFaces);
+    for i := 0 to m.FaceCount - 1 do
+      if m.TextureCoords[i] <> -1 then textureUses[m.TextureCoords[i] and $FF] += 1;
+    textureRemap := []; SetLength(textureRemap, m.NumTextureFaces);
+    textureCount := 0;
+    for i := 0 to m.NumTextureFaces - 1 do
+      if (textureUses[i] > 0) and (m.TextureRenderTypes[i] = 0) then
+      begin
+        textureRemap[i] := textureCount;
+        textureCount += 1;
+      end
+      else
+        textureRemap[i] := -1;
+    SetLength(mTexIndices1, textureCount); SetLength(mTexIndices2, textureCount); SetLength(mTexIndices3, textureCount);
+    for i := 0 to m.NumTextureFaces - 1 do
+      if textureRemap[i] <> -1 then
+      begin
+        mTexIndices1[textureRemap[i]] := m.TexIndices1[i] and $FFFF;
+        mTexIndices2[textureRemap[i]] := m.TexIndices2[i] and $FFFF;
+        mTexIndices3[textureRemap[i]] := m.TexIndices3[i] and $FFFF;
+      end;
+    SetLength(mTextureCoords, m.FaceCount);
+    for i := 0 to m.FaceCount - 1 do
+      if m.TextureCoords[i] = -1 then mTextureCoords[i] := -1
+      else mTextureCoords[i] := textureRemap[m.TextureCoords[i] and $FF];
+  end;
+
+  for i := 0 to m.FaceCount - 1 do
+  begin
+    c := m.FaceColors[i] and $FFFF;
+    faceType := 0;
+    if Length(m.FaceRenderTypes) > 0 then faceType := m.FaceRenderTypes[i];
+    faceAlpha := 0;
+    if Length(m.FaceTransparencies) > 0 then faceAlpha := m.FaceTransparencies[i];
+    if faceAlpha = -2 then faceType := 3;
+    if faceAlpha = -1 then faceType := 2;
+
+    if (Length(m.FaceTextures) > 0) and (m.FaceTextures[i] <> -1) then
+    begin
+      if faceType = 0 then
+      begin
+        t := (ly * vnY[m.FaceIndices1[i]] + lz * vnZ[m.FaceIndices1[i]] + lx * vnX[m.FaceIndices1[i]])
+             div (attenuation * vnMag[m.FaceIndices1[i]]) + ambient;
+        mColors1[i] := Bound2to126(t);
+        t := (ly * vnY[m.FaceIndices2[i]] + lz * vnZ[m.FaceIndices2[i]] + lx * vnX[m.FaceIndices2[i]])
+             div (attenuation * vnMag[m.FaceIndices2[i]]) + ambient;
+        mColors2[i] := Bound2to126(t);
+        t := (ly * vnY[m.FaceIndices3[i]] + lz * vnZ[m.FaceIndices3[i]] + lx * vnX[m.FaceIndices3[i]])
+             div (attenuation * vnMag[m.FaceIndices3[i]]) + ambient;
+        mColors3[i] := Bound2to126(t);
+      end
+      else if faceType = 1 then
+      begin
+        t := (ly * fnY[i] + lz * fnZ[i] + lx * fnX[i])
+             div (attenuation div 2 + attenuation) + ambient;
+        mColors1[i] := Bound2to126(t);
+        mColors3[i] := -1;
+      end
+      else
+        mColors3[i] := -2;
+    end
+    else if faceType = 0 then
+    begin
+      t := (ly * vnY[m.FaceIndices1[i]] + lz * vnZ[m.FaceIndices1[i]] + lx * vnX[m.FaceIndices1[i]])
+           div (attenuation * vnMag[m.FaceIndices1[i]]) + ambient;
+      mColors1[i] := Method2608(c, t);
+
+      t := (ly * vnY[m.FaceIndices2[i]] + lz * vnZ[m.FaceIndices2[i]] + lx * vnX[m.FaceIndices2[i]])
+           div (attenuation * vnMag[m.FaceIndices2[i]]) + ambient;
+      mColors2[i] := Method2608(c, t);
+
+      t := (ly * vnY[m.FaceIndices3[i]] + lz * vnZ[m.FaceIndices3[i]] + lx * vnX[m.FaceIndices3[i]])
+           div (attenuation * vnMag[m.FaceIndices3[i]]) + ambient;
+      mColors3[i] := Method2608(c, t);
+    end
+    else if faceType = 1 then
+    begin
+      t := (ly * fnY[i] + lz * fnZ[i] + lx * fnX[i])
+           div (attenuation div 2 + attenuation) + ambient;
+      mColors1[i] := Method2608(c, t);
+      mColors3[i] := -1;
+    end
+    else if faceType = 3 then
+    begin
+      mColors1[i] := 128;
+      mColors3[i] := -1;
+    end
+    else
+      mColors3[i] := -2;
+  end;
+
+  mVerticesCount := m.VertexCount;
+  mVertX := m.VertexX; mVertY := m.VertexY; mVertZ := m.VertexZ;
+  mIndicesCount := m.FaceCount;
+  mIdx1 := m.FaceIndices1; mIdx2 := m.FaceIndices2; mIdx3 := m.FaceIndices3;
+  // `litModel.facePriorities = def.faceRenderPriorities` (ItemSpriteFactory
+  // :375). Empty for a model that carries only the model-wide `Priority`
+  // scalar, which no item-sprite path reads - OS1 propagates the scalar into a
+  // per-face array only when merging several models (`ModelLit.java:287-290`).
+  mFacePriorities := m.FaceRenderPriorities;
+  mFaceTransparencies := m.FaceTransparencies;
+  mFaceTextures := m.FaceTextures;
+end;
+
+(*
+## CalculateBoundsCylinder
+```pascal
+procedure CalculateBoundsCylinder();
+```
+`Model.calculateBoundsCylinder`. Produces `mModelHeight` (the camera needs it,
+before the projection runs) plus the cylinder `mRadius`/`mDiameter` that
+`BIN_MODE` 1 and 2 bin with.
+
+Note the axis convention: `y` grows downward, so the model's *height* is
+`max(-y)` and `mBottomY` is `max(y)`.
+*)
+procedure CalculateBoundsCylinder();
+var
+  i, vx, vy, vz, d: Integer;
+begin
+  mModelHeight := 0; mBottomY := 0; mXYZMag := 0;
+  for i := 0 to mVerticesCount - 1 do
+  begin
+    vx := mVertX[i]; vy := mVertY[i]; vz := mVertZ[i];
+    if -vy > mModelHeight then mModelHeight := -vy;
+    if vy > mBottomY then mBottomY := vy;
+    d := vx * vx + vz * vz;
+    if d > mXYZMag then mXYZMag := d;
+  end;
+  mXYZMag  := Trunc(Sqrt(1.0 * (mXYZMag)) + 0.99);
+  mRadius  := Trunc(Sqrt(1.0 * (mXYZMag * mXYZMag + mModelHeight * mModelHeight)) + 0.99);
+  mDiameter := mRadius + Trunc(Sqrt(1.0 * (mXYZMag * mXYZMag + mBottomY * mBottomY)) + 0.99);
+end;
+
+(*
+## CalculateBoundsAABB
+```pascal
+procedure CalculateBoundsAABB();
+```
+`Model.projectAndDraw`'s boundsType-2 branch (`Model.java:132-152`); OS1
+`ModelLit.calcAABB` (`ModelLit.java:513-534`). Overwrites `mRadius` and
+`mDiameter` only - `mModelHeight` and `mBottomY` stay as the cylinder pass left
+them, because {ref}`RenderItemSprite` has already used `mModelHeight` for the
+camera by the time this runs, exactly as `ItemSpriteFactory` does in Java.
+
+Deliberate deviation: `calcBoundingCylinder` sets `boundingCalc = 1` and
+`objRender` then SKIPS `calcAABB` (`ModelLit.java:483-487`, `:802`), so no
+source says this runs. It is used because it is the only source-grounded bound
+that actually CONTAINS the rotated depth of every face the reference renderer
+demonstrably drew - not because it is bigger; it is smaller than the cylinder
+more often than not. See the render spec 3.1a and 7.
+*)
+procedure CalculateBoundsAABB();
+var
+  i, x, y, z, d, mag: Integer;
+begin
+  mag := 0;
+  for i := 0 to mVerticesCount - 1 do
+  begin
+    x := mVertX[i]; y := mVertY[i]; z := mVertZ[i];
+    d := x * x + z * z + y * y;
+    if d > mag then mag := d;
+  end;
+  mag := Trunc(Sqrt(1.0 * mag) + 0.99);
+  if mag + mag < mDiameter then binNarrower += 1;
+  mRadius   := mag;
+  mDiameter := mag + mag;
+end;
+
+(*
+## RasterFace
+```pascal
+procedure RasterFace(face: Integer);
+```
+`Model.rasterFace`. `mColors3 = -2` skips a face. `-1` dispatches to
+`rasterFlat`, whose last argument is an RGB palette entry; all other values are
+HSL indices for `gouraudTriangle`. Alpha is the decoded signed byte viewed as
+an unsigned 0..255 value, exactly as Java's `& 255`.
+*)
+procedure RasterFace(face: Integer);
+var
+  i1, i2, i3, texture, coord, t1, t2, t3: Integer;
+begin
+  i1 := mIdx1[face]; i2 := mIdx2[face]; i3 := mIdx3[face];
+  rasterClipEnable := faceClipped[face];
+  rasterAlpha := 0;
+  if Length(mFaceTransparencies) > 0 then
+    rasterAlpha := mFaceTransparencies[face] and $FF;
+  texture := -1;
+  if Length(mFaceTextures) > 0 then texture := mFaceTextures[face];
+  if texture <> -1 then
+  begin
+    t1 := i1; t2 := i2; t3 := i3;
+    if Length(mTextureCoords) > 0 then
+    begin
+      coord := mTextureCoords[face];
+      if coord <> -1 then
+      begin
+        t1 := mTexIndices1[coord]; t2 := mTexIndices2[coord]; t3 := mTexIndices3[coord];
+      end;
+    end;
+    if mColors3[face] = -1 then
+      rasterTextureAffine(vpX[i1], vpX[i2], vpX[i3], vpY[i1], vpY[i2], vpY[i3],
+        mColors1[face], mColors1[face], mColors1[face],
+        vpLocalX[t1], vpLocalX[t2], vpLocalX[t3],
+        vpLocalY[t1], vpLocalY[t2], vpLocalY[t3],
+        vpLocalZ[t1], vpLocalZ[t2], vpLocalZ[t3], texture)
+    else
+      rasterTextureAffine(vpX[i1], vpX[i2], vpX[i3], vpY[i1], vpY[i2], vpY[i3],
+      mColors1[face], mColors2[face], mColors3[face],
+      vpLocalX[t1], vpLocalX[t2], vpLocalX[t3],
+      vpLocalY[t1], vpLocalY[t2], vpLocalY[t3],
+      vpLocalZ[t1], vpLocalZ[t2], vpLocalZ[t3], texture);
+    Exit;
+  end;
+  if mColors3[face] = -2 then Exit;
+  if mColors3[face] = -1 then
+    rasterFlat(vpX[i1], vpX[i2], vpX[i3], vpY[i1], vpY[i2], vpY[i3],
+               colorPalette[mColors1[face]])
+  else
+    gouraudTriangle(vpX[i1], vpX[i2], vpX[i3], vpY[i1], vpY[i2], vpY[i3],
+                    mColors1[face], mColors2[face], mColors3[face]);
+end;
+
+(*
+## PriorityEmitOne
+```pascal
+procedure PriorityEmitOne(var ptr, endIdx, nextDepth: Integer; var onBucket11: Boolean);
+```
+One step of the shared priority-10/11 cursor: raster the face under it, advance
+it, roll over from bucket 10 to bucket 11 when bucket 10 runs out, and re-read
+the depth of whatever the cursor now points at - or the sentinel `-1000` when
+there is nothing left.
+
+**This is the block the Java repeats verbatim four times** (`Model.java:349-365`
+and again at `:370-386`, `:391-407`, `:421-437`; OS1 `ModelLit.java:1206-1216`
+and three more). Four copies of a five-branch state machine is the single most
+likely place for a port to drift between copies, so it is written once.
+
+`ordFaces != orderedFaces[11]` in the Java is a *reference* comparison against
+the bucket-11 array, which is exactly "the cursor has not rolled over yet" -
+`onBucket11` here. The roll-over is one-way: once on bucket 11 the cursor never
+switches again, which is what makes the degenerate start in
+{ref}`ModelDrawPriority` safe.
+
+`-1000` cannot collide with a real depth: bin indices are clamped to `0 ..
+DEPTH_BINS-1` by {ref}`ModelDraw`.
+*)
+procedure PriorityEmitOne(var ptr, endIdx, nextDepth: Integer; var onBucket11: Boolean);
+var
+  face: Integer;
+begin
+  if onBucket11 then face := prioFaces[11][ptr] else face := prioFaces[10][ptr];
+  ptr += 1;
+  RasterFace(face);
+
+  if (ptr = endIdx) and not onBucket11 then
+  begin
+    ptr := 0;
+    endIdx := prioCount[11];
+    onBucket11 := True;
+  end;
+
+  if ptr < endIdx then
+  begin
+    if onBucket11 then nextDepth := prio11Depth[ptr] else nextDepth := prio10Depth[ptr];
+  end
+  else
+    nextDepth := -1000;
+end;
+
+(*
+## ModelDrawPriority
+```pascal
+procedure ModelDrawPriority(drawTop: Integer);
+```
+`Model.draw`'s `facePriorities != null` branch (`Model.java:279-438`), verified
+against OS1 `ModelLit.java:1127-1263`. Called by {ref}`ModelDraw` once the faces
+are binned by depth; `drawTop` is the same top of the draw range the plain
+branch walks.
+
+Three phases:
+
+1. **Bucket, far to near.** The same `drawTop-1 downto 0` walk as the plain
+   branch, but each face is appended to `prioFaces[p]` instead of being drawn.
+   Priorities 0..9 accumulate a running **sum** of depths in `prioDepthSum`;
+   10 and 11 instead record each face's own depth, indexed by that bucket's own
+   running count, so the two arrays stay parallel to `prioFaces[10]`/`[11]`.
+2. **Three integer averages** over the depth sums of buckets {1,2}, {3,4} and
+   {6,8}. Each is 0 when both its buckets are empty, and that zero is a real
+   threshold, not a "disabled" marker - a queued face at depth 0 does not beat
+   it, one at depth 1 does.
+3. **The interleaved emit.** Buckets 0..9 are drawn in fixed order, and buckets
+   10/11 form a single depth-ordered queue that is spliced in ahead of bucket 0,
+   3 and 5 while its head is deeper than the matching average - then fully
+   drained afterwards.
+
+**The point of the whole thing is that priority is not a sort key.** Buckets
+0..9 are emitted in index order regardless of depth; only 10/11 are ordered by
+depth, and only against three thresholds. Sorting the faces by priority value,
+or merging 10/11 by depth into everything, produces a plausible icon and the
+wrong CRC32.
+
+## The degenerate start is a real case, not defensive coding
+`Model.java:328-334` switches the cursor to bucket 11 **before the first face is
+drawn** when bucket 10 is empty, because the in-loop roll-over can then never
+fire. Six items of the 4978 reach it (3389, 7633, 7634, 8197, 9704, 20746) and
+without it every priority-11 face is drawn after bucket 9 instead of spliced by
+depth. `dev/tests/433_priority.simba` names all six.
+
+RuneLite and OS1 differ here only cosmetically: `lt10[8] + lt10[6]` against
+`tmpPriorityDepthSum[6] + tmpPriorityDepthSum[8]`. Addition commutes; there is
+no third reading.
+
+## Capacity
+Java's `orderedFaces` is `int[12][2000]` and `eq10`/`eq11` are `int[2000]`, so a
+bucket holding more than 2000 faces would throw. Sizing to the model's face
+count is a strict superset and cannot throw: the largest single bucket measured
+over cache 2625 is 1554 faces (item 25093, priority 2), the largest 10/11 queues
+626 and 342.
+*)
+procedure ModelDrawPriority(drawTop: Integer);
+var
+  depth, i, cnt, p, slot, face, j: Integer;
+  avg12, avg34, avg68: Integer;
+  ptr, endIdx, nextDepth: Integer;
+  onBucket11: Boolean;
+begin
+  if prioCapacity < mIndicesCount then
+  begin
+    prioCapacity := mIndicesCount;
+    SetLength(prioFaces, 12);
+    for p := 0 to 11 do
+    begin
+      prioFaces[p] := [];
+      SetLength(prioFaces[p], prioCapacity);
+    end;
+    prio10Depth := []; SetLength(prio10Depth, prioCapacity);
+    prio11Depth := []; SetLength(prio11Depth, prioCapacity);
+  end;
+  if Length(prioCount) <> 12 then
+  begin
+    SetLength(prioCount, 12);
+    SetLength(prioDepthSum, 12);
+  end;
+
+  for p := 0 to 11 do
+  begin
+    prioCount[p] := 0;
+    prioDepthSum[p] := 0;
+  end;
+
+  for depth := drawTop - 1 downto 0 do
+  begin
+    cnt := distanceFaceCount[depth];
+    for i := 0 to cnt - 1 do
+    begin
+      face := facesByDistance[depth][i];
+      p := mFacePriorities[face];
+      // Java indexes numOfPriority[] with the signed byte straight from the
+      // definition and throws on anything outside 0..11. Measured 0 occurrences
+      // over cache 2625; raising keeps that a refusal rather than a wrong icon.
+      if (p < 0) or (p > 11) then
+        raise 'face priority out of 0..11: ' + ToStr(p);
+      slot := prioCount[p];
+      prioCount[p] += 1;
+      prioFaces[p][slot] := face;
+      if p < 10 then prioDepthSum[p] += depth
+      else if p = 10 then prio10Depth[slot] := depth
+      else prio11Depth[slot] := depth;
+    end;
+  end;
+
+  avg12 := 0;
+  if (prioCount[1] > 0) or (prioCount[2] > 0) then
+    avg12 := (prioDepthSum[1] + prioDepthSum[2]) div (prioCount[1] + prioCount[2]);
+
+  avg34 := 0;
+  if (prioCount[3] > 0) or (prioCount[4] > 0) then
+    avg34 := (prioDepthSum[3] + prioDepthSum[4]) div (prioCount[3] + prioCount[4]);
+
+  avg68 := 0;
+  if (prioCount[6] > 0) or (prioCount[8] > 0) then
+    avg68 := (prioDepthSum[8] + prioDepthSum[6]) div (prioCount[8] + prioCount[6]);
+
+  ptr := 0;
+  endIdx := prioCount[10];
+  onBucket11 := False;
+  if ptr = endIdx then
+  begin
+    ptr := 0;
+    endIdx := prioCount[11];
+    onBucket11 := True;
+  end;
+  if ptr < endIdx then
+  begin
+    if onBucket11 then nextDepth := prio11Depth[ptr] else nextDepth := prio10Depth[ptr];
+  end
+  else
+    nextDepth := -1000;
+
+  for j := 0 to 9 do
+  begin
+    // The Java writes `while (j == 0 && nextDepth > avg12)`; j does not change
+    // inside the body, so the guard hoists.
+    if j = 0 then
+      while nextDepth > avg12 do PriorityEmitOne(ptr, endIdx, nextDepth, onBucket11);
+    if j = 3 then
+      while nextDepth > avg34 do PriorityEmitOne(ptr, endIdx, nextDepth, onBucket11);
+    if j = 5 then
+      while nextDepth > avg68 do PriorityEmitOne(ptr, endIdx, nextDepth, onBucket11);
+
+    cnt := prioCount[j];
+    for i := 0 to cnt - 1 do
+      RasterFace(prioFaces[j][i]);
+  end;
+
+  while nextDepth <> -1000 do
+    PriorityEmitOne(ptr, endIdx, nextDepth, onBucket11);
+end;
+
+(*
+## ModelDraw
+```pascal
+procedure ModelDraw();
+```
+`Model.draw`. Bins every front-facing triangle by depth, then either walks the
+bins back to front (`facePriorities == null`) or hands them to
+{ref}`ModelDrawPriority`.
+
+A face with `mColors3 = -2` is invisible and skipped outright; the rest go
+through the signed-area back-face test, and a survivor is binned by
+`avgViewportZ + mRadius`. The bins are then walked back to front, which is the
+whole of the painter's algorithm here - there is no depth buffer, so bin order
+*is* draw order and reordering within a bin is observable.
+
+The bin table is a FIXED 1600 entries wide, as in Java (`Model.java:38-39`) and
+OS1 (`ModelLit.java:141-144`) - not `diameter + 1`. Java hands every Model a
+freshly zeroed `int[1600]` and re-zeroes only `0..diameter-1` because it reuses
+the array across frames; these globals are reused across *items*, so the counts
+are reallocated fresh each call (`:= []` then `SetLength`, since Simba's
+`SetLength` preserves the overlapping prefix). `facesByDistance` holds no live
+state above its bin's count, so it is allocated once and kept.
+*)
+const
+  DEPTH_BINS: Integer = 1600;
+
+procedure ModelDraw();
+var
+  i, a, b, c, v1, v2, v3, n, j, cnt, drawTop: Integer;
+begin
+  if mDiameter >= DEPTH_BINS then Exit;
+
+  if BIN_MODE = 1 then drawTop := DEPTH_BINS else drawTop := mDiameter;
+
+  distanceFaceCount := []; SetLength(distanceFaceCount, DEPTH_BINS);
+  if Length(facesByDistance) <> DEPTH_BINS then
+  begin
+    SetLength(facesByDistance, DEPTH_BINS);
+    for i := 0 to DEPTH_BINS - 1 do
+      SetLength(facesByDistance[i], 512);
+  end;
+
+  for i := 0 to mIndicesCount - 1 do
+  begin
+    if mColors3[i] <> -2 then
+    begin
+      a := mIdx1[i]; b := mIdx2[i]; c := mIdx3[i];
+      v1 := vpY[a]; v2 := vpY[b]; v3 := vpY[c];
+      if (v1 - v2) * (vpX[c] - vpX[b]) - (v3 - v2) * (vpX[a] - vpX[b]) > 0 then
+      begin
+        faceClipped[i] := not ((v1 >= 0) and (v2 >= 0) and (v3 >= 0) and
+                               (v1 <= rasterClipX) and (v2 <= rasterClipX) and (v3 <= rasterClipX));
+        n := (vpZ[a] + vpZ[b] + vpZ[c]) div 3 + mRadius;
+        // Guard, not a behaviour: measured 0 occurrences over both caches.
+        // Nothing in the algorithm forbids a negative bin, and Java would throw.
+        if n < 0 then
+        begin
+          n := 0;
+          binClampLo += 1;
+        end;
+        if n >= drawTop then binOverDraw += 1;
+        if n >= DEPTH_BINS then n := DEPTH_BINS - 1;
+        facesByDistance[n][distanceFaceCount[n]] := i;
+        distanceFaceCount[n] += 1;
+      end;
+    end;
+  end;
+
+  if Length(mFacePriorities) > 0 then
+  begin
+    ModelDrawPriority(drawTop);
+    Exit;
+  end;
+
+  for i := drawTop - 1 downto 0 do
+  begin
+    cnt := distanceFaceCount[i];
+    if cnt > 0 then
+      for j := 0 to cnt - 1 do
+        RasterFace(facesByDistance[i][j]);
+  end;
+end;
+
+(*
+## ProjectAndDraw
+```pascal
+procedure ProjectAndDraw(yzRotation, xzRotation, xyRotation, orientation, xOffset, yOffset, zOffset: Integer);
+```
+`Model.projectAndDraw`. `boundsType` is always 1 here, so the sphere-bounds
+fallback is skipped, exactly as it is in Java.
+
+Three optional model rotations, then the camera: translate by the offsets,
+rotate by `orientation` about x, and divide by the view-space z. `zrv` is the
+eye offset that the same rotation puts the model at, subtracted back out so the
+binned depth is relative to the model's own centre.
+
+**The projected axes are swapped on purpose.** `vpY` gets the horizontal
+(`x * zoom / z + centerX`) and `vpX` the vertical. That is how the Java names
+them and how {ref}`RasterFace` passes them on to `gouraudTriangle`; renaming
+them to match their meaning would have to be done in both places at once and
+buys nothing.
+
+The three destination arrays are cleared with `:= []` before `SetLength`
+because Lape preserves the overlapping prefix: a shorter model following a
+longer one would otherwise read the previous item's vertices.
+*)
+procedure ProjectAndDraw(yzRotation, xzRotation, xyRotation, orientation, xOffset, yOffset, zOffset: Integer);
+var
+  i, sinR1, cosR1, sinY, cosY, sinZ, cosZ, sinX, cosX, zrv, x, y, z, tmp: Integer;
+begin
+  // Java runs its boundsType-2 block here, at the top of projectAndDraw and
+  // after calculateBoundsCylinder has already supplied modelHeight.
+  if BIN_MODE = 0 then CalculateBoundsAABB();
+
+  sinR1 := ANGLE_SINE[yzRotation];   cosR1 := ANGLE_COSINE[yzRotation];
+  sinY  := ANGLE_SINE[xzRotation];   cosY  := ANGLE_COSINE[xzRotation];
+  sinZ  := ANGLE_SINE[xyRotation];   cosZ  := ANGLE_COSINE[xyRotation];
+  sinX  := ANGLE_SINE[orientation];  cosX  := ANGLE_COSINE[orientation];
+
+  zrv := JSar(sinX * yOffset + cosX * zOffset, 16);
+
+  vpX := []; SetLength(vpX, mVerticesCount);
+  vpY := []; SetLength(vpY, mVerticesCount);
+  vpZ := []; SetLength(vpZ, mVerticesCount);
+  vpLocalX := []; SetLength(vpLocalX, mVerticesCount);
+  vpLocalY := []; SetLength(vpLocalY, mVerticesCount);
+  vpLocalZ := []; SetLength(vpLocalZ, mVerticesCount);
+  faceClipped := []; SetLength(faceClipped, mIndicesCount);
+
+  for i := 0 to mVerticesCount - 1 do
+  begin
+    x := mVertX[i]; y := mVertY[i]; z := mVertZ[i];
+
+    if xyRotation <> 0 then
+    begin
+      tmp := JSar(y * sinZ + x * cosZ, 16);
+      y := JSar(y * cosZ - x * sinZ, 16);
+      x := tmp;
+    end;
+    if yzRotation <> 0 then
+    begin
+      tmp := JSar(y * cosR1 - z * sinR1, 16);
+      z := JSar(y * sinR1 + z * cosR1, 16);
+      y := tmp;
+    end;
+    if xzRotation <> 0 then
+    begin
+      tmp := JSar(z * sinY + x * cosY, 16);
+      z := JSar(z * cosY - x * sinY, 16);
+      x := tmp;
+    end;
+
+    x += xOffset; y += yOffset; z += zOffset;
+    tmp := JSar(y * cosX - z * sinX, 16);
+    z := JSar(y * sinX + z * cosX, 16);
+    vpLocalX[i] := x; vpLocalY[i] := tmp; vpLocalZ[i] := z;
+    vpZ[i] := z - zrv;
+    vpY[i] := x * Rasterizer3D_zoom div z + centerX;
+    vpX[i] := tmp * Rasterizer3D_zoom div z + centerY;
+  end;
+
+  ModelDraw();
+end;

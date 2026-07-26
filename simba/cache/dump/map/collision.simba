@@ -1,0 +1,765 @@
+(*
+# Collision
+The `map/zips/collision.zip` renderer: one 256x256 truecolour chunk per region
+per plane, named `<plane>-<regionX>-<regionY>.png`. Ported from
+`net.runelite.cache.SimbaCollisionMapDumper`.
+
+```pascal
+var
+  world: TCollisionWorld;
+  objs: TCollisionObjects;
+  cm: TCollisionMap;
+world := TCollisionWorld.FromStore(store);
+objs  := TCollisionObjects.Create(store);
+cm    := TCollisionMap.Create(TRegion.Load(store, RegionIdOf(50, 50), []), world);
+dump.SaveImage('map/collision/' + cm.ChunkName(0), cm.Render(0, objs));
+```
+
+## Four colours, and never a fifth
+`SimbaCollisionMapDumper.java:58-61` declares exactly four, and a histogram of
+the committed zip finds exactly those four and nothing else:
+
+| | ARGB | meaning |
+|---|---|---|
+| `collisionColor` | `$FF333333` | an object's footprint |
+| `wallColor` | `$FF000000` | a blocked tile, or a wall |
+| `doorColor` | `$FFFF0000` | a wall that is a door |
+| `walkableColor` | `$FFFFFFFF` | |
+
+Simba's `TColor` is **BGR**, so `doorColor` is the one that does not survive a
+channel swap. Every write here goes through the individual `.R`/`.G`/`.B`
+fields of `TColorBGRA` for that reason, never through a packed literal.
+
+That palette is also what makes the `!= wallColor` test the object fill does
+(`:514`, `:528`) collapse to **`R <> 0`**: black is the only one of the four
+with a zero red channel.
+
+## The terrain pass is bit 0 of the settings byte, and nothing else
+`SimbaCollisionMapDumper.java:298-326` looks like it branches three ways, but
+the `(tileSetting and 24) <> 0` arm at `:309` and the fall-through at `:323`
+pass the *same* expression to `drawTile`. Only the bridge arm (`:314-321`)
+changes anything:
+
+```
+walkable := (setting(z, x, y) and 1) = 0
+except on plane 0, when (setting(1, x, y) and 2) <> 0 and (setting(z,x,y) and 24) = 0:
+  walkable := (setting(1, x, y) and 1) = 0
+```
+
+`blockingMask`, `impenetrable`, `solid` and `interactType` play no part at the
+tile level.
+
+## Why one region at a time is enough
+The Java allocates a single canvas covering every region - 13056 x 45568 px,
+2.4 GB - and cuts each chunk out of it (`:280`). Objects genuinely write
+outside their own region: `drawY = (drawBaseY + (64 - sizeY - localY)) * 4`
+goes negative for a tall object near the north edge, and the type-10..22 fill
+overruns the east edge. So the naive reading is that a chunk depends on its
+neighbours and cannot be rendered alone.
+
+**It does not, and the reason is the order inside the per-region loop**
+(`:276-294`):
+
+```java
+drawRegions(image, drawBaseX, drawBaseY, z, region);   // terrain: all 4096 tiles
+drawObjects(image, drawBaseX, drawBaseY, region, z);   // objects
+... image.getSubimage(...) -> zip                       // exported immediately
+```
+
+The terrain pass writes **every** pixel of the region's own 256x256 rectangle
+before its objects run. Any bleed an earlier region left inside that rectangle
+is therefore erased, and a later region's bleed has not happened yet when the
+chunk is exported. A chunk is exactly `terrain(R) + objects(R)`, and nothing
+else can ever be visible in it.
+
+This is measured, not assumed: rendering every region alone reproduces
+**11732 / 11732** committed chunks byte for byte. Compositing the west
+neighbour's objects on top instead - what a "render the 3x3 neighbourhood"
+port does - scores **11495 / 11732**, and `0-48-50` / `0-48-48` come out at
+65488 and 65472 of 65536 pixels.
+
+Note what that number says about the export order. `RegionLoader.regions` is a
+`HashMap` (`region/RegionLoader.java:52`) and region ids are `< 65536`, so
+iteration is by bucket `((regionX mod 16) shl 8) or regionY`: the west
+neighbour sorts *after* the region for the 155 regions with
+`regionX mod 16 = 0`, i.e. for 620 chunks. Those 620 are the chunks whose
+missing bleed is easiest to *see*, but they are not the whole story - only 6 of
+the 237 chunks the composite gets wrong are among them. A neighbour drawn
+*before* the region bleeds just as much; it is the region's own terrain pass
+that erases it. So reproducing the export order is not required either.
+
+## What a per-region port must still carry: the global canvas bounds
+The bounds checks in the object pass are against the **whole-map** canvas, not
+the chunk:
+
+* `drawX + xSize >= width` (`:509`) - `continue`s the whole location, block B
+  included, for any object crossing the canvas' east edge.
+* `drawY + ySize >= height` (`:510`) - the same at its south edge.
+* `drawY - xSize < 0` / `drawX + ySize >= width` (`:524-525`) - block B's
+  equivalents.
+* `drawX >= 0 and drawY >= 0 and drawX < width and drawY < height` (`:437`) -
+  the wall types' single guard.
+
+Measured over cache 2625, only the first of those ever fires (22 times, all in
+the easternmost region column), and removing all five leaves every one of the
+11732 chunks byte-identical. They are reproduced anyway because they are what
+the Java does and a later revision can move an object.
+
+What is *not* optional is that they stay **global**. Rewriting them against
+chunk bounds - the obvious thing to do once the canvas is 256x256 - drops the
+whole footprint of every object that crosses a chunk edge: measured, that is
+`0-48-50` at 65317 / 65536 and hundreds of chunks wrong. {ref}`TCollisionWorld`
+carries the canvas dimensions for exactly this, and the writes are clipped
+separately.
+
+## Three pieces of the Java that must NOT be ported
+1. **The `Close`-op branch** (`:451-459`). `EntityOpsDefinition.Op` is
+   `@AllArgsConstructor` with no `@Data`/`@EqualsAndHashCode` (`:84-88`), so it
+   inherits identity `equals` and `getOps().contains(new Op("Close"))` is
+   *always* false. The guard at `:441-442` is therefore always true and the
+   `else` block - which carries its own off-by-one, `drawY + MAP_SCALE` at
+   `:456`, one row past the tile - never runs.
+2. **`pushDownLocs`** (`:360`) is declared, iterated at `:385` and never filled.
+3. **`object.getName() == null`** (`:500`) is unreachable: `ObjectDefinition`
+   defaults `name` to the *string* `"null"` (`definitions/ObjectDefinition.java:39`),
+   which is also what `TObjectDefinition.Default` does.
+
+## The BLACK_CHUNK substitution
+`:283-290`. A chunk that came out fully walkable and is **outside** the
+mainland box (`z = 0`, `regionX` 15..62, `regionY` 32..65) is replaced wholesale
+by an all-black image. Over the committed zip: 481 all-white chunks exist and
+every one is inside the box; the one all-black chunk inside the box is
+genuinely all-blocked.
+
+{ref}`TCollisionMap.Render` applies it, because it is part of what gets written
+to the zip. {ref}`TCollisionMap.RenderRaw` is the collision layer without it.
+*)
+{$DEFINE WL_CACHE_DUMP_COLLISION_INCLUDED}
+{$IFNDEF WL_CACHE_REGION_INCLUDED}{$INCLUDE_ONCE ../../region.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_OBJECT_INCLUDED}{$INCLUDE_ONCE ../../defs/object.simba}{$ENDIF}
+
+const
+  // net.runelite.cache.SimbaCollisionMapDumper.MAP_SCALE
+  COLLISION_SCALE: Integer = 4;
+  // Region.X * MAP_SCALE - the side of one exported chunk, in pixels.
+  COLLISION_CHUNK_SIZE: Integer = 256;
+
+  // Wintertodt's invisible, non-colliding walls, skipped by id at :431-433.
+  COLLISION_WINTERTODT_ID: Integer = 24720;
+
+  // mainlandX1/Y1/X2/Y2 (:75-78). Region coordinates, inclusive.
+  COLLISION_MAINLAND_X1: Integer = 15;
+  COLLISION_MAINLAND_Y1: Integer = 32;
+  COLLISION_MAINLAND_X2: Integer = 62;
+  COLLISION_MAINLAND_Y2: Integer = 65;
+
+type
+(*
+## TCollisionWorld
+```pascal
+TCollisionWorld = record
+  MinRegionX, MinRegionY, MaxRegionX, MaxRegionY: Integer;
+  Width, Height: Integer;   // the whole-map canvas, in pixels
+end;
+```
+The extent of the region set being dumped, i.e. what `RegionLoader.getLowestX()`
+and friends answer (`region/RegionLoader.java:177-200`) and what
+`SimbaCollisionMapDumper.drawRegions` turns into a canvas size (`:202-212`).
+
+It exists only so the object pass' bounds checks can stay global while the
+writes are clipped to one chunk - see the unit docstring. On cache 2625 it is
+x 15..65, y 19..196, i.e. 13056 x 45568 px.
+*)
+  TCollisionWorld = record
+    MinRegionX, MinRegionY, MaxRegionX, MaxRegionY: Integer;
+    Width, Height: Integer;
+  end;
+
+(*
+## TCollisionWorld.Create
+```pascal
+function TCollisionWorld.Create(minX, minY, maxX, maxY: Integer): TCollisionWorld; static;
+```
+The canvas spanned by region coordinates `minX..maxX` by `minY..maxY`,
+inclusive.
+*)
+function TCollisionWorld.Create(minX, minY, maxX, maxY: Integer): TCollisionWorld; static;
+begin
+  if (maxX < minX) or (maxY < minY) then
+    raise 'Collision: empty region bounds ' + ToStr(minX) + '..' + ToStr(maxX) +
+          ', ' + ToStr(minY) + '..' + ToStr(maxY);
+
+  Result.MinRegionX := minX;
+  Result.MinRegionY := minY;
+  Result.MaxRegionX := maxX;
+  Result.MaxRegionY := maxY;
+  Result.Width := (maxX - minX + 1) * REGION_X * COLLISION_SCALE;
+  Result.Height := (maxY - minY + 1) * REGION_Y * COLLISION_SCALE;
+end;
+
+(*
+## TCollisionWorld.FromStore
+```pascal
+function TCollisionWorld.FromStore(var store: TCacheStore): TCollisionWorld; static;
+```
+The bounds of every region index 5 declares below `REGION_MAX_ID`.
+
+The Java measures its bounds over the regions that actually *loaded*, which is
+a smaller set in principle - an archive with no terrain file would be listed
+here and absent there. On cache 2625 the two agree exactly: 2934 archives, one
+of which is 25287 and excluded by the id bound, leaving the 2933 regions the
+committed zip holds. A cache where they disagree wants
+{ref}`TCollisionWorld.Create` with explicit numbers.
+*)
+function TCollisionWorld.FromStore(var store: TCacheStore): TCollisionWorld; static;
+var
+  table: TCacheRefTable;
+  i, id, x, y, minX, minY, maxX, maxY: Integer;
+begin
+  table := store.GetRefTable(Ord(EIndexType.MAPS));
+  if table.Named then
+    raise 'Collision: index 5 is named (an OpenRS2-style dump); only the ' +
+          'unnamed live-cache layout is implemented';
+
+  minX := -1;
+  for i := 0 to High(table.Archives) do
+  begin
+    id := table.Archives[i].Id;
+    if (id < 0) or (id >= REGION_MAX_ID) then Continue;
+
+    x := RegionXOf(id);
+    y := RegionYOf(id);
+    if minX = -1 then
+    begin
+      minX := x; maxX := x;
+      minY := y; maxY := y;
+      Continue;
+    end;
+
+    if x < minX then minX := x;
+    if x > maxX then maxX := x;
+    if y < minY then minY := y;
+    if y > maxY then maxY := y;
+  end;
+
+  if minX = -1 then
+    raise 'Collision: index 5 declares no regions';
+
+  Result := TCollisionWorld.Create(minX, minY, maxX, maxY);
+end;
+
+type
+(*
+## TCollisionObjects
+```pascal
+TCollisionObjects = record
+  SizeX, SizeY, InteractType, WallOrDoor: TIntegerArray;  // indexed by object id
+  HasModels, Known: TBooleanArray;
+  MaxId: Integer;
+end;
+```
+`ObjectManager` reduced to the five fields the collision pass reads, in one
+flat table indexed by object id.
+
+`ObjectManager.load` decodes the whole OBJECT archive up front and
+`getObject(id)` is a map lookup (`ObjectManager.java:54-72`); doing the same
+here is not just faithful, it is the only affordable shape - the dump asks
+about a location's object millions of times, and a by-id lookup through
+`TCacheDefs` rescans the reference table on every call.
+
+`HasModels` stands for `getObjectModels() != null`: `TObjectDefinition` uses an
+empty array for Java's null, which is exact because the loader only ever
+allocates that array from a non-zero length.
+*)
+  TCollisionObjects = record
+    SizeX, SizeY, InteractType, WallOrDoor: TIntegerArray;
+    HasModels, Known: TBooleanArray;
+    MaxId: Integer;
+  end;
+
+(*
+## TCollisionObjects.Create
+```pascal
+function TCollisionObjects.Create(var store: TCacheStore): TCollisionObjects; static;
+```
+Decodes every OBJECT definition in `store` and keeps the five fields the
+renderer needs.
+
+`store` is `var` so the reference table it parses lands on the caller's record
+rather than on a temporary copy.
+*)
+function TCollisionObjects.Create(var store: TCacheStore): TCollisionObjects; static;
+var
+  files: array of TByteArray;
+  table: TCacheRefTable;
+  ids: TIntegerArray;
+  obj: TObjectDefinition;
+  a, i, id: Integer;
+begin
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.OBJECTS));
+  if a = -1 then
+    raise 'Collision: the cache has no OBJECT config archive';
+
+  ids := table.Archives[a].FileIds;
+  if Length(ids) = 0 then
+    raise 'Collision: the OBJECT config archive is empty';
+
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.OBJECTS), []);
+
+  Result.MaxId := 0;
+  for i := 0 to High(ids) do
+    if ids[i] > Result.MaxId then Result.MaxId := ids[i];
+
+  SetLength(Result.SizeX, Result.MaxId + 1);
+  SetLength(Result.SizeY, Result.MaxId + 1);
+  SetLength(Result.InteractType, Result.MaxId + 1);
+  SetLength(Result.WallOrDoor, Result.MaxId + 1);
+  SetLength(Result.HasModels, Result.MaxId + 1);
+  SetLength(Result.Known, Result.MaxId + 1);
+
+  for i := 0 to High(files) do
+  begin
+    id := ids[i];
+    obj := TObjectDefinition.Load(id, files[i]);
+    Result.SizeX[id] := obj.SizeX;
+    Result.SizeY[id] := obj.SizeY;
+    Result.InteractType[id] := obj.InteractType;
+    Result.WallOrDoor[id] := obj.WallOrDoor;
+    Result.HasModels[id] := Length(obj.ObjectModels) > 0;
+    Result.Known[id] := True;
+  end;
+end;
+
+type
+(*
+## TCollisionMap
+```pascal
+TCollisionMap = record
+  RegionX, RegionY: Integer;
+  DrawBaseX, DrawBaseY: Integer;   // this region's top-left tile on the canvas
+  World: TCollisionWorld;
+  Settings: TIntegerArray;         // TRegion.TileIndex order
+  Locs: array of TLocation;
+  TileStart, Order, Occupied: TIntegerArray;
+end;
+```
+One region prepared for rendering: its settings bytes, its locations, and an
+index that hands back the locations sitting on one tile.
+
+`TileStart`/`Order` are a CSR-style bucket index over `Locs`, keyed by
+`x * 64 + y`, built stably so that the locations of a tile come back in the
+order the region file listed them. That is exactly the order
+`drawObjects` visits them in - it walks `localX` outermost, `localY` innermost,
+and rescans the whole location list per tile (`:363-383`) - at 4096 times less
+work. `Occupied` lists the tiles that hold any location at all, ascending, so
+the object pass skips the empty ones without losing that order.
+*)
+  TCollisionMap = record
+    RegionX, RegionY: Integer;
+    DrawBaseX, DrawBaseY: Integer;
+    World: TCollisionWorld;
+    Settings: TIntegerArray;
+    Locs: array of TLocation;
+    TileStart, Order, Occupied: TIntegerArray;
+  end;
+
+(*
+## TCollisionMap.Create
+```pascal
+function TCollisionMap.Create(region: TRegion; world: TCollisionWorld): TCollisionMap; static;
+```
+Prepares `region` for rendering onto the canvas `world` describes.
+
+Raises on a region with no terrain: a caller sweeping an id space should test
+`HasTerrain` and skip, rather than render a blank chunk that looks plausible.
+*)
+function TCollisionMap.Create(region: TRegion; world: TCollisionWorld): TCollisionMap; static;
+var
+  cursor: TIntegerArray;
+  tiles, i, n, t, used: Integer;
+begin
+  if not region.HasTerrain then
+    raise 'Collision: region ' + ToStr(region.Id) + ' has no terrain';
+
+  Result.RegionX := region.RegionX;
+  Result.RegionY := region.RegionY;
+  Result.World := world;
+
+  // :266-274. drawBaseY inverts Y because the top-most region has the greatest
+  // baseY while the top-most image row is 0.
+  Result.DrawBaseX := region.BaseX - world.MinRegionX * REGION_X;
+  Result.DrawBaseY := world.MaxRegionY * REGION_Y - region.BaseY;
+
+  SetLength(Result.Settings, REGION_Z * REGION_X * REGION_Y);
+  for i := 0 to High(Result.Settings) do
+    Result.Settings[i] := region.Tiles[i].Settings;
+
+  Result.Locs := Copy(region.Locations);
+  n := Length(Result.Locs);
+  tiles := REGION_X * REGION_Y;
+
+  SetLength(cursor, tiles);
+  for i := 0 to n - 1 do
+    Inc(cursor[Result.Locs[i].X * REGION_Y + Result.Locs[i].Y]);
+
+  SetLength(Result.TileStart, tiles + 1);
+  t := 0;
+  used := 0;
+  for i := 0 to tiles - 1 do
+  begin
+    Result.TileStart[i] := t;
+    t += cursor[i];
+    if cursor[i] > 0 then Inc(used);
+  end;
+  Result.TileStart[tiles] := t;
+
+  SetLength(Result.Occupied, used);
+  used := 0;
+  for i := 0 to tiles - 1 do
+    if Result.TileStart[i] <> Result.TileStart[i + 1] then
+    begin
+      Result.Occupied[used] := i;
+      Inc(used);
+    end;
+
+  // cursor is reused as a write head per bucket, which is what keeps the
+  // within-tile order equal to the region file's order.
+  for i := 0 to tiles - 1 do
+    cursor[i] := Result.TileStart[i];
+
+  SetLength(Result.Order, n);
+  for i := 0 to n - 1 do
+  begin
+    t := Result.Locs[i].X * REGION_Y + Result.Locs[i].Y;
+    Result.Order[cursor[t]] := i;
+    Inc(cursor[t]);
+  end;
+end;
+
+(*
+## TCollisionMap.ChunkName
+```pascal
+function TCollisionMap.ChunkName(z: Integer): String;
+```
+The zip entry name for plane `z`: `<plane>-<regionX>-<regionY>.png` (`:291`).
+This exact spelling is what WaspLib's map loader looks chunks up by - see
+`main/position/map/maploader.simba`.
+*)
+function TCollisionMap.ChunkName(z: Integer): String;
+begin
+  Result := ToStr(z) + '-' + ToStr(Self.RegionX) + '-' + ToStr(Self.RegionY) + '.png';
+end;
+
+(*
+## TCollisionMap.InsideMainland
+```pascal
+function TCollisionMap.InsideMainland(z: Integer): Boolean;
+```
+`:283-286`. Plane 0 and region x 15..62, y 32..65. A chunk that is *not* inside
+it and came out fully walkable is shipped as an all-black image instead - see
+{ref}`TCollisionMap.Render`.
+*)
+function TCollisionMap.InsideMainland(z: Integer): Boolean;
+begin
+  Result := (z = 0) and
+            (Self.RegionX >= COLLISION_MAINLAND_X1) and (Self.RegionX <= COLLISION_MAINLAND_X2) and
+            (Self.RegionY >= COLLISION_MAINLAND_Y1) and (Self.RegionY <= COLLISION_MAINLAND_Y2);
+end;
+
+(*
+## _CollisionPut
+```pascal
+function _CollisionPut(data: PColorBGRA; originX, originY, gx, gy, r, g, b: Integer): Boolean;
+```
+One `image.setRGB(gx, gy, ...)` on the whole-map canvas, clipped to the chunk
+whose top-left canvas pixel is `(originX, originY)`. Returns whether the pixel
+landed inside the chunk, which is what {ref}`TCollisionMap.RenderRaw` uses to
+answer "did anything but `walkableColor` get written".
+
+A write that falls outside is dropped rather than raising: the Java's canvas is
+the whole map, so those pixels are a *neighbour's* problem, and by the argument
+in the unit docstring the neighbour never shows them either.
+*)
+function _CollisionPut(data: PColorBGRA; originX, originY, gx, gy, r, g, b: Integer): Boolean;
+var
+  lx, ly: Integer;
+begin
+  lx := gx - originX;
+  if (lx < 0) or (lx >= COLLISION_CHUNK_SIZE) then Exit(False);
+  ly := gy - originY;
+  if (ly < 0) or (ly >= COLLISION_CHUNK_SIZE) then Exit(False);
+
+  lx := ly * COLLISION_CHUNK_SIZE + lx;
+  data[lx]^.R := r;
+  data[lx]^.G := g;
+  data[lx]^.B := b;
+  data[lx]^.A := 255;
+  Result := True;
+end;
+
+(*
+## TCollisionMap.RenderRaw
+```pascal
+function TCollisionMap.RenderRaw(z: Integer; objs: TCollisionObjects; var walkableOnly: Boolean): TImage;
+```
+Plane `z` as a 256x256 chunk, **without** the `BLACK_CHUNK` substitution.
+`walkableOnly` comes back True when not one pixel other than `walkableColor`
+was written, which is `isFullyWhite` (`:243-253`) answered for free instead of
+by a second pass over 65536 pixels.
+
+The image starts as a native `Fill` of `walkableColor`, so the terrain pass
+only has to write the blocked tiles - about a fifth of them, measured over the
+committed zip.
+*)
+function TCollisionMap.RenderRaw(z: Integer; objs: TCollisionObjects; var walkableOnly: Boolean): TImage;
+var
+  data: PColorBGRA;
+  planeSize, base, originX, originY: Integer;
+  x, y, ty, idx, setting, upper, i, j, p, col, row: Integer;
+  oi, tileIdx, localX, localY, tileZ, k, li: Integer;
+  id, locType, rotation, drawX, drawY, xSize, ySize: Integer;
+  r, g, b, gy, lx, ly, lx0, lx1, ly0, ly1: Integer;
+begin
+  if (z < 0) or (z >= REGION_Z) then
+    raise 'Collision: plane ' + ToStr(z) + ' is out of range';
+
+  Result := new TImage(COLLISION_CHUNK_SIZE, COLLISION_CHUNK_SIZE);
+  Result.Fill($FFFFFF);
+  data := Result.Data;
+  walkableOnly := True;
+
+  planeSize := REGION_X * REGION_Y;
+  base := z * planeSize;
+  originX := Self.DrawBaseX * COLLISION_SCALE;
+  originY := Self.DrawBaseY * COLLISION_SCALE;
+
+  // --- terrain, :298-326 ------------------------------------------------
+  for x := 0 to REGION_X - 1 do
+  begin
+    col := x * COLLISION_SCALE;
+    for y := 0 to REGION_Y - 1 do
+    begin
+      // Image row y holds tile (x, 63 - y): image space has a top-left origin
+      // and game space a bottom-left one.
+      ty := REGION_Y - y - 1;
+      idx := x * REGION_Y + ty;
+      setting := Self.Settings[base + idx];
+
+      if (setting and 24) = 0 then
+        if z = 0 then
+        begin
+          upper := Self.Settings[planeSize + idx];
+          // A bridge deck: plane 0 is drawn with plane 1's walkability.
+          if (upper and 2) <> 0 then setting := upper;
+        end;
+
+      if (setting and 1) = 0 then Continue;
+
+      walkableOnly := False;
+      row := y * COLLISION_SCALE;
+      for j := 0 to COLLISION_SCALE - 1 do
+      begin
+        p := (row + j) * COLLISION_CHUNK_SIZE + col;
+        for i := 0 to COLLISION_SCALE - 1 do
+        begin
+          data[p + i]^.R := 0;
+          data[p + i]^.G := 0;
+          data[p + i]^.B := 0;
+          data[p + i]^.A := 255;
+        end;
+      end;
+    end;
+  end;
+
+  // --- objects, :355-539 ------------------------------------------------
+  for oi := 0 to High(Self.Occupied) do
+  begin
+    tileIdx := Self.Occupied[oi];
+    localX := tileIdx div REGION_Y;
+    localY := tileIdx - localX * REGION_Y;
+
+    // :381. A roofed or hidden tile selects no locations at all.
+    if (Self.Settings[base + tileIdx] and 24) <> 0 then Continue;
+
+    // :372-374. Locations on a bridge deck belong to the plane above.
+    tileZ := z;
+    if (Self.Settings[planeSize + tileIdx] and 2) <> 0 then tileZ += 1;
+
+    for k := Self.TileStart[tileIdx] to Self.TileStart[tileIdx + 1] - 1 do
+    begin
+      li := Self.Order[k];
+      if Self.Locs[li].Plane <> tileZ then Continue;
+
+      locType := Self.Locs[li].LocType;
+      // :390-392. Wall decorations do not block.
+      if (locType >= 4) and (locType <= 8) then Continue;
+
+      id := Self.Locs[li].Id;
+      if (id < 0) or (id > objs.MaxId) or (not objs.Known[id]) then
+        raise 'Collision: region ' + ToStr(Self.RegionX) + ',' + ToStr(Self.RegionY) +
+              ' places object ' + ToStr(id) + ', which the cache does not hold';
+
+      if objs.InteractType[id] = 0 then Continue;                      // :394-395
+      if (locType = 22) and (objs.InteractType[id] <> 1) then Continue; // :421-423
+
+      rotation := Self.Locs[li].Orientation;
+      drawX := (Self.DrawBaseX + localX) * COLLISION_SCALE;
+      drawY := (Self.DrawBaseY + (REGION_Y - objs.SizeY[id] - localY)) * COLLISION_SCALE;
+
+      if (locType >= 0) and (locType <= 3) then
+      begin
+        if id = COLLISION_WINTERTODT_ID then Continue;                 // :431-433
+
+        r := 0; g := 0; b := 0;                                        // wallColor
+        if objs.WallOrDoor[id] <> 0 then r := 255;                     // doorColor
+
+        // :437. Canvas bounds, not chunk bounds.
+        if (drawX < 0) or (drawY < 0) or
+           (drawX >= Self.World.Width) or (drawY >= Self.World.Height) then Continue;
+
+        // :439-449. The `Close`-op else-branch at :451-459 is dead - see the
+        // unit docstring - so only this arm exists.
+        if (locType = 0) or (locType = 2) then
+          for i := 0 to COLLISION_SCALE - 1 do
+            case rotation of
+              0: if _CollisionPut(data, originX, originY, drawX, drawY + i, r, g, b) then walkableOnly := False;
+              1: if _CollisionPut(data, originX, originY, drawX + i, drawY, r, g, b) then walkableOnly := False;
+              2: if _CollisionPut(data, originX, originY, drawX + COLLISION_SCALE - 1, drawY + i, r, g, b) then walkableOnly := False;
+              3: if _CollisionPut(data, originX, originY, drawX + i, drawY + COLLISION_SCALE - 1, r, g, b) then walkableOnly := False;
+            end;
+
+        if locType = 3 then                                            // :462-468
+          case rotation of
+            0: if _CollisionPut(data, originX, originY, drawX, drawY, r, g, b) then walkableOnly := False;
+            1: if _CollisionPut(data, originX, originY, drawX + COLLISION_SCALE - 1, drawY, r, g, b) then walkableOnly := False;
+            2: if _CollisionPut(data, originX, originY, drawX + COLLISION_SCALE - 1, drawY + COLLISION_SCALE - 1, r, g, b) then walkableOnly := False;
+            3: if _CollisionPut(data, originX, originY, drawX, drawY + COLLISION_SCALE - 1, r, g, b) then walkableOnly := False;
+          end;
+
+        // :470-478. A type 2 draws a SECOND edge, and its rotations index the
+        // four edges differently from the block above.
+        if locType = 2 then
+          for i := 0 to COLLISION_SCALE - 1 do
+            case rotation of
+              0: if _CollisionPut(data, originX, originY, drawX + i, drawY, r, g, b) then walkableOnly := False;
+              1: if _CollisionPut(data, originX, originY, drawX + COLLISION_SCALE - 1, drawY + i, r, g, b) then walkableOnly := False;
+              2: if _CollisionPut(data, originX, originY, drawX + i, drawY + COLLISION_SCALE - 1, r, g, b) then walkableOnly := False;
+              3: if _CollisionPut(data, originX, originY, drawX, drawY + i, r, g, b) then walkableOnly := False;
+            end;
+
+        Continue;
+      end;
+
+      if locType = 9 then                                              // :483-496
+      begin
+        r := 0; g := 0; b := 0;
+        if objs.WallOrDoor[id] <> 0 then r := 255;
+
+        for i := 0 to COLLISION_SCALE - 1 do
+        begin
+          if (rotation <> 0) and (rotation <> 2) then gy := drawY + i
+          else gy := drawY + (COLLISION_SCALE - 1 - i);
+          if _CollisionPut(data, originX, originY, drawX + i, gy, r, g, b) then
+            walkableOnly := False;
+        end;
+
+        Continue;
+      end;
+
+      if (locType < 10) or (locType > 22) then Continue;                // :498
+
+      if not objs.HasModels[id] then Continue;                          // :501
+      if drawX < 0 then Continue;                                       // :503
+
+      xSize := objs.SizeX[id] * COLLISION_SCALE;
+      ySize := objs.SizeY[id] * COLLISION_SCALE;
+
+      // :507-519. Note the two guards `continue` the whole location, so a
+      // failure here also skips the transposed block below.
+      if (xSize = ySize) or (rotation = 0) or (rotation = 2) then
+      begin
+        if drawX + xSize >= Self.World.Width then Continue;
+        if drawY + ySize >= Self.World.Height then Continue;
+
+        lx0 := drawX - originX;
+        lx1 := lx0 + xSize - 1;
+        ly0 := drawY - originY;
+        ly1 := ly0 + ySize - 1;
+        if lx0 < 0 then lx0 := 0;
+        if ly0 < 0 then ly0 := 0;
+        if lx1 > COLLISION_CHUNK_SIZE - 1 then lx1 := COLLISION_CHUNK_SIZE - 1;
+        if ly1 > COLLISION_CHUNK_SIZE - 1 then ly1 := COLLISION_CHUNK_SIZE - 1;
+
+        for ly := ly0 to ly1 do
+        begin
+          p := ly * COLLISION_CHUNK_SIZE;
+          for lx := lx0 to lx1 do
+            // `!= wallColor`: black is the only one of the four colours with a
+            // zero red channel.
+            if data[p + lx]^.R <> 0 then
+            begin
+              data[p + lx]^.R := 51;
+              data[p + lx]^.G := 51;
+              data[p + lx]^.B := 51;
+              data[p + lx]^.A := 255;
+              walkableOnly := False;
+            end;
+        end;
+      end;
+
+      // :521-533. Independent of the block above: a SQUARE object at rotation
+      // 1 or 3 runs both.
+      if (rotation = 1) or (rotation = 3) then
+      begin
+        drawY := drawY + ySize - 1;
+        if drawY >= Self.World.Height then Continue;
+        if drawY - xSize < 0 then Continue;
+        if drawX + ySize >= Self.World.Width then Continue;
+
+        // (drawX + sY, drawY - sX) over sX < xSize, sY < ySize covers this
+        // rectangle exactly once, so it is a plain fill.
+        lx0 := drawX - originX;
+        lx1 := lx0 + ySize - 1;
+        ly1 := drawY - originY;
+        ly0 := ly1 - xSize + 1;
+        if lx0 < 0 then lx0 := 0;
+        if ly0 < 0 then ly0 := 0;
+        if lx1 > COLLISION_CHUNK_SIZE - 1 then lx1 := COLLISION_CHUNK_SIZE - 1;
+        if ly1 > COLLISION_CHUNK_SIZE - 1 then ly1 := COLLISION_CHUNK_SIZE - 1;
+
+        for ly := ly0 to ly1 do
+        begin
+          p := ly * COLLISION_CHUNK_SIZE;
+          for lx := lx0 to lx1 do
+            if data[p + lx]^.R <> 0 then
+            begin
+              data[p + lx]^.R := 51;
+              data[p + lx]^.G := 51;
+              data[p + lx]^.B := 51;
+              data[p + lx]^.A := 255;
+              walkableOnly := False;
+            end;
+        end;
+      end;
+    end;
+  end;
+end;
+
+(*
+## TCollisionMap.Render
+```pascal
+function TCollisionMap.Render(z: Integer; objs: TCollisionObjects): TImage;
+```
+Plane `z` exactly as `collision.zip` carries it: {ref}`TCollisionMap.RenderRaw`
+plus the `BLACK_CHUNK` substitution (`:283-290`) - a fully walkable chunk
+outside the mainland box is shipped as an all-black image.
+*)
+function TCollisionMap.Render(z: Integer; objs: TCollisionObjects): TImage;
+var
+  walkableOnly: Boolean;
+begin
+  Result := Self.RenderRaw(z, objs, walkableOnly);
+  if walkableOnly and (not Self.InsideMainland(z)) then
+    Result.Fill($000000);
+end;

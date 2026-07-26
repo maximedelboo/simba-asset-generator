@@ -1,0 +1,395 @@
+(*
+# Dump Common
+The shared floor every asset dumper stands on: JSON string escaping, and a
+small output-directory context.
+
+Dependency-free on purpose - like the rest of `utils/cache/`, this unit does
+**not** include `WaspLib/main.simba`, so none of WaspLib's `String` helper
+methods (`.Lower()`, `.Replace()`, ...) exist here. Use the Lape built-ins
+(`LowerCase`, `UpperCase`, `SameText`, `IntToHex`) instead.
+
+## There are TWO escapers, and they are not interchangeable
+
+The Java pipeline this replaces serialises JSON through Gson in two different
+configurations, and the committed `wasp-assets` prove both are live. Pick by
+which output file you are reproducing - getting it wrong is a silent parity
+loss across thousands of entries, not a crash.
+
+| producer | Gson call | use |
+|---|---|---|
+| `ItemExporter` -> `jsons/item-definitions.zip` | `new GsonBuilder().setPrettyPrinting().create()` | {ref}`JSONEscapeHTML` |
+| `NpcExporter.simbaExport` -> `map/npcs.zip` | `JsonObject.toString()` | {ref}`JSONEscape` |
+| `SimbaObjectInfoDumper` -> `map/objects.zip` | `JsonObject.toString()` | {ref}`JSONEscape` |
+
+The difference is Gson's **HTML-safe** mode. `GsonBuilder` enables it by
+default; the bare `JsonElement.toString()` path does not. In HTML-safe mode the
+five characters `' & < = >` are additionally emitted as `\u00xx`.
+
+Measured on the committed assets, which is where these rules come from rather
+than from the Gson documentation:
+
+- `jsons/item-definitions.zip` (33745 entries): `\u0027` x3536,
+  `\u003c` x193, `\u003e` x193, `\u0026` x44, `\u003d` x5, and
+  **zero** raw `' & < = >` bytes anywhere.
+- `map/objects.zip` (2785 entries): **zero** `\uXXXX` escapes of any kind,
+  and 251 raw `<`, 251 `>`, 2 `&`, 131 `=`, 431 apostrophes.
+
+## Non-ASCII passes through as raw UTF-8
+
+Gson only ever escapes below U+0080 (plus U+2028/U+2029, which do not occur in
+this cache - checked across all 33745 item definitions). Everything else is
+written straight to a UTF-8 stream.
+
+Our loaders already hand us UTF-8 byte strings - `TByteStream.ReadJagexString`
+decodes cp1252 on the way in - so the escaper's job is simply to leave every
+byte >= $80 alone. The committed assets confirm that is what the Java did:
+item 10968 stores `Tasty saut<C3><A9>ed mushrooms.` and NPC 5521 stores
+`Le-sabr<C3><A8>`, as raw UTF-8 with no `\uXXXX` anywhere.
+
+A Simba `String` is a 1-indexed byte string, so a per-byte loop is already the
+right granularity: UTF-8 continuation bytes are all >= $80 and land in the
+pass-through branch untouched.
+*)
+{$DEFINE WL_CACHE_DUMP_COMMON_INCLUDED}
+
+(*
+## _JSONEscapeCore
+```
+function _JSONEscapeCore(s: String; htmlSafe: Boolean): String;
+```
+Shared body of the two public escapers; mirrors Gson's
+`JsonWriter.REPLACEMENT_CHARS` and `HTML_SAFE_REPLACEMENT_CHARS` tables.
+
+Gson builds the long form with `String.format("\\u%04x", i)`, so its hex
+digits are **lowercase** - `\u001b`, never `\u001B`. `IntToHex` returns
+uppercase, which is what the `LowerCase` call is for.
+
+`/` is deliberately absent from both tables: JSON permits escaping it, and Gson
+never does.
+
+Built with `Result +=` rather than a preallocated buffer on purpose - measured
+on this build, appending in place is the faster of the two, because Lape
+appends without the quadratic reallocation the idiom implies.
+*)
+function _JSONEscapeCore(s: String; htmlSafe: Boolean): String;
+var
+  i, b: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(s) do
+  begin
+    b := Ord(s[i]);
+    case b of
+      8:  Result += '\b';
+      9:  Result += '\t';
+      10: Result += '\n';
+      12: Result += '\f';
+      13: Result += '\r';
+      34: Result += '\"';    // double quote
+      92: Result += '\\'; // backslash
+
+      // Every other C0 control has no short form and takes the long one.
+      0..7, 11, 14..31:
+        Result += '\u00' + LowerCase(IntToHex(b, 2));
+
+      // & ' < = >  -- escaped only in Gson's HTML-safe mode.
+      38, 39, 60, 61, 62:
+        if htmlSafe then
+          Result += '\u00' + LowerCase(IntToHex(b, 2))
+        else
+          Result += s[i];
+
+      // $20..$7f minus the above, plus every byte >= $80 (UTF-8), verbatim.
+      else
+        Result += s[i];
+    end;
+  end;
+end;
+
+(*
+## JSONEscape
+```
+function JSONEscape(s: String): String;
+```
+Escapes `s` the way Gson's plain `JsonElement.toString()` does - **without**
+HTML-safe escaping.
+
+This is the form behind `map/objects.zip` and `map/npcs.zip`, where colour tags
+survive as a literal `<col=00ffff>` and apostrophes stay apostrophes.
+
+Example:
+```pascal
+WriteLn JSONEscape('<col=00ffff>Zamorak''s robe');
+// <col=00ffff>Zamorak's robe
+```
+*)
+function JSONEscape(s: String): String;
+begin
+  Result := _JSONEscapeCore(s, False);
+end;
+
+(*
+## JSONEscapeHTML
+```
+function JSONEscapeHTML(s: String): String;
+```
+Escapes `s` the way a Gson instance built through `GsonBuilder` does, i.e. with
+HTML-safe escaping **on**, so `&` `'` `<` `=` `>` become `\u0026`
+`\u0027` `\u003c` `\u003d` `\u003e`.
+
+This is the form behind `jsons/item-definitions.zip`.
+
+Example:
+```pascal
+WriteLn JSONEscapeHTML('Zamorak''s robe');
+// Zamorak\u0027s robe
+```
+*)
+function JSONEscapeHTML(s: String): String;
+begin
+  Result := _JSONEscapeCore(s, True);
+end;
+
+
+(*
+## _DumpNormSep
+```
+function _DumpNormSep(p: String): String;
+```
+Rewrites every `/` in `p` to `PATH_SEP`.
+
+Dumper call sites spell relative paths with forward slashes, because that is
+what the asset tree and the zip entry names use; on Windows those must become
+backslashes before they reach the filesystem. A hand-rolled loop rather than
+`StringReplace` keeps this unit clear of `TReplaceFlags`, whose member spelling
+is not stable across the `{$SCOPEDENUMS}` boundary.
+*)
+function _DumpNormSep(p: String): String;
+var
+  i: Integer;
+  sep: Char;
+begin
+  Result := p;
+  // PATH_SEP is a String constant, not a Char - indexing an AnsiString needs
+  // an AnsiChar on the right-hand side, so take element 1 once up front.
+  sep := PATH_SEP[1];
+  for i := 1 to Length(Result) do
+    if Result[i] = '/' then
+      Result[i] := sep;
+end;
+
+type
+(*
+## TAssetDump
+The output context every dumper takes: where the asset tree is being written,
+plus the handful of filesystem operations they all repeat.
+
+`Root` always ends in `PATH_SEP`, so `Root + rel` is always a valid join.
+*)
+  TAssetDump = record
+    Root: String;
+  end;
+
+(*
+## TAssetDump.Setup
+```
+procedure TAssetDump.Setup(root: String);
+```
+Points the dump at `root`: normalises separators, guarantees exactly one
+trailing `PATH_SEP`, and creates the directory.
+
+Passing a path that already ends in a separator is fine - it is not doubled.
+*)
+procedure TAssetDump.Setup(root: String);
+begin
+  if root = '' then
+    raise 'TAssetDump.Setup: empty root path';
+
+  Self.Root := _DumpNormSep(root);
+  if Self.Root[Length(Self.Root)] <> PATH_SEP[1] then
+    Self.Root += PATH_SEP;
+
+  if not DirCreate(Self.Root) then
+    raise 'TAssetDump.Setup: cannot create "' + Self.Root + '"';
+end;
+
+(*
+## TAssetDump.Path
+```
+function TAssetDump.Path(rel: String): String;
+```
+Resolves `rel` against {ref}`TAssetDump.Root`, rewriting `/` to `PATH_SEP`.
+
+`Path('')` is `Root`.
+*)
+function TAssetDump.Path(rel: String): String;
+begin
+  Result := Self.Root + _DumpNormSep(rel);
+end;
+
+(*
+## TAssetDump.Ensure
+```
+procedure TAssetDump.Ensure(relDir: String);
+```
+Creates `relDir` beneath {ref}`TAssetDump.Root`, including every missing
+parent. Idempotent - an already-existing directory is not an error.
+*)
+procedure TAssetDump.Ensure(relDir: String);
+var
+  dir: String;
+begin
+  dir := Self.Path(relDir);
+  if not DirCreate(dir) then
+    raise 'TAssetDump.Ensure: cannot create "' + dir + '"';
+end;
+
+(*
+## TAssetDump.SaveImage
+```
+procedure TAssetDump.SaveImage(rel: String; img: TImage);
+```
+Writes `img` to `rel` beneath {ref}`TAssetDump.Root`, overwriting whatever was
+there before.
+
+The `FileDelete` is **load-bearing**, not defensive tidying: `TImage.Save`
+raises `TSimbaImage.Save: File already exists` when the target is present, so
+without it any dumper re-run over a populated output tree dies on its first
+file. `FileDelete` returning `False` for a file that was not there is the
+normal case and is ignored.
+
+The parent directory must already exist - call {ref}`TAssetDump.Ensure` first.
+*)
+procedure TAssetDump.SaveImage(rel: String; img: TImage);
+var
+  target: String;
+begin
+  target := Self.Path(rel);
+  FileDelete(target);
+  img.Save(target);
+end;
+
+(*
+## TAssetDump.SaveText
+```
+procedure TAssetDump.SaveText(rel: String; text: String);
+```
+Writes `text` to `rel` beneath {ref}`TAssetDump.Root`, overwriting whatever was
+there before. Deletes first so a shorter payload cannot leave a stale tail
+behind.
+
+An **empty** `text` needs a different call: measured on this build,
+`FileWrite(path, '')` returns `False` *and leaves no file on disk at all*. An
+empty file is a legitimate dumper output - a map chunk with no entries, an
+empty item-finder column - so it goes through `FileCreate` rather than being
+treated as an error.
+
+The parent directory must already exist - call {ref}`TAssetDump.Ensure` first.
+*)
+procedure TAssetDump.SaveText(rel: String; text: String);
+var
+  target: String;
+begin
+  target := Self.Path(rel);
+  FileDelete(target);
+
+  if text = '' then
+  begin
+    if not FileCreate(target) then
+      raise 'TAssetDump.SaveText: cannot create "' + target + '"';
+    Exit;
+  end;
+
+  if not FileWrite(target, text) then
+    raise 'TAssetDump.SaveText: cannot write "' + target + '"';
+end;
+
+(*
+## DumpEntryOrder
+```pascal
+function DumpEntryOrder(names: TStringArray): TIntegerArray;
+```
+Positions into `names` in **byte-lexicographic** order — `0.json, 1.json,
+10.json, 100.json, 1000.json, ...`, not numeric.
+
+This is the order every dumper needs, because the reference archives were
+produced by a CI `zip -r` over a directory and that is the order the shell
+glob expands in. Three dumpers had transcribed it independently
+(`dumpitemdefs`, `dumpnpcs`, `mapdata`) before it was lifted here.
+
+**Simba's own `TStringArray.Sort()` cannot be used.** It sorts *naturally*, so
+it puts `9.json` before `10.json` and `0-9-9.png` before `0-15-9.png` — a
+different order that produces a silently wrong archive. The `<` operator on
+Strings *is* byte-lexicographic, which is what the merge below compares with.
+
+Bottom-up merge sort: O(n log n) over 33745 names, and stable — though the
+names are unique in every current caller, so stability is a property rather
+than a requirement.
+
+Example:
+```pascal
+WriteLn(DumpEntryOrder(['1-50-50.png', '0-25-57.png']));  // [1, 0]
+```
+*)
+function DumpEntryOrder(names: TStringArray): TIntegerArray;
+var
+  src, dst, tmp: TIntegerArray;
+  n, width, lo, mid, hi, i, k, outPos: Integer;
+begin
+  n := Length(names);
+  src := [];
+  SetLength(src, n);
+  for i := 0 to n - 1 do src[i] := i;
+  if n < 2 then Exit(src);
+
+  dst := [];
+  SetLength(dst, n);
+
+  width := 1;
+  while width < n do
+  begin
+    lo := 0;
+    while lo < n do
+    begin
+      mid := Min(lo + width, n);
+      hi := Min(lo + width * 2, n);
+      i := lo;
+      k := mid;
+      outPos := lo;
+      while (i < mid) or (k < hi) do
+      begin
+        if i >= mid then
+        begin
+          dst[outPos] := src[k];
+          Inc(k);
+        end
+        else if k >= hi then
+        begin
+          dst[outPos] := src[i];
+          Inc(i);
+        end
+        else if names[src[k]] < names[src[i]] then
+        begin
+          dst[outPos] := src[k];
+          Inc(k);
+        end
+        else
+        begin
+          dst[outPos] := src[i];
+          Inc(i);
+        end;
+        Inc(outPos);
+      end;
+      lo += width * 2;
+    end;
+
+    // Swap the two buffers by reference; they stay distinct arrays, so the
+    // next pass never reads what it is writing.
+    tmp := src;
+    src := dst;
+    dst := tmp;
+    width := width * 2;
+  end;
+
+  Result := src;
+end;
