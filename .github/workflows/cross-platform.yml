@@ -179,7 +179,8 @@ jobs:
         shell: pwsh
         run: |
           if (!(Test-Path out/hashes.json) -or !(Test-Path out/finders/items/items-imgs.zip) -or !(Test-Path out/map/mapdata.zip)) { throw 'expected generated assets are missing' }
-          if ((Get-Content out/hashes.json -Raw | ConvertFrom-Json).psobject.Properties.Count -ne 24) { throw 'manifest does not contain 24 assets' }
+          $manifest = @(Get-Content out/hashes.json -Raw | ConvertFrom-Json)
+          if ($manifest.Count -ne 24) { throw 'manifest does not contain 24 assets' }
 
       - name: Upload generation proof
         uses: actions/upload-artifact@v4
