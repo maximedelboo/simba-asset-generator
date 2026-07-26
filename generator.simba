@@ -9,6 +9,7 @@ Standalone Simba entry point. The entire cache reader and asset dumper lives in
 Simba --run asset-generator/generator.simba
 Simba --revision=2639 --run asset-generator/generator.simba
 Simba --cache=/path/to/unpacked/cache --run asset-generator/generator.simba
+Simba --root=/path/to/asset-generator --cache=/path/to/unpacked/cache --run asset-generator/generator.simba
 ```
 
 With no arguments, the generator asks OpenRS2 for the latest valid Old School
@@ -53,7 +54,13 @@ var
   ran, present, verified: Integer;
   t: Double;
 begin
+  // Simba's interactive runner preserves the script directory. Some headless
+  // launchers deliberately change the worker process directory, so allow a
+  // caller to state the package root explicitly without changing no-argument
+  // behaviour for normal users.
   rootDir := PathIncludeTrailingSep(PathNormalize({$MACRO DIR}));
+  if GetProcessArg('root') then
+    rootDir := PathIncludeTrailingSep(PathNormalize(GetProcessArg('root')));
   cacheRoot := rootDir + 'cache' + PATH_SEP;
   outDir := rootDir + 'out' + PATH_SEP;
 
