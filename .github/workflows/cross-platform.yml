@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libgtk2.0-0 libgdk-pixbuf2.0-0 libx11-6 libxtst6
+          sudo apt-get install --yes libgtk2.0-0 libgdk-pixbuf2.0-0 libx11-6 libxtst6 xvfb
           url=$(curl --fail --silent --show-error https://raw.githubusercontent.com/Villavu/Simba-Build-Archive/main/latest.linux64)
           curl --fail --location --output simba.zip "$url"
           unzip -q simba.zip
@@ -112,12 +112,12 @@ jobs:
             return 1
           }
           rm -f latest-openrs2-revision.txt
-          ./Simba-Linux64 --extractopenssl --run tests/latest_openrs2.simba
+          xvfb-run -a ./Simba-Linux64 --extractopenssl --run tests/latest_openrs2.simba
           wait_for_file latest-openrs2-revision.txt
           cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
           test -n "$cache_file"
           rm -rf out
-          ./Simba-Linux64 --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+          xvfb-run -a ./Simba-Linux64 --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
           wait_for_file out/hashes.json
 
       - name: Generate full asset tree (macOS)
