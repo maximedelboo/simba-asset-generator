@@ -22,7 +22,7 @@ jobs:
             os: ubuntu-latest
             simba_target: linux64
           - name: macOS
-            os: macos-13
+            os: macos-latest
             simba_target: macintel
           - name: Windows
             os: windows-latest
