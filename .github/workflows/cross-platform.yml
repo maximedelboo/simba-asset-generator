@@ -102,45 +102,68 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          run_simba() {
-            ./Simba-Linux64 --extractopenssl "$@"
-            sleep 2
-            while pgrep -f 'Simba-Linux64.*\.simba' >/dev/null; do sleep 2; done
+          wait_for_file() {
+            local path=$1
+            for _ in $(seq 1 1350); do
+              test -f "$path" && return 0
+              sleep 2
+            done
+            echo "Timed out waiting for $path" >&2
+            return 1
           }
-          run_simba --run tests/latest_openrs2.simba
+          rm -f latest-openrs2-revision.txt
+          ./Simba-Linux64 --extractopenssl --run tests/latest_openrs2.simba
+          wait_for_file latest-openrs2-revision.txt
           cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
           test -n "$cache_file"
-          run_simba --cache="$(dirname "$cache_file")" --run generator.simba
+          rm -rf out
+          ./Simba-Linux64 --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+          wait_for_file out/hashes.json
 
       - name: Generate full asset tree (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          run_simba() {
-            ./Simba.app/Contents/MacOS/Simba --extractopenssl "$@"
-            sleep 2
-            while pgrep -f 'Simba.app/Contents/MacOS/Simba.*\.simba' >/dev/null; do sleep 2; done
+          wait_for_file() {
+            local path=$1
+            for _ in $(seq 1 1350); do
+              test -f "$path" && return 0
+              sleep 2
+            done
+            echo "Timed out waiting for $path" >&2
+            return 1
           }
-          run_simba --run tests/latest_openrs2.simba
+          rm -f latest-openrs2-revision.txt
+          ./Simba.app/Contents/MacOS/Simba --extractopenssl --run tests/latest_openrs2.simba
+          wait_for_file latest-openrs2-revision.txt
           cache_file=$(find "$PWD/cache/2625" -name main_file_cache.dat2 -type f -print -quit)
           test -n "$cache_file"
-          run_simba --cache="$(dirname "$cache_file")" --run generator.simba
+          rm -rf out
+          ./Simba.app/Contents/MacOS/Simba --extractopenssl --cache="$(dirname "$cache_file")" --run generator.simba
+          wait_for_file out/hashes.json
 
       - name: Generate full asset tree (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          function Invoke-Simba([string[]]$SimbaArgs, [string]$ScriptName) {
-            & .\Simba-Win64.exe --extractopenssl @SimbaArgs
-            Start-Sleep -Seconds 2
-            while (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "Simba-Win64\.exe.*$ScriptName" }) {
+          function Wait-ForFile([string]$Path) {
+            for ($i = 0; $i -lt 1350; $i++) {
+              if (Test-Path $Path) { return }
               Start-Sleep -Seconds 2
             }
+            throw "Timed out waiting for $Path"
           }
-          Invoke-Simba @('--run', 'tests/latest_openrs2.simba') 'latest_openrs2\.simba'
+          function Invoke-Simba([string[]]$SimbaArgs) {
+            & .\Simba-Win64.exe --extractopenssl @SimbaArgs
+          }
+          Remove-Item latest-openrs2-revision.txt -ErrorAction Ignore
+          Invoke-Simba @('--run', 'tests/latest_openrs2.simba')
+          Wait-ForFile latest-openrs2-revision.txt
           $cacheFile = Get-ChildItem cache/2625 -Filter main_file_cache.dat2 -File -Recurse | Select-Object -First 1
           if (!$cacheFile) { throw 'main_file_cache.dat2 was not unpacked' }
-          Invoke-Simba @("--cache=$($cacheFile.Directory.FullName)", '--run', 'generator.simba') 'generator\.simba'
+          Remove-Item out -Recurse -Force -ErrorAction Ignore
+          Invoke-Simba @("--cache=$($cacheFile.Directory.FullName)", '--run', 'generator.simba')
+          Wait-ForFile out/hashes.json
 
       - name: Verify the generated manifest (Unix)
         if: runner.os != 'Windows'

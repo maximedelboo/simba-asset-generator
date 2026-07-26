@@ -10,5 +10,7 @@ begin
   revision := manager.LatestOpenRS2Revision();
   if StrToInt(revision) <= 0 then
     raise 'TestLatestOpenRS2: invalid revision "' + revision + '"';
+  if not FileWrite('latest-openrs2-revision.txt', revision) then
+    raise 'TestLatestOpenRS2: could not write proof marker';
   WriteLn('Latest valid Old School OpenRS2 revision: ', revision);
 end.
