@@ -1,0 +1,12 @@
+program MapNativeLoad;
+
+// Isolates plugin loading/import from invoking an FFI function.
+{$IFDEF CPUAARCH64}
+{$loadlib ../plugins/mapnative/mapnative64.dylib.aarch64}
+{$ELSE}
+{$loadlib ../plugins/mapnative/mapnative}
+{$ENDIF}
+
+begin
+  WriteLn('MapNativeLoad: [PASS] native plugin loaded');
+end.

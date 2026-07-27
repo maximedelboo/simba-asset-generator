@@ -1,0 +1,55 @@
+program TestNPCModelMemo;
+
+(**
+# NPC model-stat memo regression test
+
+Checks that the per-model cache used by `DumpNPCHelper` is observationally
+identical to the uncached Java-shaped entity computation for every NPC in an
+unpacked cache.
+
+```text
+Simba --cache=/path/to/cache --run tests/npc_model_memo.simba
+```
+*)
+{$INCLUDE_ONCE ../simba/cache/dump/dumpnpcs.simba}
+
+var
+  cacheDir: String;
+  store: TCacheStore;
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids: TIntegerArray;
+  textures: array of TTextureDefinition;
+  known: TBooleanArray;
+  heights: TIntegerArray;
+  memoColors: array of TIntegerArray;
+  a, i: Integer;
+  uncached, memoised: String;
+begin
+  cacheDir := Trim(GetProcessArg('cache'));
+  if cacheDir = '' then
+    raise 'TestNPCModelMemo: pass --cache=/path/to/unpacked/cache';
+  store := TCacheStore.Create(cacheDir);
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  a := table.IndexOfArchive(Ord(EConfigType.NPC));
+  if a = -1 then raise 'TestNPCModelMemo: CONFIGS/NPC archive is missing';
+  ids := table.Archives[a].FileIds;
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.NPC), []);
+  if Length(ids) <> Length(files) then
+    raise 'TestNPCModelMemo: file-id count differs from file count';
+
+  textures := ModelStatsTextures(store);
+  SetLength(known, store.ArchiveCount(Ord(EIndexType.MODELS)));
+  SetLength(heights, Length(known));
+  SetLength(memoColors, Length(known));
+
+  for i := 0 to High(ids) do
+  begin
+    uncached := NpcHelperJSONOf(store, textures, ids[i], files[i]);
+    memoised := NpcHelperJSONOfMemo(store, textures, ids[i], files[i],
+                                    known, heights, memoColors);
+    if uncached <> memoised then
+      raise 'TestNPCModelMemo: JSON differs for NPC ' + ToStr(ids[i]);
+  end;
+  WriteLn('TestNPCModelMemo: ', Length(ids), ' NPCs match uncached JSON');
+end.

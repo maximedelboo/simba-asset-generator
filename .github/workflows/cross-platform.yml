@@ -98,6 +98,21 @@ jobs:
           Invoke-WebRequest $url -OutFile simba.zip
           Expand-Archive simba.zip . -Force
 
+      - name: Verify packaged map-native plugin (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: xvfb-run -a ./Simba-Linux64 --extractopenssl --root="$PWD" --run tests/mapnative_packaged_load.simba
+
+      - name: Verify packaged map-native plugin (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ./Simba.app/Contents/MacOS/Simba --extractopenssl --root="$PWD" --run tests/mapnative_packaged_load.simba
+
+      - name: Verify packaged map-native plugin (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\Simba-Win64.exe --extractopenssl "--root=$PWD" --run tests/mapnative_packaged_load.simba
+
       - name: Generate full asset tree (Linux)
         if: runner.os == 'Linux'
         shell: bash

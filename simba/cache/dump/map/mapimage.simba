@@ -110,6 +110,18 @@ last. It is a real defect and it is what produced `map.zip`, so
 {$IFNDEF WL_CACHE_DEF_TERRAIN_INCLUDED}{$INCLUDE_ONCE ../../defs/terrain.simba}{$ENDIF}
 {$IFNDEF WL_CACHE_DEF_SPRITE_INCLUDED}{$INCLUDE_ONCE ../../defs/sprite.simba}{$ENDIF}
 {$IFNDEF WL_CACHE_DUMP_MAPPALETTE_INCLUDED}{$INCLUDE_ONCE mappalette.simba}{$ENDIF}
+// This package ships a native compositor for every supported Simba runtime.
+// The relative path deliberately resolves from the generator root, so callers
+// do not have to modify their Simba application's Plugins directory.
+{$IFDEF CPUAARCH64}
+  {$IFDEF DARWIN}
+    {$loadlib ../../../../plugins/mapnative/mapnative64.dylib.aarch64}
+  {$ELSE}
+    {$loadlib ../../../../plugins/mapnative/mapnative64.so.aarch64}
+  {$ENDIF}
+{$ELSE}
+{$loadlib ../../../../plugins/mapnative/mapnative}
+{$ENDIF}
 
 const
   // net.runelite.cache.SimbaMapImageDumper.MAP_SCALE / .BLEND
@@ -137,10 +149,11 @@ const
   // idx8's archive of map decorations, found by name (`:973`).
   MAPIMAGE_SCENE_ARCHIVE: String = 'mapscene';
 
-  // How many decoded regions to keep. Nine are live at once (the 3x3 window);
-  // the slack is what stops a raster-order sweep from re-decoding a whole column
-  // every time the inner loop wraps.
-  MAPIMAGE_REGION_CACHE: Integer = 24;
+  // A raster-order sweep must retain the previous two complete x-columns while
+  // it walks the next one. 24 slots evicted those regions and decoded 8,209
+  // times for 2,933 cache regions (cache 2639); 512 retains substantially more
+  // of that column working set with modest, bounded memory.
+  MAPIMAGE_REGION_CACHE: Integer = 512;
 
   // TILE_SHAPE_2D and TILE_ROTATION_2D (`:66-67`), flattened row-major at 16
   // entries per row. Row `shape` of the first is a 4x4 mask - 0 picks the
@@ -409,6 +422,13 @@ re-decodes everything.
     PlaneRegion: Integer;
     PlaneBuf: array of TIntegerArray;
     PlaneBuilt: TBooleanArray;
+
+    // Aggregate timings for one mapdata run. These are diagnostic counters,
+    // kept on the warm renderer so the caller can identify the expensive
+    // rendering phase without timing thousands of individual chunks.
+    ProfileNeighbourMS, ProfileTerrainMS, ProfileObjectsMS, ProfileIconsMS: Double;
+    ProfileRegionDecodeMS, ProfileRegionProjectMS, ProfilePlaneBuildMS: Double;
+    ProfileRegionLoads: Integer;
   end;
 
 // ARGB opacity. Written as a shift because the literal $FF000000 does not fit a
@@ -777,6 +797,7 @@ function TMapImage.LoadRegion(id: Integer): TMapRegion;
 var
   region: TRegion;
   cursor: TIntegerArray;
+  profile: Double;
   tiles, i, n, t, used: Integer;
 begin
   Result.Id := id;
@@ -790,10 +811,13 @@ begin
 
   if not Self.RegionExists(Result.RegionX, Result.RegionY) then Exit;
 
+  profile := PerformanceTime();
   region := TRegion.Load(Self.Store, id, []);
+  Self.ProfileRegionDecodeMS += PerformanceTime() - profile;
   if not region.HasTerrain then Exit;
   Result.Valid := True;
 
+  profile := PerformanceTime();
   n := REGION_Z * REGION_X * REGION_Y;
   SetLength(Result.UnderlayId, n);
   SetLength(Result.OverlayId, n);
@@ -852,6 +876,7 @@ begin
     Result.Order[cursor[t]] := i;
     Inc(cursor[t]);
   end;
+  Self.ProfileRegionProjectMS += PerformanceTime() - profile;
 end;
 
 // Least-recently-used slot for region `id`, decoding it if it is not resident.
@@ -878,6 +903,7 @@ begin
     end;
 
   Self.CacheRegions[victim] := Self.LoadRegion(id);
+  Inc(Self.ProfileRegionLoads);
   Self.CacheIds[victim] := id;
   Self.CacheStamp[victim] := Self.Clock;
   Result := victim;
@@ -1526,9 +1552,13 @@ end;
 // The blend buffer for plane `z` of the region being rendered, built on first
 // use. drawTile does the same lazily through its `int[4][][] map` local (`:346-352`).
 procedure TMapImage.EnsurePlane(regs: array of TMapRegion; centre, z: Integer);
+var
+  profile: Double;
 begin
   if Self.PlaneBuilt[z] then Exit;
+  profile := PerformanceTime();
   Self.BuildPlane(regs, centre, z);
+  Self.ProfilePlaneBuildMS += PerformanceTime() - profile;
   Self.PlaneBuilt[z] := True;
 end;
 
@@ -1571,6 +1601,14 @@ var
 begin
   planeSize := REGION_X * REGION_Y;
   settings := regs[centre].Settings;
+
+  // All four planes are needed as raw pointers by the one native call. A normal
+  // full region render uses all four too; this only moves their lazy build to
+  // the first plane, without changing the buffers or compositing order.
+  for x := 0 to REGION_Z - 1 do Self.EnsurePlane(regs, centre, x);
+  MapNativeComposite(@settings[0], @Self.PlaneBuf[0][0], @Self.PlaneBuf[1][0],
+                     @Self.PlaneBuf[2][0], @Self.PlaneBuf[3][0], data, z);
+  Exit;
 
   for x := 0 to REGION_X - 1 do
     for y := 0 to REGION_Y - 1 do
@@ -1642,6 +1680,7 @@ function TMapImage.Render(regionX, regionY, z: Integer): TImage;
 var
   regs: array of TMapRegion;
   data: PColorBGRA;
+  t: Double;
   i, centre, id, originX, originY: Integer;
 begin
   if (z < 0) or (z >= REGION_Z) then
@@ -1650,7 +1689,9 @@ begin
     raise 'MapImage: no region at ' + ToStr(regionX) + ',' + ToStr(regionY);
 
   id := RegionIdOf(regionX, regionY);
+  t := PerformanceTime();
   regs := Self.Neighbourhood(regionX, regionY);
+  Self.ProfileNeighbourMS += PerformanceTime() - t;
 
   centre := -1;
   for i := 0 to High(regs) do
@@ -1677,8 +1718,16 @@ begin
   for i := 0 to High(regs) do
   begin
     if i = centre then
+    begin
+      t := PerformanceTime();
       Self.DrawTerrain(data, regs, centre, z);
+      Self.ProfileTerrainMS += PerformanceTime() - t;
+    end;
+    t := PerformanceTime();
     Self.DrawObjects(data, regs[i], originX, originY, z);
+    Self.ProfileObjectsMS += PerformanceTime() - t;
+    t := PerformanceTime();
     Self.DrawIcons(data, regs[i], originX, originY, z);
+    Self.ProfileIconsMS += PerformanceTime() - t;
   end;
 end;

@@ -545,7 +545,8 @@ var
   mi: TMapImage;
   world: TCollisionWorld;
   objs: TCollisionObjects;
-  t: Double;
+  t, part: Double;
+  mapBuild, mapSave, collisionBuild, collisionSave, heightBuild, heightSave: Double;
   shard, shardCount, first, last: Integer;
 begin
   dir := PathIncludeTrailingSep(binDir);
@@ -570,14 +571,27 @@ begin
     last := Min(Length(regionIds), first + MAPDATA_REGIONS_PER_SHARD);
     WriteLn('MapData:   map       shard ', shard + 1, '/', shardCount,
             '  regions ', first + 1, '-', last);
+    part := PerformanceTime();
     bundle := MapDataImageShard(mi, regionIds, first, last);
+    mapBuild += PerformanceTime() - part;
     name := MapDataShardName(MAPDATA_SHARD_PREFIXES[0], shard);
+    part := PerformanceTime();
     bundle.Save(dir + name);
+    mapSave += PerformanceTime() - part;
     names += name;
     bundle.Init();
   end;
   Result += Round(PerformanceTime() - t);
   WriteLn('MapData: [1/3] map images done in ', Result[0], ' ms');
+  WriteLn('MapData:   map build ', Round(mapBuild), ' ms, bundle save ', Round(mapSave),
+          ' ms; neighbourhood ', Round(mi.ProfileNeighbourMS), ' ms, terrain ',
+          Round(mi.ProfileTerrainMS), ' ms, objects ', Round(mi.ProfileObjectsMS),
+          ' ms, icons ', Round(mi.ProfileIconsMS), ' ms');
+  WriteLn('MapData:   terrain plane build ', Round(mi.ProfilePlaneBuildMS),
+          ' ms, composite ', Round(mi.ProfileTerrainMS - mi.ProfilePlaneBuildMS), ' ms');
+  WriteLn('MapData:   region cache misses ', mi.ProfileRegionLoads, '; decode ',
+          Round(mi.ProfileRegionDecodeMS), ' ms, project ',
+          Round(mi.ProfileRegionProjectMS), ' ms');
 
   t := PerformanceTime();
   world := TCollisionWorld.FromStore(store);
@@ -589,14 +603,20 @@ begin
     last := Min(Length(regionIds), first + MAPDATA_REGIONS_PER_SHARD);
     WriteLn('MapData:   collision shard ', shard + 1, '/', shardCount,
             '  regions ', first + 1, '-', last);
+    part := PerformanceTime();
     bundle := MapDataCollisionShard(store, regionIds, first, last, world, objs);
+    collisionBuild += PerformanceTime() - part;
     name := MapDataShardName(MAPDATA_SHARD_PREFIXES[1], shard);
+    part := PerformanceTime();
     bundle.Save(dir + name);
+    collisionSave += PerformanceTime() - part;
     names += name;
     bundle.Init();
   end;
   Result += Round(PerformanceTime() - t);
   WriteLn('MapData: [2/3] collision done in ', Result[1], ' ms');
+  WriteLn('MapData:   collision build ', Round(collisionBuild), ' ms, bundle save ',
+          Round(collisionSave), ' ms');
 
   t := PerformanceTime();
   WriteLn('MapData: [3/3] heightmap');
@@ -606,14 +626,20 @@ begin
     last := Min(Length(regionIds), first + MAPDATA_REGIONS_PER_SHARD);
     WriteLn('MapData:   heightmap shard ', shard + 1, '/', shardCount,
             '  regions ', first + 1, '-', last);
+    part := PerformanceTime();
     bundle := MapDataHeightmapShard(store, regionIds, first, last);
+    heightBuild += PerformanceTime() - part;
     name := MapDataShardName(MAPDATA_SHARD_PREFIXES[2], shard);
+    part := PerformanceTime();
     bundle.Save(dir + name);
+    heightSave += PerformanceTime() - part;
     names += name;
     bundle.Init();
   end;
   Result += Round(PerformanceTime() - t);
   WriteLn('MapData: [3/3] heightmap done in ', Result[2], ' ms');
+  WriteLn('MapData:   heightmap build ', Round(heightBuild), ' ms, bundle save ',
+          Round(heightSave), ' ms');
 
   WriteLn('MapData: packing ', Length(names), ' shards into mapdata.zip…');
   ZipMapFiles(dir, zipPath, names);

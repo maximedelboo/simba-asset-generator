@@ -192,9 +192,10 @@ is the matching entry of the reference table's `FileIds`.
 because it is the one thing here that is worth loading once: rebuilding it per
 definition would decompress the TEXTURES archive 16292 times.
 
-There is **no memoisation**, per definition or per model, matching
-`SimbaNPCDumper` - see the note in `modelstats.simba` on why a memo here is the
-one optimisation worth refusing.
+The entity computation is not memoised: every NPC still selects height from its
+first model and appends all model palettes in order. The caller may memoise the
+pure per-model statistic below that boundary; this has been verified to leave
+the complete helper bundle byte-identical.
 *)
 function NpcHelperJSONOf(var store: TCacheStore; textures: array of TTextureDefinition; id: Integer; data: TByteArray): String;
 var
@@ -203,6 +204,44 @@ var
 begin
   npc := TNpcDefinition.Load(id, data);
   stats := TModelStats.OfModels(store, textures, npc.Models);
+  Result := NpcHelperJSON(npc, stats.Height, stats.Colors);
+end;
+
+// Model statistics are a pure function of one model archive and the immutable
+// texture table. Memoising that lower-level value keeps the Java entity-level
+// behaviour intact: height still comes from the first model and colours are
+// still appended in model order, including cross-model duplicates.
+function NpcHelperJSONOfMemo(var store: TCacheStore; textures: array of TTextureDefinition;
+                             id: Integer; data: TByteArray; var known: TBooleanArray;
+                             var heights: TIntegerArray;
+                             var colors: array of TIntegerArray): String;
+var
+  npc: TNpcDefinition;
+  stats, one: TModelStats;
+  i, model: Integer;
+begin
+  npc := TNpcDefinition.Load(id, data);
+  for i := 0 to High(npc.Models) do
+  begin
+    model := npc.Models[i];
+    if (model >= 0) and (model <= High(known)) and known[model] then
+    begin
+      one.Height := heights[model];
+      one.Colors := colors[model];
+    end
+    else
+    begin
+      one := TModelStats.OfModel(store, textures, model);
+      if (model >= 0) and (model <= High(known)) then
+      begin
+        known[model] := True;
+        heights[model] := one.Height;
+        colors[model] := one.Colors;
+      end;
+    end;
+    if stats.Height = 0 then stats.Height := one.Height;
+    stats.Colors := stats.Colors + one.Colors;
+  end;
   Result := NpcHelperJSON(npc, stats.Height, stats.Colors);
 end;
 
@@ -241,10 +280,15 @@ var
   textures: array of TTextureDefinition;
   table: TCacheRefTable;
   ids, order: TIntegerArray;
+  modelHeights: TIntegerArray;
+  modelKnown: TBooleanArray;
+  modelColors: array of TIntegerArray;
   names: TStringArray;
   zip: TZipWriter;
+  t, setupMS, jsonMS, zipMS: Double;
   a, i, k: Integer;
 begin
+  t := PerformanceTime();
   table := store.GetRefTable(Ord(EIndexType.CONFIGS));
   a := table.IndexOfArchive(Ord(EConfigType.NPC));
   if a = -1 then
@@ -257,11 +301,15 @@ begin
           ' files but its reference table names ' + ToStr(Length(ids));
 
   textures := ModelStatsTextures(store);
+  SetLength(modelKnown, store.ArchiveCount(Ord(EIndexType.MODELS)));
+  SetLength(modelHeights, Length(modelKnown));
+  SetLength(modelColors, Length(modelKnown));
 
   SetLength(names, Length(ids));
   for i := 0 to High(ids) do
     names[i] := ToStr(ids[i]) + '.json';
   order := DumpEntryOrder(names);
+  setupMS := PerformanceTime() - t;
 
   zip.Init();
   for i := 0 to High(order) do
@@ -269,8 +317,15 @@ begin
     if i mod 1000 = 0 then
       WriteLn('DumpNPCs: helper ', i, '/', Length(order));
     k := order[i];
-    zip.AddBytes(names[k], _NpcHelperBytes(NpcHelperJSONOf(store, textures, ids[k], files[k])));
+    t := PerformanceTime();
+    zip.AddBytes(names[k], _NpcHelperBytes(NpcHelperJSONOfMemo(store, textures, ids[k], files[k],
+                                                                 modelKnown, modelHeights, modelColors)));
+    jsonMS += PerformanceTime() - t;
   end;
 
+  t := PerformanceTime();
   zip.Save(zipPath);
+  zipMS := PerformanceTime() - t;
+  WriteLn('DumpNPCs: helper setup ', Round(setupMS), ' ms, per-NPC decode/stats/json ',
+          Round(jsonMS), ' ms, zip ', Round(zipMS), ' ms');
 end;

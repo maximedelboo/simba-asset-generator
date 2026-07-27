@@ -1,0 +1,56 @@
+program ProfileMapNativeShard;
+
+(**
+# Native map-composite benchmark
+
+The normal map renderer uses the packaged `mapnative` plugin. This entry point
+is retained as an explicit benchmark name for existing scripts; no custom
+Simba application setup is required.
+
+Use the same `--shard` and optional `--save` arguments as
+`tests/profile_map_shard.simba`, then compare the two saved bundles with `cmp`.
+*)
+{$INCLUDE_ONCE ../simba/cache/dump/map/mapdata.simba}
+
+var
+  cacheDir, shardArg, savePath: String;
+  store: TCacheStore;
+  ids: TIntegerArray;
+  mi: TMapImage;
+  bundle: TMapBundle;
+  t: Double;
+  shard, first, last, shardCount: Integer;
+begin
+  cacheDir := Trim(GetProcessArg('cache'));
+  if cacheDir = '' then
+    raise 'ProfileMapNativeShard: pass --cache=/path/to/unpacked/cache';
+  if GetProcessArg('shard') then shardArg := Trim(GetProcessArg('shard'));
+  if GetProcessArg('save') then savePath := Trim(GetProcessArg('save'));
+  if shardArg = '' then shard := 0 else shard := StrToInt(shardArg);
+
+  store := TCacheStore.Create(cacheDir);
+  ids := MapDataRegionIds(store);
+  shardCount := (Length(ids) + MAPDATA_REGIONS_PER_SHARD - 1) div
+                MAPDATA_REGIONS_PER_SHARD;
+  if (shard < 0) or (shard >= shardCount) then
+    raise 'ProfileMapNativeShard: shard must be 0..' + ToStr(shardCount - 1);
+
+  first := shard * MAPDATA_REGIONS_PER_SHARD;
+  last := Min(Length(ids), first + MAPDATA_REGIONS_PER_SHARD);
+  mi := TMapImage.Create(store);
+  t := PerformanceTime();
+  bundle := MapDataImageShard(mi, ids, first, last);
+
+  WriteLn('ProfileMapNativeShard: shard ', shard, ' regions ', first + 1, '-', last,
+          ' rendered ', Length(bundle.Names), ' chunks in ',
+          Round(PerformanceTime() - t), ' ms');
+  WriteLn('ProfileMapNativeShard: terrain ', Round(mi.ProfileTerrainMS),
+          ' ms (plane build ', Round(mi.ProfilePlaneBuildMS), ' ms, composite ',
+          Round(mi.ProfileTerrainMS - mi.ProfilePlaneBuildMS), ' ms)');
+  if savePath <> '' then
+  begin
+    bundle.Save(savePath);
+    WriteLn('ProfileMapNativeShard: bundle saved to ', savePath);
+  end;
+  bundle.Init();
+end.

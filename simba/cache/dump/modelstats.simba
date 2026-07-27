@@ -56,18 +56,20 @@ Three properties of that loop are contract, not incidental:
 `ObjectDefinition.getObjectID()`, a field that is declared and never assigned,
 so every lookup and store uses key 0 and all 48857 entries of the committed
 `map/objects.zip` carry the *first* processed object's height and colour set.
-That is a Java defect. There is deliberately no memo in this unit - not per
-entity, and not per model either, because a model-level memo is a performance
-choice that would sit exactly where the Java's correctness bug does. A full NPC
-sweep of 16292 definitions over 7801 distinct models measures ~29 s on this
-machine, which is fine for a one-off asset generation.
+That is a Java defect. There is deliberately no **entity** memo in this unit:
+the entity loop remains literal, so height still comes from the first model and
+colours still concatenate in model order. `DumpNPCHelper` may memoise the pure
+lower-level model statistic by model id; this cannot affect that loop and was
+proven byte-identical for the complete helper bundle. It removes repeated reads
+of shared models without reproducing Java's broken entity-key cache.
 
 ## Verification
 Measured against the committed `wasp-assets/map/zips/npcs_helper.zip`, which
 `SimbaNPCDumper` wrote with no memoisation and no filtering: **16292 / 16292
 heights and 16292 / 16292 colour sets**, on OpenRS2 cache 2625 *and* on 2639 -
-the two revisions produce byte-identical stats for every NPC. See
-`dev/tests/410_modelstats.simba`.
+the two revisions produce byte-identical stats for every NPC. The memoised 2639
+helper bundle also compares byte-for-byte equal to the uncached bundle. See
+`tests/npc_model_memo.simba` for the complete cached-versus-uncached JSON check.
 *)
 {$DEFINE WL_CACHE_DUMP_MODELSTATS_INCLUDED}
 {$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}

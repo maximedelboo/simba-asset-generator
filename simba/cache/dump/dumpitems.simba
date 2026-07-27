@@ -26,6 +26,38 @@ type
 
   TItemDumpRows = array of TItemDumpRow;
 
+  // An open-addressed set of strings.  Hash32 is Simba's compiled xxHash32;
+  // the short probe loop exists only to resolve its (very rare) collisions.
+  // The fixed-size tables below remain below a 0.5 load factor for cache 2639.
+  TItemDumpSeen = record
+    Keys: TStringArray;
+  end;
+
+procedure ItemDumpSeenInit(var seen: TItemDumpSeen; capacity: Integer);
+begin
+  if (capacity < 2) or ((capacity and (capacity - 1)) <> 0) then
+    raise 'DumpItems: seen-table capacity must be a power of two';
+  seen.Keys := [];
+  SetLength(seen.Keys, capacity);
+end;
+
+// Returns True only for the first occurrence of key.  Empty keys are not used
+// by either caller, so an empty table slot needs no separate occupancy array.
+function ItemDumpSeenAdd(var seen: TItemDumpSeen; key: String): Boolean;
+var
+  slot, mask: Integer;
+begin
+  mask := Length(seen.Keys) - 1;
+  slot := Integer(Hash32(key) and UInt32(mask));
+  while seen.Keys[slot] <> '' do
+  begin
+    if seen.Keys[slot] = key then Exit(False);
+    slot := (slot + 1) and mask;
+  end;
+  seen.Keys[slot] := key;
+  Result := True;
+end;
+
 function CompareItemDumpRow(constref a, b: TItemDumpRow): Integer;
 begin
   Result := a.Id - b.Id;
@@ -171,12 +203,11 @@ begin
   Result := LowerCase(raw.Name);
 end;
 
-procedure ItemDumpAppend(var rows: TItemDumpRows; var source: TItemSpriteSource;
-                         id: Integer; name: String);
+procedure ItemDumpAppend(var rows: TItemDumpRows; var seen: TItemDumpSeen;
+                         var source: TItemSpriteSource; id: Integer; name: String);
 var
   row: TItemDumpRow;
   processed: TImage;
-  i: Integer;
 begin
   if name = '' then Exit;
   RenderItemSpriteFromSource(source, id, 1, 1, ITEM_DUMP_SHADOW, False);
@@ -185,8 +216,11 @@ begin
   row.Image := ItemDumpImage(graphicsPixels);
   row.PNG := ItemDumpPNG(row.Image);
   row.RawHash := HashData(EHashAlgo.CRC32, row.Image.Data, 4608);
-  for i := 0 to High(rows) do
-    if (rows[i].Name = row.Name) and (rows[i].RawHash = row.RawHash) then Exit;
+  // RawHash is exactly eight hexadecimal characters, so appending it to the
+  // name is unambiguous (the last eight characters always recover the hash).
+  // The old linear scan consumed 7.8 s on cache 2639; this preserves its
+  // first-row-wins rule while using Simba's native Hash32 to find it.
+  if not ItemDumpSeenAdd(seen, row.Name + row.RawHash) then Exit;
   // items.bin stores the original icon; update_items mutates a separately
   // loaded image only for its hash/mask calculation.
   processed := ItemDumpImage(graphicsPixels);
@@ -203,15 +237,14 @@ var
   raw: TItemDefinition;
   rows: TItemDumpRows;
   uniqueRows: TItemDumpRows;
+  rowSeen, borderSeen: TItemDumpSeen;
   id, i, maxId: Integer;
   name, hashes, names, idText: String;
-  seenBorders: TStringArray;
   row: TItemDumpRow;
   writer: TResourceWriter;
   zip, imagesZip: TZipWriter;
   bin: TByteArray;
   j: Integer;
-  seen: Boolean;
 begin
   BuildCircularAngle();
   BuildPalette(JAGEX_BRIGHTNESS_MAX);
@@ -224,6 +257,11 @@ begin
   for i := 0 to maxId do positions[i] := -1;
   for i := 0 to High(ids) do positions[ids[i]] := i;
   ItemSpriteSourceSetup(source, store, files, positions);
+  // 65,536 slots gives both sets a load factor below 0.5 on current caches;
+  // a future cache that crosses it can raise this constant without changing
+  // the output contract.
+  ItemDumpSeenInit(rowSeen, 65536);
+  ItemDumpSeenInit(borderSeen, 65536);
 
   // Scan sparse ids, not file positions: this is the numeric row order contract.
   for id := 0 to maxId do
@@ -235,8 +273,8 @@ begin
     // SimbaItemSpritesDumper emits stack variants before their base item, under
     // the base name. This order decides the retained id for duplicates.
     for j := 0 to High(raw.CountObj) do
-      if raw.CountObj[j] > 0 then ItemDumpAppend(rows, source, raw.CountObj[j], name);
-    ItemDumpAppend(rows, source, id, name);
+      if raw.CountObj[j] > 0 then ItemDumpAppend(rows, rowSeen, source, raw.CountObj[j], name);
+    ItemDumpAppend(rows, rowSeen, source, id, name);
   end;
 
   dump.Ensure('finders/items/data');
@@ -265,13 +303,9 @@ begin
   // the established bundle format and keeps builds deterministic.
   for i := 0 to High(rows) do
   begin
-    seen := False;
-    for j := 0 to High(seenBorders) do
-      if seenBorders[j] = rows[i].BorderHash then seen := True;
-    if not seen then
+    if ItemDumpSeenAdd(borderSeen, rows[i].BorderHash) then
     begin
       writer.AddImage(rows[i].BorderHash + '.bmp', rows[i].Mask);
-      seenBorders += rows[i].BorderHash;
     end;
   end;
   writer.Save(dump.Path('finders/items/items.bin'));

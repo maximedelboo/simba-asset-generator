@@ -391,6 +391,11 @@ sensitive to the order regions are walked in.
     ModelHeight: TIntegerArray;
     ModelColors: array of TIntegerArray;
     ModelKnown: TBooleanArray;
+    // Read-only profiling of model-cache misses during one dump.
+    ProfileModelDecodeMS: Double;
+    ProfileModelDecodeCount: Integer;
+    ProfileLoadRegionsMS: Double;
+    ProfileBuildChunksMS: Double;
 
     Regions: array of TObjectDumpRegion;
     Order: TIntegerArray;
@@ -535,6 +540,8 @@ Without this the 15882 objects the dump emits would decode the same shared
 models tens of thousands of times over.
 *)
 function TObjectDump.ModelStat(var store: TCacheStore; model: Integer): TModelStats;
+var
+  t: Double;
 begin
   if (model >= 0) and (model <= High(Self.ModelKnown)) and Self.ModelKnown[model] then
   begin
@@ -543,7 +550,10 @@ begin
     Exit;
   end;
 
+  t := PerformanceTime();
   Result := TModelStats.OfModel(store, Self.Textures, model);
+  Self.ProfileModelDecodeMS += PerformanceTime() - t;
+  Inc(Self.ProfileModelDecodeCount);
 
   if (model >= 0) and (model <= High(Self.ModelKnown)) then
   begin
@@ -730,7 +740,7 @@ var
   region: TRegion;
   sorted: array of TLocation;
   filtering: Boolean;
-  i, j, k, b, t: Integer;
+  i, j, k, b, t, used: Integer;
 begin
   filtering := Length(only) > 0;
   if filtering then
@@ -794,15 +804,31 @@ begin
 
     // Tiles that hold at least one location on any plane, ascending in
     // x * 64 + y - which is the localX-outer, localY-inner order the Java walks.
+    // First count, then allocate the two compact indices once.  `+=` creates
+    // and copies a new dynamic array for every populated tile (and five more
+    // times for its plane boundaries); across 2,933 regions that work showed
+    // up in the region-projection profile.  The two-pass form keeps exactly
+    // the same ascending tile order and boundary values without reallocating.
+    used := 0;
+    for t := 0 to OBJDUMP_TILES - 1 do
+    begin
+      k := t * REGION_Z;
+      if start[k + REGION_Z] <> start[k] then Inc(used);
+    end;
     Self.Regions[i].TileXY := [];
     Self.Regions[i].PlaneStart := [];
+    SetLength(Self.Regions[i].TileXY, used);
+    SetLength(Self.Regions[i].PlaneStart, used * (REGION_Z + 1));
+
+    used := 0;
     for t := 0 to OBJDUMP_TILES - 1 do
     begin
       k := t * REGION_Z;
       if start[k + REGION_Z] = start[k] then Continue;
-      Self.Regions[i].TileXY += t;
+      Self.Regions[i].TileXY[used] := t;
       for b := 0 to REGION_Z do
-        Self.Regions[i].PlaneStart += start[k + b];
+        Self.Regions[i].PlaneStart[used * (REGION_Z + 1) + b] := start[k + b];
+      Inc(used);
     end;
   end;
 end;
@@ -997,10 +1023,13 @@ live `ObjectManager` would do in Java. Build a fresh dump instead.
 *)
 procedure TObjectDump.Run(var store: TCacheStore; only: TIntegerArray);
 var
+  t: Double;
   z, i, r: Integer;
   text: String;
 begin
+  t := PerformanceTime();
   Self.LoadRegions(store, only);
+  Self.ProfileLoadRegionsMS += PerformanceTime() - t;
 
   Self.Names := [];
   Self.Chunks := [];
@@ -1009,6 +1038,7 @@ begin
   // the previous run wrote, and restarting the counter would make a stale slot
   // read as current. It only ever counts up.
 
+  t := PerformanceTime();
   for z := 0 to REGION_Z - 1 do
     for i := 0 to High(Self.Order) do
     begin
@@ -1022,6 +1052,7 @@ begin
                     ToStr(Self.Regions[r].RegionY) + '.json';
       Self.Chunks += text;
     end;
+  Self.ProfileBuildChunksMS += PerformanceTime() - t;
 end;
 
 (*
@@ -1047,13 +1078,25 @@ procedure DumpObjects(var store: TCacheStore; zipPath: String);
 var
   dump: TObjectDump;
   zip: TZipWriter;
+  t, createMS, runMS, writeMS: Double;
   i: Integer;
 begin
+  t := PerformanceTime();
   dump := TObjectDump.Create(store);
+  createMS := PerformanceTime() - t;
+  t := PerformanceTime();
   dump.Run(store, []);
+  runMS := PerformanceTime() - t;
 
+  t := PerformanceTime();
   zip.Init();
   for i := 0 to High(dump.Names) do
     zip.AddBytes(dump.Names[i], _ObjDumpBytes(dump.Chunks[i]));
   zip.Save(zipPath);
+  writeMS := PerformanceTime() - t;
+  WriteLn('DumpObjects: create ', Round(createMS), ' ms, regions/json ',
+          Round(runMS), ' ms, unique model decodes ', dump.ProfileModelDecodeCount,
+          ' in ', Round(dump.ProfileModelDecodeMS), ' ms, zip ', Round(writeMS), ' ms');
+  WriteLn('DumpObjects: region projection ', Round(dump.ProfileLoadRegionsMS),
+          ' ms, chunk/json loop ', Round(dump.ProfileBuildChunksMS), ' ms');
 end;

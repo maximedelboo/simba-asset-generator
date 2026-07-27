@@ -1,0 +1,13 @@
+program MapNativePackagedLoad;
+
+{$IFDEF CPUAARCH64}
+{$loadlib ../plugins/mapnative/mapnative64.dylib.aarch64}
+{$ELSE}
+{$loadlib ../plugins/mapnative/mapnative}
+{$ENDIF}
+
+begin
+  if MapNativeAdd(20, 22) <> 42 then
+    raise 'MapNativePackagedLoad: C ABI returned the wrong integer';
+  WriteLn('MapNativePackagedLoad: [PASS] packaged plugin loaded');
+end.

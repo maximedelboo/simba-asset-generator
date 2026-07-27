@@ -1,0 +1,14 @@
+program MapNativeSmoke;
+
+// Confirms the local C plugin's basic Simba FFI ABI before map benchmark work.
+{$IFDEF CPUAARCH64}
+{$loadlib ../plugins/mapnative/mapnative64.dylib.aarch64}
+{$ELSE}
+{$loadlib ../plugins/mapnative/mapnative}
+{$ENDIF}
+
+begin
+  if MapNativeAdd(20, 22) <> 42 then
+    raise 'MapNativeSmoke: C ABI returned the wrong integer result';
+  WriteLn('MapNativeSmoke: [PASS] native plugin ABI');
+end.
