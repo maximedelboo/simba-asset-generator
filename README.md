@@ -23,15 +23,26 @@ Both are ignored by Git. `--only=itemfinder` is useful during renderer work.
 ## What `static/` is
 
 `static/` is checked-in **generator input**, not a comparison directory and not
-previously generated output. It contains the sixteen curated output paths that
-an OSRS cache cannot supply on its own: UI masks, fonts, finder layouts,
-overheads/prayers/spells, and curated JSON data such as consumables, gear and
-weapons. A normal generation copies these inputs into `out/` alongside the
-cache-derived assets.
+previously generated output. It vendors the historical files that the generator
+currently stages unchanged into `out/`. Their provenance is deliberately
+mixed; “static” means *copied by the current flow*, not “impossible to derive
+from the cache”.
 
-`static/map/npcs.zip` is a packaged fallback for NPC spawn data. The generator
-normally obtains current spawn data from its source; it uses this fallback only
-when that source is unavailable.
+- Eleven paths (fonts, UI images, layouts, consumables, monsters and weapons)
+  have no known automated producer in this project history; they are retained
+  curated inputs until their source is specified or a producer is implemented.
+- `finders/spells.zip` is partly cache-derived (276 of 376 historical entries
+  match cache sprites), but its name-to-sprite mapping is not recorded and the
+  remaining entries are not explained by a cache revision. `prayer.zip` and
+  `overheads.zip` are historical screen-capture/processed assets rather than
+  direct cache extracts.
+- `jsons/gear.json` *is* cache-derivable from item definitions. It remains
+  copied only because that small Simba dumper has not yet been ported.
+
+`static/map/npcs.zip` has a different role: it is a packaged fallback. The
+generator normally creates NPC data from the cache plus live spawn coordinates;
+spawn coordinates do not exist in the OSRS cache, so this one output cannot be
+made from cache bytes alone.
 
 ## Cross-platform proof
 
