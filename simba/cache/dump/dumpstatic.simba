@@ -10,8 +10,9 @@ string on failure.
 
 ## These are not a gap, they are a measurement
 
-Sixteen of the twenty-four whitelist paths were never produced by a cache
-dumper, and eleven of those were never produced by *anything* automated -
+Fifteen of the twenty-four whitelist paths are currently staged from static
+input rather than produced by a cache
+dumper, and twelve of those were never produced by *anything* automated -
 `fonts/fonts.zip`, the four `images/*` files, `images/skills.zip`,
 `finders/house_layout.zip`, `jsons/consumables.{json,zip}`, `jsons/monsters`,
 `jsons/monsters.zip` and `jsons/weapons.json` are curated data with no
@@ -26,34 +27,16 @@ Three more were established as unreproducible rather than merely unimplemented
 | `finders/overheads.zip` | localises to sprite archive 440 by colour, but no nearest-neighbour downscale exceeds **0.224** similarity |
 | `finders/spells.zip` | 73.4% bit-exact cache sprites, but its name -> sprite-id mapping exists in **no source file**, and **9 sprite ids are claimed by 2-5 entries**, so some committed rows are wrong |
 
-## `jsons/gear.json` is the sixteenth, and it is cache-derived after all
+## `jsons/gear.json` is cache-derived
 
-It is staged here rather than generated, but not because it cannot be: the
-committed file was **reproduced byte for byte (96043 / 96043) from the committed
-`item-definitions.zip` alone**, so it is a pure function of the ITEM archive and
-belongs in a future dumper, not in this list.
-
-The producer is `SimbaGearDumper.java`, not `WaspLib/tools/update_gear.simba`,
-and three independent things say so:
-
-- the committed file has **12** top-level slot keys; `update_gear.simba` writes
-  **13**, always, with `spec_weapons` between `ring` and `2h` and no code path
-  that omits it;
-- `update_gear.simba` filters out every name beginning `noted ` or ending
-  ` 0`/` 25`/` 50`/` 75`/` 100` before it asks the wiki anything, and the
-  committed file contains **141** such names (`ahrim's hood 0`, ...);
-- `update-dumps.yml:328` runs `net.runelite.cache.SimbaGearDumper` and
-  `:796` maps its artifact straight onto `jsons/gear.json`. No CI job has ever
-  run `update_gear.simba`, and its output path (`WaspLib/jsons/gear.json`) has
-  never existed in WaspLib's history.
-
-So porting it is a small, well-specified job - a `LinkedHashMap` of 12 slots
-keyed off `wearPos1/2/3`, deduplicated, sorted, hand-written with a `", "`
-separator - and until that lands the file is copied.
+`dumpgear.simba` now generates it directly from the ITEM archive. Its twelve
+slots are a deterministic function of `wearPos1/2/3`, lower-cased item names,
+deduplication and byte-lexicographic sorting; cache 2625 reproduces the former
+static file byte for byte.
 
 ## The parity property this buys
 
-A copied file has, by construction, the committed CRC32. So these sixteen
+A copied file has, by construction, the committed CRC32. So these fifteen
 entries in a generated `hashes.json` should equal the ones in
 `wasp-assets/hashes.json` - the only entries in the whole manifest of which that
 is true, since every generated zip is written by {ref}`TZipWriter`, whose
@@ -61,7 +44,7 @@ deflate is not the JDK's. That makes the copy step self-checking end to end:
 `dev/tests/420_static.simba` asserts against the committed manifest, not against
 its own recomputation.
 
-### ...for fifteen of the sixteen
+### ...for fourteen of the fifteen
 
 **`jsons/monsters` is the exception, on every non-Windows host, and it is a
 `.gitattributes` artefact rather than a defect.** `wasp-assets/.gitattributes`
@@ -101,6 +84,7 @@ instead of transcribing one.
 | path | dumper |
 |---|---|
 | `jsons/item-definitions.zip` | `dumpitemdefs.simba` |
+| `jsons/gear.json` | `dumpgear.simba` |
 | `map/objects.zip` | `dumpobjects.simba` |
 | `map/mapdata.zip` | `map/mapdata.simba` |
 | `map/npcs.zip` | `dumpnpcs.simba` + `dumpnpcspawns.simba` (third-party spawn source) |
@@ -118,6 +102,7 @@ state for that one run.
     'finders/items/data/id.txt',
     'finders/items/data/item.txt',
     'finders/items/items.zip',
+    'jsons/gear.json',
     'jsons/item-definitions.zip',
     'map/mapdata.zip',
     'map/npcs.zip',
@@ -130,7 +115,7 @@ state for that one run.
 function StaticAssetPaths(hashable, generated: TStringArray): TStringArray;
 ```
 `hashable` minus `generated`, preserving `hashable`'s order. With
-`AssetHashablePaths(ASSET_WHITELIST)` and {ref}`GENERATED_ASSETS` that is the 16
+`AssetHashablePaths(ASSET_WHITELIST)` and {ref}`GENERATED_ASSETS` that is the 15
 static paths.
 
 Derived rather than written out, so that registering a new dumper shrinks the
@@ -210,7 +195,7 @@ directories on the way, and returns how many were copied - which is always
 That is the opposite of {ref}`WriteHashesJSON`'s rule, and deliberately so. A
 whitelist file our dumpers do not produce yet is a known, temporary hole and is
 worth omitting quietly; a *static* file missing from the source directory means
-the source directory is wrong, and quietly staging fifteen of sixteen would
+the source directory is wrong, and quietly staging fourteen of fifteen would
 surface hours later as one unexplained manifest entry.
 
 Each copy is verified by CRC32 before it counts. `FileCopy` reports success from

@@ -28,7 +28,7 @@ currently stages unchanged into `out/`. Their provenance is deliberately
 mixed; “static” means *copied by the current flow*, not “impossible to derive
 from the cache”.
 
-- Eleven paths (fonts, UI images, layouts, consumables, monsters and weapons)
+- Twelve paths (fonts, UI images, layouts, consumables, monsters and weapons)
   have no known automated producer in this project history; they are retained
   curated inputs until their source is specified or a producer is implemented.
 - `finders/spells.zip` is partly cache-derived (276 of 376 historical entries
@@ -36,8 +36,8 @@ from the cache”.
   remaining entries are not explained by a cache revision. `prayer.zip` and
   `overheads.zip` are historical screen-capture/processed assets rather than
   direct cache extracts.
-- `jsons/gear.json` *is* cache-derivable from item definitions. It remains
-  copied only because that small Simba dumper has not yet been ported.
+- `jsons/gear.json` is generated directly from cache item definitions; it no
+  longer has a checked-in static copy.
 
 `static/map/npcs.zip` has a different role: it is a packaged fallback. The
 generator normally creates NPC data from the cache plus live spawn coordinates;

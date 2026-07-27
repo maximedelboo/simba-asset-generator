@@ -50,6 +50,7 @@ that is *not yet complete*:
 // `WaspLib/tools/dump_assets.simba` agree on it without transcribing it twice.
 // Item rendering is registered below through dumpitems.simba.
 {$IFNDEF WL_CACHE_DUMP_STATIC_INCLUDED}{$INCLUDE_ONCE dumpstatic.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DUMP_GEAR_INCLUDED}{$INCLUDE_ONCE dumpgear.simba}{$ENDIF}
 {$IFNDEF WL_CACHE_DUMP_ITEMDEFS_INCLUDED}{$INCLUDE_ONCE dumpitemdefs.simba}{$ENDIF}
 {$IFNDEF WL_CACHE_DUMP_ITEMS_INCLUDED}{$INCLUDE_ONCE dumpitems.simba}{$ENDIF}
 {$IFNDEF WL_CACHE_DUMP_OBJECTS_INCLUDED}{$INCLUDE_ONCE dumpobjects.simba}{$ENDIF}
@@ -472,7 +473,7 @@ end;
 
 (*
 ## The registry
-Six one-line adapters and the procedure that registers them. Each adapter
+Seven one-line adapters and the procedure that registers them. Each adapter
 exists only to give a dumper the {ref}`TAssetDumperProc` shape and to name the
 whitelist path it writes to - the whitelist path is spelled **here**, in the
 orchestrator, so that the manifest's view of what a dumper produces and the
@@ -487,7 +488,7 @@ directory: `TZipWriter.Save` opens the file and nothing more.
 ```pascal
 procedure DumpAssetsStatic(var ctx: TAssetDumpContext);
 ```
-Stages the 16 whitelist paths no cache can produce, out of `ctx.StaticDir`.
+Stages the 15 currently copied whitelist paths out of `ctx.StaticDir`.
 See {ref}`DumpStaticAssets`.
 *)
 procedure DumpAssetsStatic(var ctx: TAssetDumpContext);
@@ -508,6 +509,12 @@ procedure DumpAssetsItems(var ctx: TAssetDumpContext);
 begin
   ctx.Dump.Ensure('jsons');
   DumpItemDefinitions(ctx.Store, ctx.Dump.Path('jsons/item-definitions.zip'));
+end;
+
+procedure DumpAssetsGear(var ctx: TAssetDumpContext);
+begin
+  ctx.Dump.Ensure('jsons');
+  DumpGear(ctx.Store, ctx.Dump);
 end;
 
 procedure DumpAssetsItemFinder(var ctx: TAssetDumpContext);
@@ -601,7 +608,8 @@ is what `--only` matches.
 
 | name | writes |
 |---|---|
-| `static` | the 16 copied whitelist paths |
+| `static` | the 15 copied whitelist paths |
+| `gear` | `jsons/gear.json` |
 | `items` | `jsons/item-definitions.zip` |
 | `itemfinder` | `finders/items/{items.zip,items.bin,items-imgs.zip,data/*.txt}` |
 | `objects` | `map/objects.zip` |
@@ -620,6 +628,7 @@ cache-derived and both are covered by the manifest.
 procedure RegisterAssetDumpers(var run: TAssetDumpRun);
 begin
   run.Register('static',  @DumpAssetsStatic);
+  run.Register('gear',    @DumpAssetsGear);
   run.Register('items',   @DumpAssetsItems);
   run.Register('itemfinder', @DumpAssetsItemFinder);
   run.Register('objects', @DumpAssetsObjects);

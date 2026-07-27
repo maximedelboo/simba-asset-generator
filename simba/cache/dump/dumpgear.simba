@@ -1,0 +1,102 @@
+(** Pure-Simba cache dumper for `jsons/gear.json`. *)
+{$DEFINE WL_CACHE_DUMP_GEAR_INCLUDED}
+{$IFNDEF WL_CACHE_DUMP_COMMON_INCLUDED}{$INCLUDE_ONCE dumpcommon.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_TYPES_INCLUDED}{$INCLUDE_ONCE ../cachetypes.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_STORE_INCLUDED}{$INCLUDE_ONCE ../store.simba}{$ENDIF}
+{$IFNDEF WL_CACHE_DEF_ITEM_INCLUDED}{$INCLUDE_ONCE ../defs/item.simba}{$ENDIF}
+
+const
+  GEAR_SLOT_NAMES: TStringArray = ['head', 'cape', 'neck', 'ammo', 'weapon',
+                                   'body', 'shield', 'legs', 'hands', 'feet',
+                                   'ring', '2h'];
+
+type
+  TGearSlots = array[0..11] of TStringArray;
+
+procedure _GearAdd(var names: TStringArray; name: String);
+var i: Integer;
+begin
+  for i := 0 to High(names) do if names[i] = name then Exit;
+  names += name;
+end;
+
+procedure _GearAddPosition(var slots: TGearSlots; position: Integer; name: String);
+begin
+  case position of
+    0, 8, 11: _GearAdd(slots[0], name);
+    1: _GearAdd(slots[1], name);
+    2: _GearAdd(slots[2], name);
+    3: _GearAdd(slots[4], name);
+    4: _GearAdd(slots[5], name);
+    5: _GearAdd(slots[6], name);
+    7: _GearAdd(slots[7], name);
+    9: _GearAdd(slots[8], name);
+    10: _GearAdd(slots[9], name);
+    12: _GearAdd(slots[10], name);
+    13: _GearAdd(slots[3], name);
+  end;
+end;
+
+function _GearJSONName(s: String): String;
+var i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(s) do
+  begin
+    if s[i] = '"' then Result += '\\';
+    Result += s[i];
+  end;
+end;
+
+procedure DumpGear(var store: TCacheStore; var dump: TAssetDump);
+var
+  table: TCacheRefTable;
+  files: array of TByteArray;
+  ids, order: TIntegerArray;
+  slots: TGearSlots;
+  item: TItemDefinition;
+  i, j, archive: Integer;
+  name, text: String;
+  weapon, shield: Boolean;
+begin
+  table := store.GetRefTable(Ord(EIndexType.CONFIGS));
+  archive := table.IndexOfArchive(Ord(EConfigType.ITEM));
+  if archive = -1 then raise 'DumpGear: this cache has no CONFIGS/ITEM archive';
+  ids := table.Archives[archive].FileIds;
+  files := store.ReadFiles(Ord(EIndexType.CONFIGS), Ord(EConfigType.ITEM), []);
+  if Length(files) <> Length(ids) then raise 'DumpGear: item file/id count mismatch';
+
+  for i := 0 to High(ids) do
+  begin
+    item := TItemDefinition.Load(ids[i], files[i]);
+    if (item.WearPos1 = -1) and (item.WearPos2 = -1) and (item.WearPos3 = -1) then Continue;
+    name := LowerCase(item.Name);
+    if (Trim(name) = '') or SameText(name, 'null') then Continue;
+    weapon := (item.WearPos1 = 3) or (item.WearPos2 = 3) or (item.WearPos3 = 3);
+    shield := (item.WearPos1 = 5) or (item.WearPos2 = 5) or (item.WearPos3 = 5);
+    if weapon and shield then
+    begin
+      _GearAdd(slots[11], name);
+      Continue;
+    end;
+    _GearAddPosition(slots, item.WearPos1, name);
+    _GearAddPosition(slots, item.WearPos2, name);
+    _GearAddPosition(slots, item.WearPos3, name);
+  end;
+
+  text := '{' + LINE_SEP;
+  for i := 0 to High(GEAR_SLOT_NAMES) do
+  begin
+    order := DumpEntryOrder(slots[i]);
+    text += '  "' + GEAR_SLOT_NAMES[i] + '": [';
+    for j := 0 to High(order) do
+    begin
+      text += '"' + _GearJSONName(slots[i][order[j]]) + '"';
+      if j < High(order) then text += ', ';
+    end;
+    text += ']';
+    if i < High(GEAR_SLOT_NAMES) then text += ',';
+    text += LINE_SEP;
+  end;
+  dump.SaveText('jsons/gear.json', text + '}' + LINE_SEP);
+end;
