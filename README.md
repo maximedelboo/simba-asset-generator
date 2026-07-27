@@ -20,6 +20,19 @@ Simba --revision=2625 --run generator.simba
 `cache/` holds downloaded caches and `out/` holds the generated asset tree.
 Both are ignored by Git. `--only=itemfinder` is useful during renderer work.
 
+## What `static/` is
+
+`static/` is checked-in **generator input**, not a comparison directory and not
+previously generated output. It contains the sixteen curated output paths that
+an OSRS cache cannot supply on its own: UI masks, fonts, finder layouts,
+overheads/prayers/spells, and curated JSON data such as consumables, gear and
+weapons. A normal generation copies these inputs into `out/` alongside the
+cache-derived assets.
+
+`static/map/npcs.zip` is a packaged fallback for NPC spawn data. The generator
+normally obtains current spawn data from its source; it uses this fallback only
+when that source is unavailable.
+
 ## Cross-platform proof
 
 [`cross-platform.yml`](.github/workflows/cross-platform.yml) executes a full
