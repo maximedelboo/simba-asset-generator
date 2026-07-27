@@ -1,11 +1,43 @@
 program TestLatestOpenRS2;
 
 {$INCLUDE_ONCE ../simba/cache/manager.simba}
+{$INCLUDE_ONCE ../simba/cache/dump/zipwriter.simba}
+
+procedure TestNestedDiskZip();
+var
+  manager: TCacheManager;
+  zip: TZipWriter;
+  root, installed: String;
+  bytes: TByteArray;
+begin
+  root := SimbaEnv.TempPath + 'simba-asset-generator-cache-layout';
+  if DirExists(root) then DirDelete(root, False);
+  manager := TCacheManager.Create(root);
+
+  bytes := [1];
+  zip.Init();
+  zip.AddBytes('cache/main_file_cache.dat2', bytes);
+  zip.AddBytes('cache/main_file_cache.idx0', bytes);
+  zip.Save(manager.Root + 'nested.disk.zip');
+
+  installed := manager.InstallDiskZip('1', manager.Root + 'nested.disk.zip');
+  if not FileExists(installed + 'main_file_cache.dat2') then
+    raise 'TestNestedDiskZip: data file was not normalised to the cache root';
+  if not FileExists(installed + 'main_file_cache.idx0') then
+    raise 'TestNestedDiskZip: index file was not normalised to the cache root';
+  if DirExists(installed + 'cache') then
+    raise 'TestNestedDiskZip: nested cache directory was not removed';
+  if not manager.IsReady('1') then
+    raise 'TestNestedDiskZip: installed cache was not marked ready';
+
+  DirDelete(root, False);
+end;
 
 var
   manager: TCacheManager;
   revision: String;
 begin
+  TestNestedDiskZip();
   manager := TCacheManager.Create(SimbaEnv.TempPath + 'simba-asset-generator-test');
   revision := manager.LatestOpenRS2Revision();
   if StrToInt(revision) <= 0 then

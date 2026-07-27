@@ -134,7 +134,9 @@ end;
 
 function TCacheManager.InstallDiskZip(revision, zipPath: String): String;
 var
-  dir: String;
+  dir, nested: String;
+  files: TStringArray;
+  i: Integer;
 begin
   if not FileExists(zipPath) or (FileSize(zipPath) = 0) then
     raise 'CacheManager: missing or empty disk zip ' + zipPath;
@@ -149,6 +151,33 @@ begin
   begin
     DirDelete(dir, False);
     raise 'CacheManager: could not extract ' + zipPath;
+  end;
+  // OpenRS2 has used both layouts for disk.zip: cache files directly at the
+  // archive root and files below one `cache/` directory. Keep the installed
+  // cache layout stable for the store regardless of the archive layout.
+  nested := dir + 'cache' + PATH_SEP;
+  if not FileExists(dir + 'main_file_cache.dat2') and
+     FileExists(nested + 'main_file_cache.dat2') then
+  begin
+    files := DirList(nested, False);
+    for i := 0 to High(files) do
+    begin
+      if not FileExists(files[i]) then
+      begin
+        DirDelete(dir, False);
+        raise 'CacheManager: unexpected directory in disk zip ' + files[i];
+      end;
+      if not FileRename(files[i], dir + PathExtractName(files[i])) then
+      begin
+        DirDelete(dir, False);
+        raise 'CacheManager: could not move extracted cache file ' + files[i];
+      end;
+    end;
+    if not DirDelete(nested, False) then
+    begin
+      DirDelete(dir, False);
+      raise 'CacheManager: could not remove extracted cache directory';
+    end;
   end;
   if not FileExists(dir + 'main_file_cache.dat2') then
   begin
